@@ -48,6 +48,10 @@ export function buildParamOptions(gainsOnly = false) {
 let _vmState = {};
 export function setStateRef(stateObj) { _vmState = stateObj; }
 
+function isEditMode() {
+  return document.body.classList.contains('edit-mode');
+}
+
 // ── Utilities ─────────────────────────────────────────────────────────────────
 function fmtDb(v) {
   if (v === undefined || v === null) return '—';
@@ -164,6 +168,7 @@ export function createFaderWidget({ min = -60, max = 12, step = 0.1, value = 0, 
   }
 
   trackWrap.addEventListener('pointerdown', e => {
+    if (isEditMode()) return;
     dragging = true;
     trackWrap.setPointerCapture(e.pointerId);
     e.preventDefault();
@@ -182,6 +187,7 @@ export function createFaderWidget({ min = -60, max = 12, step = 0.1, value = 0, 
   // Double-tap / double-click to reset to 0 dB
   let lastTap = 0;
   trackWrap.addEventListener('pointerdown', e => {
+    if (isEditMode()) return;
     const now = Date.now();
     if (now - lastTap < 300) { current = 0; updateDisplay(0); onChange?.(0); }
     lastTap = now;
@@ -357,6 +363,7 @@ export function renderToggle(ctrl, vmState) {
 
   let pressing = false;
   card.addEventListener('pointerdown', e => {
+    if (isEditMode()) return;
     if (e.target.closest('.edit-overlay, .drag-handle, .resize-handle')) return;
     pressing = true;
     if (cfg.momentary) { setActive(true); vmSet(param, 1); }
@@ -367,6 +374,7 @@ export function renderToggle(ctrl, vmState) {
     if (cfg.momentary) { setActive(false); vmSet(param, 0); }
   });
   card.addEventListener('click', e => {
+    if (isEditMode()) return;
     if (e.target.closest('.edit-overlay, .drag-handle, .resize-handle')) return;
     if (cfg.momentary) return;
     const newVal = card.classList.contains('active') ? 0 : 1;
@@ -402,12 +410,14 @@ export function renderMacro(ctrl, vmState) {
   card.appendChild(resizeHandle());
 
   card.addEventListener('pointerdown', e => {
+    if (isEditMode()) return;
     if (e.target.closest('.edit-overlay, .drag-handle, .resize-handle')) return;
     const actions = cfg.actions || [];
     if (actions.length) vmMacro(actions.map(a => ({ param: a.param, value: a.value })));
     if (cfg.momentary) card.style.filter = 'brightness(1.4)';
   });
   card.addEventListener('pointerup', () => {
+    if (isEditMode()) return;
     if (cfg.momentary) {
       card.style.filter = '';
       const off = (cfg.actions || []).map(a => ({ param: a.param, value: a.offValue ?? (a.value === 0 ? 1 : 0) }));
@@ -450,7 +460,10 @@ export function renderStripPanel(ctrl, vmState) {
   const muteBtn = document.createElement('button');
   muteBtn.className = 'strip-mute-btn' + (vmState[strip.params.mute] ? ' muted' : '');
   muteBtn.textContent = vmState[strip.params.mute] ? 'MUTED' : 'MUTE';
-  muteBtn.addEventListener('click', () => vmSet(strip.params.mute, muteBtn.classList.contains('muted') ? 0 : 1));
+  muteBtn.addEventListener('click', () => {
+    if (isEditMode()) return;
+    vmSet(strip.params.mute, muteBtn.classList.contains('muted') ? 0 : 1);
+  });
 
   const routingEl = document.createElement('div');
   routingEl.className = 'strip-routing';
@@ -461,7 +474,10 @@ export function renderStripPanel(ctrl, vmState) {
     btn.className = 'routing-btn' + (vmState[strip.params[k]] ? ' active' : '');
     btn.textContent = key;
     btn.dataset.key = k;
-    btn.addEventListener('click', () => vmSet(strip.params[k], btn.classList.contains('active') ? 0 : 1));
+    btn.addEventListener('click', () => {
+      if (isEditMode()) return;
+      vmSet(strip.params[k], btn.classList.contains('active') ? 0 : 1);
+    });
     routingEl.appendChild(btn);
     routingBtns[k] = btn;
   });
@@ -517,7 +533,10 @@ export function renderBusPanel(ctrl, vmState) {
   const muteBtn = document.createElement('button');
   muteBtn.className = 'strip-mute-btn' + (vmState[bus.params.mute] ? ' muted' : '');
   muteBtn.textContent = vmState[bus.params.mute] ? 'MUTED' : 'MUTE';
-  muteBtn.addEventListener('click', () => vmSet(bus.params.mute, muteBtn.classList.contains('muted') ? 0 : 1));
+  muteBtn.addEventListener('click', () => {
+    if (isEditMode()) return;
+    vmSet(bus.params.mute, muteBtn.classList.contains('muted') ? 0 : 1);
+  });
 
   card.appendChild(dragHandle());
   card.appendChild(nameEl);

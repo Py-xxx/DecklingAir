@@ -1,220 +1,247 @@
-// Editor — add/configure/reorder controls + settings panel
 import { VM_STRIPS, VM_BUSES, buildParamOptions } from './controls.js';
+import { vmMacro } from './socket.js';
 
-let _state = null;   // shared app state ref
-let _callbacks = {}; // { onSave, onDelete }
+const DEFAULT_SIZES = {
+  fader: [1, 4],
+  toggle: [1, 1],
+  button: [2, 1],
+  macro: [2, 1],
+  vu_meter: [1, 3],
+  strip_panel: [1, 4],
+  bus_panel: [1, 3],
+  label: [2, 1],
+};
+
+let _state = null;
+let _callbacks = {};
+let _editingId = null;
+let _selectedType = null;
+let _selectedSize = { colSpan: 1, rowSpan: 2 };
+let _pageEditIndex = null;
+let _gridGesture = null;
+
+const previewEl = document.getElementById('drop-preview');
+const mainAreaEl = document.getElementById('main-area');
 
 export function initEditor(state, callbacks) {
   _state = state;
   _callbacks = callbacks;
 
-  // Populate param dropdowns
-  populateParamDropdown('cfg-fader-param', buildParamOptions(true).filter(o => o.value.includes('Gain')));
+  populateParamDropdown('cfg-fader-param', buildParamOptions(true));
   populateParamDropdown('cfg-toggle-param', buildParamOptions(false));
+  populateStripBusSources();
+  buildSizePicker();
 
-  // Populate strip/bus selectors
-  const stripSel = document.getElementById('cfg-strip-select');
-  VM_STRIPS.forEach(s => {
-    const o = document.createElement('option');
-    o.value = s.index; o.textContent = s.fullLabel;
-    stripSel.appendChild(o);
-  });
-  const busSel = document.getElementById('cfg-bus-select');
-  VM_BUSES.forEach(b => {
-    const o = document.createElement('option');
-    o.value = b.index; o.textContent = b.fullLabel;
-    busSel.appendChild(o);
-  });
-  const vuSrc = document.getElementById('cfg-vu-source');
-  VM_STRIPS.forEach(s => {
-    const o = document.createElement('option');
-    o.value = `strip-${s.index}`; o.textContent = `Strip: ${s.fullLabel}`;
-    vuSrc.appendChild(o);
-  });
-  VM_BUSES.forEach(b => {
-    const o = document.createElement('option');
-    o.value = `bus-${b.index}`; o.textContent = `Bus: ${b.fullLabel}`;
-    vuSrc.appendChild(o);
-  });
-
-  // Type card selection
   document.querySelectorAll('.type-card').forEach(card => {
-    card.addEventListener('click', () => {
-      document.querySelectorAll('.type-card').forEach(c => c.classList.remove('selected'));
-      card.classList.add('selected');
-      showConfigSection(card.dataset.type);
-      setDefaultSizes(card.dataset.type);
-    });
+    card.addEventListener('click', () => selectType(card.dataset.type));
   });
 
-  // Modal close/cancel
+  document.getElementById('fab-add').addEventListener('click', () => openModal(null));
+  document.getElementById('btn-edit').addEventListener('click', toggleEditMode);
+
   document.getElementById('modal-close').addEventListener('click', closeModal);
   document.getElementById('modal-cancel').addEventListener('click', closeModal);
-  document.getElementById('modal-backdrop').addEventListener('click', (e) => {
-    if (e.target === document.getElementById('modal-backdrop')) closeModal();
-  });
   document.getElementById('modal-save').addEventListener('click', saveControl);
+  document.getElementById('modal-back').addEventListener('click', showTypeStep);
+  document.getElementById('modal-backdrop').addEventListener('click', event => {
+    if (event.target === document.getElementById('modal-backdrop')) closeModal();
+  });
 
-  // Macro actions
-  document.getElementById('btn-add-macro-action').addEventListener('click', addMacroAction);
+  document.getElementById('btn-add-macro-action').addEventListener('click', () => addMacroAction());
 
-  // Settings modal
-  document.getElementById('btn-settings').addEventListener('click', openSettings);
   document.getElementById('settings-close').addEventListener('click', closeSettings);
-  document.getElementById('settings-modal').addEventListener('click', (e) => {
-    if (e.target === document.getElementById('settings-modal')) closeSettings();
-  });
+  document.getElementById('settings-cancel').addEventListener('click', closeSettings);
   document.getElementById('settings-apply').addEventListener('click', applySettings);
+  document.getElementById('settings-modal').addEventListener('click', event => {
+    if (event.target === document.getElementById('settings-modal')) closeSettings();
+  });
   document.getElementById('s-add-page').addEventListener('click', () => openPageNameModal(null));
+  document.getElementById('s-export').addEventListener('click', exportLayout);
+  document.getElementById('s-import').addEventListener('click', () => {
+    document.getElementById('s-import-file').click();
+  });
+  document.getElementById('s-import-file').addEventListener('change', importLayout);
   document.getElementById('s-vm-restart').addEventListener('click', () => {
-    import('./socket.js').then(({ vmMacro }) => vmMacro([{ param: 'Command.Restart', value: 1 }]));
+    vmMacro([{ param: 'Command.Restart', value: 1 }]);
   });
 
-  // Export / Import
-  document.getElementById('s-export').addEventListener('click', exportLayout);
-  document.getElementById('s-import').addEventListener('click', () => document.getElementById('s-import-file').click());
-  document.getElementById('s-import-file').addEventListener('change', importLayout);
-
-  // FAB / empty state add
-  document.getElementById('fab-add').addEventListener('click', () => openModal(null));
-  document.getElementById('empty-add-btn')?.addEventListener('click', () => openModal(null));
-
-  // Page name modal
   document.getElementById('page-modal-close').addEventListener('click', closePageModal);
   document.getElementById('page-modal-cancel').addEventListener('click', closePageModal);
   document.getElementById('page-modal-save').addEventListener('click', savePageName);
-  document.getElementById('btn-add-page').addEventListener('click', () => openPageNameModal(null));
-
-  // Edit mode button
-  document.getElementById('btn-edit').addEventListener('click', toggleEditMode);
+  document.getElementById('page-modal').addEventListener('click', event => {
+    if (event.target === document.getElementById('page-modal')) closePageModal();
+  });
+  document.getElementById('page-name-input').addEventListener('keydown', event => {
+    if (event.key === 'Enter') savePageName();
+  });
 }
 
-// ── Edit Mode ─────────────────────────────────────────────────────────────────
 export function toggleEditMode() {
   _state.ui.editMode = !_state.ui.editMode;
   document.body.classList.toggle('edit-mode', _state.ui.editMode);
-  const btn = document.getElementById('btn-edit');
-  btn.classList.toggle('active', _state.ui.editMode);
+  document.getElementById('btn-edit').classList.toggle('active', _state.ui.editMode);
   document.getElementById('fab-add').style.display = _state.ui.editMode ? 'flex' : 'none';
-  document.getElementById('btn-add-page').style.display = _state.ui.editMode ? 'flex' : 'none';
+  _callbacks.commitLayout?.({ persist: false, rerender: true });
 }
 
-// ── Grid event delegation ─────────────────────────────────────────────────────
 export function initGridEvents(gridEl) {
-  gridEl.addEventListener('click', (e) => {
-    const editBtn = e.target.closest('[data-action="edit"]');
-    const delBtn  = e.target.closest('[data-action="delete"]');
-    if (editBtn) { e.stopPropagation(); openModal(editBtn.dataset.ctrlId); }
-    if (delBtn)  { e.stopPropagation(); deleteControl(delBtn.dataset.ctrlId); }
-  });
+  gridEl.addEventListener('click', event => {
+    const editButton = event.target.closest('[data-action="edit"]');
+    const deleteButton = event.target.closest('[data-action="delete"]');
 
-  // Drag to reorder
-  let dragSrc = null;
-  gridEl.addEventListener('dragstart', (e) => {
-    const card = e.target.closest('.control-card');
-    if (!card || !_state.ui.editMode) return;
-    dragSrc = card.dataset.id;
-    card.classList.add('dragging');
-    e.dataTransfer.effectAllowed = 'move';
-  });
-  gridEl.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-    const card = e.target.closest('.control-card');
-    if (card && card.dataset.id !== dragSrc) {
-      document.querySelectorAll('.control-card.drag-over').forEach(c => c.classList.remove('drag-over'));
-      card.classList.add('drag-over');
+    if (editButton) {
+      event.stopPropagation();
+      openModal(editButton.dataset.ctrlId);
+      return;
+    }
+
+    if (deleteButton) {
+      event.stopPropagation();
+      deleteControl(deleteButton.dataset.ctrlId);
     }
   });
-  gridEl.addEventListener('dragleave', (e) => {
-    const card = e.target.closest('.control-card');
-    if (card) card.classList.remove('drag-over');
-  });
-  gridEl.addEventListener('drop', (e) => {
-    e.preventDefault();
-    const target = e.target.closest('.control-card');
-    if (!target || !dragSrc || target.dataset.id === dragSrc) return;
-    reorderControl(dragSrc, target.dataset.id);
-    document.querySelectorAll('.control-card.drag-over').forEach(c => c.classList.remove('drag-over'));
-  });
-  gridEl.addEventListener('dragend', () => {
-    document.querySelectorAll('.control-card.dragging').forEach(c => c.classList.remove('dragging'));
-    dragSrc = null;
-  });
 
-  // Make cards draggable when in edit mode
-  const obs = new MutationObserver(() => {
-    gridEl.querySelectorAll('.control-card').forEach(c => {
-      c.draggable = _state.ui.editMode;
+  gridEl.addEventListener('pointerdown', event => {
+    const dragHandle = event.target.closest('.drag-handle');
+    const resizeHandle = event.target.closest('.resize-handle');
+    if (!_state.ui.editMode || (!dragHandle && !resizeHandle)) return;
+
+    const card = event.target.closest('.control-card');
+    if (!card) return;
+
+    startGridGesture({
+      mode: resizeHandle ? 'resize' : 'move',
+      event,
+      gridEl,
+      card,
     });
   });
-  obs.observe(document.body, { attributes: true, attributeFilter: ['class'] });
 }
 
-function reorderControl(srcId, targetId) {
-  const page = currentPage();
-  if (!page) return;
-  const controls = page.controls;
-  const srcIdx = controls.findIndex(c => c.id === srcId);
-  const tgtIdx = controls.findIndex(c => c.id === targetId);
-  if (srcIdx < 0 || tgtIdx < 0) return;
-  const [item] = controls.splice(srcIdx, 1);
-  controls.splice(tgtIdx, 0, item);
-  _callbacks.onSave?.();
-}
-
-function deleteControl(id) {
-  const page = currentPage();
-  if (!page) return;
-  page.controls = page.controls.filter(c => c.id !== id);
-  _callbacks.onDelete?.(id);
-  _callbacks.onSave?.();
-}
-
-// ── Add / Edit Modal ──────────────────────────────────────────────────────────
-let _editingId = null;
-
-export function openModal(ctrlId) {
-  _editingId = ctrlId;
-  const isEdit = !!ctrlId;
-
-  document.getElementById('modal-title').textContent = isEdit ? 'Edit Control' : 'Add Control';
+export function openModal(controlId) {
+  _editingId = controlId;
   resetModal();
 
-  if (isEdit) {
-    const ctrl = findControl(ctrlId);
-    if (!ctrl) return;
-    populateModal(ctrl);
-    document.getElementById('step-type').style.display = 'none';
-    document.getElementById('step-config').style.display = 'flex';
+  if (controlId) {
+    const control = findControl(controlId);
+    if (!control) return;
+
+    _selectedType = control.type;
+    _selectedSize = {
+      colSpan: control.colSpan || 1,
+      rowSpan: control.rowSpan || 1,
+    };
+
+    highlightSelectedType(control.type);
+    updateSizePicker();
+    populateModal(control);
+    showConfigStep(true);
+    document.getElementById('modal-title').textContent = 'Edit Control';
   } else {
-    document.getElementById('step-type').style.display = 'flex';
-    document.getElementById('step-config').style.display = 'none';
+    document.getElementById('modal-title').textContent = 'Add Control';
+    showTypeStep();
   }
 
   document.getElementById('modal-backdrop').style.display = 'flex';
 }
 
-function closeModal() {
-  document.getElementById('modal-backdrop').style.display = 'none';
-  _editingId = null;
+export function openSettings() {
+  const settings = _state.layout.settings || {};
+  const bridge = _state.bridge || {};
+  const vmTypeNames = {
+    1: 'VoiceMeeter',
+    2: 'VoiceMeeter Banana',
+    3: 'VoiceMeeter Potato',
+  };
+
+  document.getElementById('s-accent-color').value = settings.accentColor || '#6c63ff';
+  document.getElementById('s-grid-cols').value = String(settings.gridColumns || 8);
+  document.getElementById('s-status').textContent = bridge.connected ? 'Connected' : 'Disconnected';
+  document.getElementById('s-vm-type').textContent = vmTypeNames[bridge.vmType] || '—';
+  document.getElementById('s-vm-version').textContent = bridge.vmVersion || '—';
+
+  renderPagesList();
+  document.getElementById('settings-modal').style.display = 'flex';
+}
+
+export function openPageNameModal(index) {
+  _pageEditIndex = index;
+  const isEdit = Number.isInteger(index);
+  document.getElementById('page-modal-title').textContent = isEdit ? 'Rename Page' : 'Add Page';
+  document.getElementById('page-name-input').value = isEdit ? _state.layout.pages[index]?.name || '' : '';
+  document.getElementById('page-modal').style.display = 'flex';
+  window.setTimeout(() => document.getElementById('page-name-input').focus(), 20);
 }
 
 function resetModal() {
-  document.querySelectorAll('.type-card').forEach(c => c.classList.remove('selected'));
-  document.querySelectorAll('.cfg-section').forEach(s => s.style.display = 'none');
+  _selectedType = null;
+  _selectedSize = { colSpan: 1, rowSpan: 2 };
+
+  document.querySelectorAll('.type-card').forEach(card => card.classList.remove('selected'));
+  document.querySelectorAll('.cfg-section').forEach(section => {
+    section.style.display = 'none';
+  });
+
   document.getElementById('cfg-label').value = '';
-  document.getElementById('cfg-col-span').value = '1';
-  document.getElementById('cfg-row-span').value = '4';
+  document.getElementById('cfg-fader-param').selectedIndex = 0;
+  document.getElementById('cfg-fader-min').value = '-60';
+  document.getElementById('cfg-fader-max').value = '12';
+  document.getElementById('cfg-fader-step').value = '0.1';
+  document.getElementById('cfg-fader-vu').checked = true;
+
+  document.getElementById('cfg-toggle-param').selectedIndex = 0;
+  document.getElementById('cfg-toggle-color').value = '#6c63ff';
+  document.getElementById('cfg-toggle-momentary').checked = false;
+
+  document.getElementById('cfg-macro-color').value = '#ff9800';
+  document.getElementById('cfg-macro-momentary').checked = false;
   document.getElementById('macro-actions-list').innerHTML = '';
+
+  document.getElementById('cfg-vu-source').selectedIndex = 0;
+  document.getElementById('cfg-strip-select').selectedIndex = 0;
+  document.querySelectorAll('#cfg-strip-routing input').forEach(input => {
+    input.checked = ['A1', 'A2', 'B1', 'B2'].includes(input.value);
+  });
+  document.getElementById('cfg-bus-select').selectedIndex = 0;
+
+  updateSizePicker();
+}
+
+function selectType(type) {
+  _selectedType = type;
+  _selectedSize = sizeForType(type);
+  highlightSelectedType(type);
+  updateSizePicker();
+  showConfigStep(false);
+}
+
+function highlightSelectedType(type) {
+  document.querySelectorAll('.type-card').forEach(card => {
+    card.classList.toggle('selected', card.dataset.type === type);
+  });
+}
+
+function showTypeStep() {
+  document.getElementById('step-type').style.display = 'block';
+  document.getElementById('step-config').style.display = 'none';
+  document.getElementById('modal-back').style.display = 'none';
+  document.getElementById('modal-save').style.display = 'none';
+}
+
+function showConfigStep(isEdit) {
+  document.getElementById('step-type').style.display = 'none';
+  document.getElementById('step-config').style.display = 'flex';
+  document.getElementById('modal-back').style.display = isEdit ? 'none' : 'inline-flex';
+  document.getElementById('modal-save').style.display = 'inline-flex';
+  showConfigSection(_selectedType);
 }
 
 function showConfigSection(type) {
-  document.querySelectorAll('.cfg-section').forEach(s => s.style.display = 'none');
-  document.getElementById('step-type').style.display = 'none';
-  document.getElementById('step-config').style.display = 'flex';
+  document.querySelectorAll('.cfg-section').forEach(section => {
+    section.style.display = 'none';
+  });
 
-  const map = {
+  const sectionMap = {
     fader: 'cfg-fader',
     toggle: 'cfg-toggle',
     button: 'cfg-toggle',
@@ -223,130 +250,184 @@ function showConfigSection(type) {
     strip_panel: 'cfg-strip-panel',
     bus_panel: 'cfg-bus-panel',
   };
-  const sectionId = map[type];
+
+  const sectionId = sectionMap[type];
   if (sectionId) document.getElementById(sectionId).style.display = 'flex';
+  document.getElementById('size-picker-group').style.display = 'block';
 }
 
-function setDefaultSizes(type) {
-  const defaults = {
-    fader: [1, 4],
-    toggle: [1, 1],
-    button: [2, 1],
-    macro: [2, 1],
-    vu_meter: [1, 3],
-    strip_panel: [1, 4],
-    bus_panel: [1, 3],
-    label: [2, 1],
-  };
-  const [cols, rows] = defaults[type] || [1, 2];
-  document.getElementById('cfg-col-span').value = cols;
-  document.getElementById('cfg-row-span').value = rows;
-}
+function populateModal(control) {
+  const config = control.config || {};
+  document.getElementById('cfg-label').value = config.label || config.text || '';
 
-function populateModal(ctrl) {
-  showConfigSection(ctrl.type);
-  const cfg = ctrl.config || {};
-  document.getElementById('cfg-label').value = cfg.label || cfg.text || '';
-  document.getElementById('cfg-col-span').value = ctrl.colSpan || 1;
-  document.getElementById('cfg-row-span').value = ctrl.rowSpan || 2;
+  if (control.type === 'fader') {
+    setSelectValue('cfg-fader-param', config.parameter);
+    document.getElementById('cfg-fader-min').value = String(config.min ?? -60);
+    document.getElementById('cfg-fader-max').value = String(config.max ?? 12);
+    document.getElementById('cfg-fader-step').value = String(config.step ?? 0.1);
+    document.getElementById('cfg-fader-vu').checked = config.showVu !== false;
+  }
 
-  if (ctrl.type === 'fader') {
-    setSelectValue('cfg-fader-param', cfg.parameter);
-    document.getElementById('cfg-fader-min').value = cfg.min ?? -60;
-    document.getElementById('cfg-fader-max').value = cfg.max ?? 12;
-    document.getElementById('cfg-fader-step').value = cfg.step ?? 0.1;
-    document.getElementById('cfg-fader-vu').checked = cfg.showVu !== false;
-  } else if (ctrl.type === 'toggle' || ctrl.type === 'button') {
-    setSelectValue('cfg-toggle-param', cfg.parameter);
-    document.getElementById('cfg-toggle-color').value = cfg.activeColor || '#6c63ff';
-    document.getElementById('cfg-toggle-momentary').checked = !!cfg.momentary;
-  } else if (ctrl.type === 'macro') {
-    document.getElementById('cfg-macro-color').value = cfg.activeColor || '#ff9800';
-    document.getElementById('cfg-macro-momentary').checked = !!cfg.momentary;
-    (cfg.actions || []).forEach(a => addMacroAction(a));
-  } else if (ctrl.type === 'vu_meter') {
-    const src = cfg.stripIndex !== undefined ? `strip-${cfg.stripIndex}` : `bus-${cfg.busIndex ?? 0}`;
-    setSelectValue('cfg-vu-source', src);
-  } else if (ctrl.type === 'strip_panel') {
-    document.getElementById('cfg-strip-select').value = cfg.stripIndex ?? 0;
-    const checks = document.querySelectorAll('#cfg-strip-routing input');
-    checks.forEach(c => { c.checked = (cfg.routingButtons || ['A1','A2','B1','B2']).includes(c.value); });
-  } else if (ctrl.type === 'bus_panel') {
-    document.getElementById('cfg-bus-select').value = cfg.busIndex ?? 0;
+  if (control.type === 'toggle' || control.type === 'button') {
+    setSelectValue('cfg-toggle-param', config.parameter);
+    document.getElementById('cfg-toggle-color').value = config.activeColor || '#6c63ff';
+    document.getElementById('cfg-toggle-momentary').checked = !!config.momentary;
+  }
+
+  if (control.type === 'macro') {
+    document.getElementById('cfg-macro-color').value = config.activeColor || '#ff9800';
+    document.getElementById('cfg-macro-momentary').checked = !!config.momentary;
+    (config.actions || []).forEach(action => addMacroAction(action));
+  }
+
+  if (control.type === 'vu_meter') {
+    const sourceValue = config.stripIndex !== undefined
+      ? `strip-${config.stripIndex}`
+      : `bus-${config.busIndex ?? 0}`;
+    setSelectValue('cfg-vu-source', sourceValue);
+  }
+
+  if (control.type === 'strip_panel') {
+    document.getElementById('cfg-strip-select').value = String(config.stripIndex ?? 0);
+    const selected = config.routingButtons || ['A1', 'A2', 'B1', 'B2'];
+    document.querySelectorAll('#cfg-strip-routing input').forEach(input => {
+      input.checked = selected.includes(input.value);
+    });
+  }
+
+  if (control.type === 'bus_panel') {
+    document.getElementById('cfg-bus-select').value = String(config.busIndex ?? 0);
   }
 }
 
 function saveControl() {
-  const type = _editingId ? findControl(_editingId)?.type : document.querySelector('.type-card.selected')?.dataset.type;
-  if (!type && !_editingId) { alert('Please select a control type'); return; }
+  const type = _editingId ? findControl(_editingId)?.type : _selectedType;
+  if (!type) {
+    window.alert('Choose a control type first.');
+    return;
+  }
 
+  const config = buildControlConfig(type);
+  if (!config) return;
+
+  const page = currentPage();
+  if (!page) return;
+
+  const size = {
+    colSpan: _selectedSize.colSpan,
+    rowSpan: _selectedSize.rowSpan,
+  };
+
+  if (_editingId) {
+    const control = findControl(_editingId);
+    if (!control) return;
+
+    const resolved = resolvePlacement(
+      page.controls,
+      {
+        col: control.col,
+        row: control.row,
+        colSpan: size.colSpan,
+        rowSpan: size.rowSpan,
+      },
+      control.id,
+      currentGridColumns(),
+    );
+
+    control.col = resolved.col;
+    control.row = resolved.row;
+    control.colSpan = resolved.colSpan;
+    control.rowSpan = resolved.rowSpan;
+    control.config = config;
+  } else {
+    const placement = findNextOpenSlot(page.controls, size, currentGridColumns());
+    page.controls.push({
+      id: genId(),
+      type,
+      col: placement.col,
+      row: placement.row,
+      colSpan: size.colSpan,
+      rowSpan: size.rowSpan,
+      config,
+    });
+  }
+
+  closeModal();
+  _callbacks.commitLayout?.();
+}
+
+function buildControlConfig(type) {
   const label = document.getElementById('cfg-label').value.trim();
-  const colSpan = parseInt(document.getElementById('cfg-col-span').value);
-  const rowSpan = parseInt(document.getElementById('cfg-row-span').value);
 
-  let config = {};
-  const resolvedType = _editingId ? findControl(_editingId)?.type : type;
-
-  if (resolvedType === 'fader') {
-    config = {
+  if (type === 'fader') {
+    return {
       label: label || 'Fader',
       parameter: document.getElementById('cfg-fader-param').value,
-      min: parseFloat(document.getElementById('cfg-fader-min').value),
-      max: parseFloat(document.getElementById('cfg-fader-max').value),
-      step: parseFloat(document.getElementById('cfg-fader-step').value),
+      min: Number.parseFloat(document.getElementById('cfg-fader-min').value || '-60'),
+      max: Number.parseFloat(document.getElementById('cfg-fader-max').value || '12'),
+      step: Math.max(0.01, Number.parseFloat(document.getElementById('cfg-fader-step').value || '0.1')),
       showVu: document.getElementById('cfg-fader-vu').checked,
     };
-  } else if (resolvedType === 'toggle' || resolvedType === 'button') {
-    config = {
-      label: label || 'Button',
+  }
+
+  if (type === 'toggle' || type === 'button') {
+    return {
+      label: label || (type === 'button' ? 'Button' : 'Toggle'),
       parameter: document.getElementById('cfg-toggle-param').value,
       activeColor: document.getElementById('cfg-toggle-color').value,
       momentary: document.getElementById('cfg-toggle-momentary').checked,
     };
-  } else if (resolvedType === 'macro') {
-    const actionRows = document.querySelectorAll('.macro-action-row');
-    const actions = [];
-    actionRows.forEach(row => {
-      const p = row.querySelector('.macro-param').value;
-      const v = parseFloat(row.querySelector('.macro-value').value);
-      if (p) actions.push({ param: p, value: v });
-    });
-    config = {
+  }
+
+  if (type === 'macro') {
+    const actions = [...document.querySelectorAll('.macro-action-row')].map(row => ({
+      param: row.querySelector('.macro-param').value,
+      value: Number.parseFloat(row.querySelector('.macro-value').value || '0'),
+    })).filter(action => action.param);
+
+    return {
       label: label || 'Macro',
       activeColor: document.getElementById('cfg-macro-color').value,
       momentary: document.getElementById('cfg-macro-momentary').checked,
       actions,
     };
-  } else if (resolvedType === 'vu_meter') {
-    const src = document.getElementById('cfg-vu-source').value;
-    const [kind, idx] = src.split('-');
-    config = {
+  }
+
+  if (type === 'vu_meter') {
+    const [kind, indexValue] = document.getElementById('cfg-vu-source').value.split('-');
+    const index = Number.parseInt(indexValue, 10) || 0;
+
+    return {
       label: label || 'Level',
-      ...(kind === 'strip' ? { stripIndex: parseInt(idx) } : { busIndex: parseInt(idx) })
+      ...(kind === 'strip' ? { stripIndex: index } : { busIndex: index }),
     };
-  } else if (resolvedType === 'strip_panel') {
-    const si = parseInt(document.getElementById('cfg-strip-select').value);
-    const routingButtons = [...document.querySelectorAll('#cfg-strip-routing input:checked')].map(c => c.value);
-    config = { label: label || VM_STRIPS[si].fullLabel, stripIndex: si, routingButtons };
-  } else if (resolvedType === 'bus_panel') {
-    const bi = parseInt(document.getElementById('cfg-bus-select').value);
-    config = { label: label || VM_BUSES[bi].fullLabel, busIndex: bi };
-  } else if (resolvedType === 'label') {
-    config = { text: label || 'Label' };
   }
 
-  if (_editingId) {
-    const ctrl = findControl(_editingId);
-    if (ctrl) { ctrl.config = config; ctrl.colSpan = colSpan; ctrl.rowSpan = rowSpan; }
-  } else {
-    const page = currentPage();
-    if (page) {
-      page.controls.push({ id: genId(), type: resolvedType, colSpan, rowSpan, config });
-    }
+  if (type === 'strip_panel') {
+    const stripIndex = Number.parseInt(document.getElementById('cfg-strip-select').value, 10) || 0;
+    const routingButtons = [...document.querySelectorAll('#cfg-strip-routing input:checked')].map(input => input.value);
+    return {
+      label: label || VM_STRIPS[stripIndex].fullLabel,
+      stripIndex,
+      routingButtons,
+    };
   }
 
-  closeModal();
-  _callbacks.onSave?.();
+  if (type === 'bus_panel') {
+    const busIndex = Number.parseInt(document.getElementById('cfg-bus-select').value, 10) || 0;
+    return {
+      label: label || VM_BUSES[busIndex].fullLabel,
+      busIndex,
+    };
+  }
+
+  if (type === 'label') {
+    return {
+      text: label || 'Label',
+    };
+  }
+
+  return null;
 }
 
 function addMacroAction(preset = {}) {
@@ -354,46 +435,37 @@ function addMacroAction(preset = {}) {
   const row = document.createElement('div');
   row.className = 'macro-action-row';
 
-  const pSel = document.createElement('select');
-  pSel.className = 'form-select macro-param';
-  buildParamOptions(true).forEach(({ value, label }) => {
-    const o = document.createElement('option');
-    o.value = value; o.textContent = label;
-    pSel.appendChild(o);
+  const paramSelect = document.createElement('select');
+  paramSelect.className = 'form-select macro-param';
+  buildParamOptions(false).forEach(({ value, label }) => {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    paramSelect.appendChild(option);
   });
-  if (preset.param) setSelectValue2(pSel, preset.param);
+  if (preset.param) paramSelect.value = preset.param;
 
-  const vInput = document.createElement('input');
-  vInput.type = 'number'; vInput.className = 'form-input macro-value';
-  vInput.step = '0.1'; vInput.value = preset.value ?? 1;
-  vInput.style.maxWidth = '80px';
+  const valueInput = document.createElement('input');
+  valueInput.type = 'number';
+  valueInput.className = 'form-input macro-value';
+  valueInput.step = '0.1';
+  valueInput.value = String(preset.value ?? 1);
 
-  const del = document.createElement('button');
-  del.className = 'macro-action-del'; del.textContent = '×';
-  del.addEventListener('click', () => row.remove());
+  const removeButton = document.createElement('button');
+  removeButton.type = 'button';
+  removeButton.className = 'macro-action-del';
+  removeButton.textContent = '×';
+  removeButton.addEventListener('click', () => row.remove());
 
-  row.appendChild(pSel);
-  row.appendChild(vInput);
-  row.appendChild(del);
+  row.appendChild(paramSelect);
+  row.appendChild(valueInput);
+  row.appendChild(removeButton);
   list.appendChild(row);
 }
 
-// ── Settings Modal ────────────────────────────────────────────────────────────
-export function openSettings() {
-  const settings = _state.layout?.settings || {};
-  document.getElementById('s-accent-color').value = settings.accentColor || '#6c63ff';
-  document.getElementById('s-grid-cols').value = settings.gridColumns || 8;
-
-  // Bridge info
-  const info = _state.bridge || {};
-  const vmTypeNames = { 1: 'VoiceMeeter', 2: 'VoiceMeeter Banana', 3: 'VoiceMeeter Potato' };
-  document.getElementById('s-status').textContent = info.connected ? '🟢 Connected' : '🔴 Disconnected';
-  document.getElementById('s-vm-type').textContent = vmTypeNames[info.vmType] || '—';
-  document.getElementById('s-vm-version').textContent = info.vmVersion || '—';
-
-  // Pages list
-  renderPagesList();
-  document.getElementById('settings-modal').style.display = 'flex';
+function closeModal() {
+  document.getElementById('modal-backdrop').style.display = 'none';
+  _editingId = null;
 }
 
 function closeSettings() {
@@ -402,113 +474,475 @@ function closeSettings() {
 
 function applySettings() {
   const accentColor = document.getElementById('s-accent-color').value;
-  const gridColumns = parseInt(document.getElementById('s-grid-cols').value);
+  const gridColumns = clampInt(document.getElementById('s-grid-cols').value, 4, 12);
 
-  if (!_state.layout.settings) _state.layout.settings = {};
-  _state.layout.settings.accentColor = accentColor;
-  _state.layout.settings.gridColumns = gridColumns;
+  _state.layout.settings = {
+    ...(_state.layout.settings || {}),
+    accentColor,
+    gridColumns,
+  };
 
-  document.documentElement.style.setProperty('--accent', accentColor);
-  document.querySelector('.control-grid')?.style.setProperty('--grid-cols', gridColumns);
+  _state.layout.pages.forEach(page => {
+    page.controls.forEach(control => {
+      control.colSpan = Math.min(control.colSpan || 1, gridColumns);
+      control.col = Math.min(control.col || 1, gridColumns - control.colSpan + 1);
+    });
+  });
 
-  _callbacks.onSave?.();
   closeSettings();
+  _callbacks.commitLayout?.();
 }
 
 function renderPagesList() {
   const listEl = document.getElementById('pages-list');
   listEl.innerHTML = '';
-  (_state.layout?.pages || []).forEach((page, i) => {
+
+  _state.layout.pages.forEach((page, index) => {
     const item = document.createElement('div');
     item.className = 'page-item';
 
-    const input = document.createElement('input');
-    input.type = 'text'; input.value = page.name;
-    input.addEventListener('change', () => { page.name = input.value; _callbacks.onSave?.(); });
-
-    const del = document.createElement('button');
-    del.className = 'page-item-del'; del.textContent = '×';
-    del.addEventListener('click', () => {
-      if (_state.layout.pages.length <= 1) { alert('Cannot delete the last page.'); return; }
-      _state.layout.pages.splice(i, 1);
-      if (_state.ui.currentPage >= _state.layout.pages.length) _state.ui.currentPage = 0;
+    const openButton = document.createElement('button');
+    openButton.type = 'button';
+    openButton.className = 'btn-secondary btn-sm';
+    openButton.textContent = index === _state.ui.currentPage ? 'Current' : 'Open';
+    openButton.addEventListener('click', () => {
+      _state.ui.currentPage = index;
+      _callbacks.commitLayout?.({ persist: false, rerender: true });
       renderPagesList();
-      _callbacks.onSave?.();
     });
 
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = page.name;
+    input.addEventListener('change', () => {
+      page.name = input.value.trim() || `Page ${index + 1}`;
+      _callbacks.commitLayout?.();
+      renderPagesList();
+    });
+
+    item.appendChild(openButton);
     item.appendChild(input);
-    item.appendChild(del);
+
+    if (_state.layout.pages.length > 1) {
+      const deleteButton = document.createElement('button');
+      deleteButton.type = 'button';
+      deleteButton.className = 'page-item-del';
+      deleteButton.textContent = '×';
+      deleteButton.title = `Delete ${page.name}`;
+      deleteButton.addEventListener('click', () => {
+        if (!window.confirm(`Delete page "${page.name}"?`)) return;
+        _state.layout.pages.splice(index, 1);
+        _state.ui.currentPage = Math.min(_state.ui.currentPage, _state.layout.pages.length - 1);
+        _callbacks.commitLayout?.();
+        renderPagesList();
+      });
+      item.appendChild(deleteButton);
+    }
+
     listEl.appendChild(item);
   });
 }
 
-// ── Page modal ─────────────────────────────────────────────────────────────────
-let _pageEditIndex = null;
-export function openPageNameModal(index) {
-  _pageEditIndex = index;
-  const isEdit = index !== null;
-  document.getElementById('page-modal-title').textContent = isEdit ? 'Rename Page' : 'Add Page';
-  document.getElementById('page-name-input').value = isEdit ? _state.layout.pages[index]?.name || '' : '';
-  document.getElementById('page-modal').style.display = 'flex';
-  setTimeout(() => document.getElementById('page-name-input').focus(), 50);
-}
-function closePageModal() { document.getElementById('page-modal').style.display = 'none'; }
-function savePageName() {
-  const name = document.getElementById('page-name-input').value.trim() || 'Page';
-  if (_pageEditIndex !== null) {
-    _state.layout.pages[_pageEditIndex].name = name;
-  } else {
-    _state.layout.pages.push({ id: genId(), name, grid: { columns: 8 }, controls: [] });
-  }
-  closePageModal();
-  _callbacks.onSave?.();
+function closePageModal() {
+  document.getElementById('page-modal').style.display = 'none';
+  _pageEditIndex = null;
 }
 
-// ── Export / Import ───────────────────────────────────────────────────────────
+function savePageName() {
+  const name = document.getElementById('page-name-input').value.trim() || 'Page';
+
+  if (Number.isInteger(_pageEditIndex)) {
+    _state.layout.pages[_pageEditIndex].name = name;
+  } else {
+    _state.layout.pages.push({
+      id: genId('page'),
+      name,
+      controls: [],
+    });
+    _state.ui.currentPage = _state.layout.pages.length - 1;
+  }
+
+  closePageModal();
+  _callbacks.commitLayout?.();
+}
+
 function exportLayout() {
   const json = JSON.stringify(_state.layout, null, 2);
   const blob = new Blob([json], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
-  const a = document.createElement('a'); a.href = url;
-  a.download = 'vm-layout.json'; a.click();
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = 'vm-layout.json';
+  anchor.click();
   URL.revokeObjectURL(url);
 }
 
-function importLayout(e) {
-  const file = e.target.files[0];
+function importLayout(event) {
+  const file = event.target.files?.[0];
   if (!file) return;
+
   const reader = new FileReader();
-  reader.onload = (ev) => {
+  reader.onload = loadEvent => {
     try {
-      const imported = JSON.parse(ev.target.result);
-      Object.assign(_state.layout, imported);
-      _callbacks.onSave?.();
+      const imported = JSON.parse(loadEvent.target.result);
+      _callbacks.replaceLayout?.(imported);
       closeSettings();
-    } catch { alert('Invalid layout file'); }
+    } catch {
+      window.alert('Invalid layout JSON.');
+    }
   };
   reader.readAsText(file);
-  e.target.value = '';
+  event.target.value = '';
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function currentPage() {
-  return _state.layout?.pages?.[_state.ui.currentPage];
+function buildSizePicker() {
+  const picker = document.getElementById('size-picker');
+  picker.innerHTML = '';
+  const cols = Math.min(currentGridColumns(), 6);
+  const rows = 4;
+  picker.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+
+  for (let row = 1; row <= rows; row += 1) {
+    for (let col = 1; col <= cols; col += 1) {
+      const cell = document.createElement('button');
+      cell.type = 'button';
+      cell.className = 'size-cell';
+      cell.dataset.colspan = String(col);
+      cell.dataset.rowspan = String(row);
+      cell.addEventListener('mouseenter', () => paintSizePicker(col, row, false));
+      cell.addEventListener('focus', () => paintSizePicker(col, row, false));
+      cell.addEventListener('click', () => {
+        _selectedSize = { colSpan: col, rowSpan: row };
+        updateSizePicker();
+      });
+      picker.appendChild(cell);
+    }
+  }
+
+  picker.addEventListener('mouseleave', () => updateSizePicker());
 }
+
+function updateSizePicker() {
+  const cols = Math.min(currentGridColumns(), 6);
+  const picker = document.getElementById('size-picker');
+  picker.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+  paintSizePicker(_selectedSize.colSpan, _selectedSize.rowSpan, true);
+  document.getElementById('size-display').textContent = `${_selectedSize.colSpan} × ${_selectedSize.rowSpan}`;
+}
+
+function paintSizePicker(colSpan, rowSpan, committed) {
+  document.querySelectorAll('.size-cell').forEach(cell => {
+    const cellCol = Number.parseInt(cell.dataset.colspan, 10);
+    const cellRow = Number.parseInt(cell.dataset.rowspan, 10);
+    const inside = cellCol <= colSpan && cellRow <= rowSpan;
+    cell.classList.toggle('preview', inside);
+    cell.classList.toggle('selected', committed && inside);
+  });
+  document.getElementById('size-display').textContent = `${colSpan} × ${rowSpan}`;
+}
+
+function populateStripBusSources() {
+  const stripSelect = document.getElementById('cfg-strip-select');
+  const busSelect = document.getElementById('cfg-bus-select');
+  const vuSource = document.getElementById('cfg-vu-source');
+
+  VM_STRIPS.forEach(strip => {
+    const stripOption = document.createElement('option');
+    stripOption.value = String(strip.index);
+    stripOption.textContent = strip.fullLabel;
+    stripSelect.appendChild(stripOption);
+
+    const vuOption = document.createElement('option');
+    vuOption.value = `strip-${strip.index}`;
+    vuOption.textContent = `Strip: ${strip.fullLabel}`;
+    vuSource.appendChild(vuOption);
+  });
+
+  VM_BUSES.forEach(bus => {
+    const busOption = document.createElement('option');
+    busOption.value = String(bus.index);
+    busOption.textContent = bus.fullLabel;
+    busSelect.appendChild(busOption);
+
+    const vuOption = document.createElement('option');
+    vuOption.value = `bus-${bus.index}`;
+    vuOption.textContent = `Bus: ${bus.fullLabel}`;
+    vuSource.appendChild(vuOption);
+  });
+}
+
+function populateParamDropdown(id, options) {
+  const select = document.getElementById(id);
+  select.innerHTML = '';
+  options.forEach(({ value, label }) => {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    select.appendChild(option);
+  });
+}
+
+function startGridGesture({ mode, event, gridEl, card }) {
+  const control = findControl(card.dataset.id);
+  if (!control) return;
+
+  const metrics = getGridMetrics(gridEl);
+  const original = {
+    col: control.col,
+    row: control.row,
+    colSpan: control.colSpan,
+    rowSpan: control.rowSpan,
+  };
+
+  _gridGesture = {
+    mode,
+    gridEl,
+    card,
+    controlId: control.id,
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+    original,
+    lastValid: original,
+    metrics,
+  };
+
+  card.classList.add('is-dragging');
+  showDropPreview(original, false);
+  window.addEventListener('pointermove', onGridGestureMove);
+  window.addEventListener('pointerup', endGridGesture);
+  window.addEventListener('pointercancel', endGridGesture);
+  event.preventDefault();
+}
+
+function onGridGestureMove(event) {
+  if (!_gridGesture) return;
+
+  const { mode, controlId, original, metrics } = _gridGesture;
+  const page = currentPage();
+  if (!page) return;
+
+  const deltaCols = Math.round((event.clientX - _gridGesture.startX) / metrics.stepX);
+  const deltaRows = Math.round((event.clientY - _gridGesture.startY) / metrics.stepY);
+
+  if (mode === 'move') {
+    const candidate = clampPlacement({
+      col: original.col + deltaCols,
+      row: original.row + deltaRows,
+      colSpan: original.colSpan,
+      rowSpan: original.rowSpan,
+    }, metrics.cols);
+
+    const resolved = resolvePlacement(page.controls, candidate, controlId, metrics.cols);
+    _gridGesture.lastValid = resolved;
+    showDropPreview(resolved, false);
+    return;
+  }
+
+  const candidate = clampPlacement({
+    col: original.col,
+    row: original.row,
+    colSpan: original.colSpan + deltaCols,
+    rowSpan: original.rowSpan + deltaRows,
+  }, metrics.cols);
+
+  const blocked = collides(page.controls, candidate, controlId);
+  if (!blocked) {
+    _gridGesture.lastValid = candidate;
+  }
+  showDropPreview(blocked ? candidate : _gridGesture.lastValid, blocked);
+}
+
+function endGridGesture() {
+  if (!_gridGesture) return;
+
+  const { card, controlId, lastValid, original } = _gridGesture;
+  card.classList.remove('is-dragging');
+
+  const control = findControl(controlId);
+  if (control && hasPlacementChanged(original, lastValid)) {
+    control.col = lastValid.col;
+    control.row = lastValid.row;
+    control.colSpan = lastValid.colSpan;
+    control.rowSpan = lastValid.rowSpan;
+    _callbacks.commitLayout?.();
+  } else {
+    _callbacks.commitLayout?.({ persist: false, rerender: true });
+  }
+
+  hideDropPreview();
+  window.removeEventListener('pointermove', onGridGestureMove);
+  window.removeEventListener('pointerup', endGridGesture);
+  window.removeEventListener('pointercancel', endGridGesture);
+  _gridGesture = null;
+}
+
+function showDropPreview(placement, invalid) {
+  const metrics = getGridMetrics(_gridGesture?.gridEl || document.getElementById('control-grid'));
+  const rect = placementToPixels(metrics, placement);
+
+  previewEl.style.display = 'block';
+  previewEl.style.left = `${rect.left}px`;
+  previewEl.style.top = `${rect.top}px`;
+  previewEl.style.width = `${rect.width}px`;
+  previewEl.style.height = `${rect.height}px`;
+  previewEl.classList.toggle('invalid', !!invalid);
+}
+
+function hideDropPreview() {
+  previewEl.style.display = 'none';
+  previewEl.classList.remove('invalid');
+}
+
+function placementToPixels(metrics, placement) {
+  return {
+    left: metrics.gridOffsetLeft + (placement.col - 1) * metrics.stepX,
+    top: metrics.gridOffsetTop + (placement.row - 1) * metrics.stepY,
+    width: metrics.cellWidth * placement.colSpan + metrics.gap * (placement.colSpan - 1),
+    height: metrics.rowHeight * placement.rowSpan + metrics.gap * (placement.rowSpan - 1),
+  };
+}
+
+function getGridMetrics(gridEl) {
+  const gridRect = gridEl.getBoundingClientRect();
+  const mainRect = mainAreaEl.getBoundingClientRect();
+  const styles = window.getComputedStyle(gridEl);
+  const cols = currentGridColumns();
+  const gap = Number.parseFloat(styles.columnGap || styles.gap || '8') || 8;
+  const rowHeight = Number.parseFloat(styles.gridAutoRows || '80') || 80;
+  const cellWidth = (gridRect.width - gap * (cols - 1)) / cols;
+
+  return {
+    cols,
+    gap,
+    rowHeight,
+    cellWidth,
+    stepX: cellWidth + gap,
+    stepY: rowHeight + gap,
+    gridOffsetLeft: gridRect.left - mainRect.left + mainAreaEl.scrollLeft,
+    gridOffsetTop: gridRect.top - mainRect.top + mainAreaEl.scrollTop,
+  };
+}
+
+function deleteControl(id) {
+  const page = currentPage();
+  if (!page) return;
+  page.controls = page.controls.filter(control => control.id !== id);
+  _callbacks.commitLayout?.();
+}
+
+function currentPage() {
+  return _state.layout?.pages?.[_state.ui.currentPage] || null;
+}
+
+function currentGridColumns() {
+  return clampInt(_state.layout?.settings?.gridColumns ?? 8, 4, 12);
+}
+
 function findControl(id) {
-  for (const page of _state.layout?.pages || []) {
-    const c = page.controls.find(c => c.id === id);
-    if (c) return c;
+  for (const page of _state.layout.pages || []) {
+    const control = page.controls.find(item => item.id === id);
+    if (control) return control;
   }
   return null;
 }
-function genId() { return 'ctrl_' + Math.random().toString(36).slice(2, 9); }
-function populateParamDropdown(id, opts) {
-  const sel = document.getElementById(id);
-  opts.forEach(({ value, label }) => {
-    const o = document.createElement('option');
-    o.value = value; o.textContent = label;
-    sel.appendChild(o);
+
+function sizeForType(type) {
+  const [colSpan, rowSpan] = DEFAULT_SIZES[type] || [1, 2];
+  return { colSpan, rowSpan };
+}
+
+function clampPlacement(placement, cols) {
+  const colSpan = clampInt(placement.colSpan, 1, cols);
+  return {
+    col: clampInt(placement.col, 1, cols - colSpan + 1),
+    row: Math.max(1, clampInt(placement.row, 1, 999)),
+    colSpan,
+    rowSpan: Math.max(1, clampInt(placement.rowSpan, 1, 20)),
+  };
+}
+
+function resolvePlacement(controls, candidate, ignoreId, cols) {
+  const clamped = clampPlacement(candidate, cols);
+  if (!collides(controls, clamped, ignoreId)) return clamped;
+
+  let best = null;
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  for (let row = 1; row <= 120; row += 1) {
+    for (let col = 1; col <= cols - clamped.colSpan + 1; col += 1) {
+      const next = {
+        col,
+        row,
+        colSpan: clamped.colSpan,
+        rowSpan: clamped.rowSpan,
+      };
+      if (collides(controls, next, ignoreId)) continue;
+
+      const score = Math.abs(next.row - clamped.row) * 10 + Math.abs(next.col - clamped.col);
+      if (score < bestScore) {
+        best = next;
+        bestScore = score;
+      }
+    }
+  }
+
+  return best || clamped;
+}
+
+function findNextOpenSlot(controls, size, cols) {
+  for (let row = 1; row <= 120; row += 1) {
+    for (let col = 1; col <= cols - size.colSpan + 1; col += 1) {
+      const candidate = {
+        col,
+        row,
+        colSpan: size.colSpan,
+        rowSpan: size.rowSpan,
+      };
+      if (!collides(controls, candidate)) return candidate;
+    }
+  }
+
+  return {
+    col: 1,
+    row: 1,
+    colSpan: size.colSpan,
+    rowSpan: size.rowSpan,
+  };
+}
+
+function collides(controls, candidate, ignoreId = null) {
+  return controls.some(control => {
+    if (ignoreId && control.id === ignoreId) return false;
+    return rectsOverlap(control, candidate);
   });
 }
-function setSelectValue(id, val) { const el = document.getElementById(id); if (el && val) el.value = val; }
-function setSelectValue2(el, val) { if (el && val) el.value = val; }
+
+function rectsOverlap(a, b) {
+  const aRight = a.col + a.colSpan - 1;
+  const aBottom = a.row + a.rowSpan - 1;
+  const bRight = b.col + b.colSpan - 1;
+  const bBottom = b.row + b.rowSpan - 1;
+
+  return !(aRight < b.col || bRight < a.col || aBottom < b.row || bBottom < a.row);
+}
+
+function hasPlacementChanged(a, b) {
+  return a.col !== b.col || a.row !== b.row || a.colSpan !== b.colSpan || a.rowSpan !== b.rowSpan;
+}
+
+function setSelectValue(id, value) {
+  if (!value) return;
+  const element = document.getElementById(id);
+  if (element) element.value = value;
+}
+
+function clampInt(value, min, max) {
+  const parsed = Number.parseInt(value, 10);
+  if (Number.isNaN(parsed)) return min;
+  return Math.min(max, Math.max(min, parsed));
+}
+
+function genId(prefix = 'ctrl') {
+  return `${prefix}_${Math.random().toString(36).slice(2, 9)}`;
+}
