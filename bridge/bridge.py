@@ -250,6 +250,9 @@ async def run_bridge():
                     "type": "hello",
                     "vmType": vm_type,
                     "vmVersion": vm_ver,
+                    "capabilities": {
+                        "desktopActions": True,
+                    },
                 }))
                 log.info("VoiceMeeter type=%d version=%s", vm_type, vm_ver)
 
@@ -327,6 +330,10 @@ async def receive_loop(ws):
                 run_desktop_action(msg.get("action", {}))
             except Exception as e:
                 log.error("Desktop action failed: %s", e)
+                await ws.send(json.dumps({
+                    "type": "error",
+                    "message": f"Desktop action failed: {e}",
+                }))
 
 async def poll_loop(ws):
     """Periodically poll VoiceMeeter for state changes and level data."""

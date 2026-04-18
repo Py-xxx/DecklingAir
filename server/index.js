@@ -64,7 +64,7 @@ function saveLayout() {
 let vmState = {};
 let vmLevels = [];
 let bridgeWs = null;
-let bridgeInfo = { connected: false, vmType: null, vmVersion: null };
+let bridgeInfo = { connected: false, vmType: null, vmVersion: null, capabilities: {} };
 
 app.disable('etag');
 app.use(express.json());
@@ -139,6 +139,16 @@ io.on('connection', (socket) => {
   });
 
   socket.on('desktop:action', (action) => {
+    if (!bridgeWs || bridgeWs.readyState !== WebSocket.OPEN) {
+      socket.emit('bridge:error', 'Desktop actions are unavailable because the Windows bridge is offline.');
+      return;
+    }
+
+    if (!bridgeInfo.capabilities?.desktopActions) {
+      socket.emit('bridge:error', 'Desktop actions require an updated Windows bridge. Restart or rebuild the bridge on the PC.');
+      return;
+    }
+
     sendToBridge({ type: 'desktopAction', action });
   });
 
@@ -182,7 +192,12 @@ wss.on('connection', (ws, req) => {
 
     switch (msg.type) {
       case 'hello':
-        bridgeInfo = { connected: true, vmType: msg.vmType, vmVersion: msg.vmVersion };
+        bridgeInfo = {
+          connected: true,
+          vmType: msg.vmType,
+          vmVersion: msg.vmVersion,
+          capabilities: msg.capabilities || {},
+        };
         io.emit('bridge:status', bridgeInfo);
         console.log(`VM type: ${msg.vmType}, version: ${msg.vmVersion}`);
         break;
@@ -212,7 +227,7 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     console.log('Bridge disconnected');
     bridgeWs = null;
-    bridgeInfo = { connected: false, vmType: null, vmVersion: null };
+    bridgeInfo = { connected: false, vmType: null, vmVersion: null, capabilities: {} };
     io.emit('bridge:status', bridgeInfo);
   });
 
