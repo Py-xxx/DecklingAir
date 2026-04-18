@@ -6,6 +6,7 @@ const DEFAULT_SIZES = {
   toggle: [1, 1],
   button: [2, 1],
   macro: [2, 1],
+  desktop_action: [2, 1],
   vu_meter: [1, 3],
   strip_panel: [1, 4],
   bus_panel: [1, 3],
@@ -48,6 +49,7 @@ export function initEditor(state, callbacks) {
   });
 
   document.getElementById('btn-add-macro-action').addEventListener('click', () => addMacroAction());
+  document.getElementById('cfg-desktop-kind').addEventListener('change', updateDesktopActionFields);
 
   document.getElementById('settings-close').addEventListener('click', closeSettings);
   document.getElementById('settings-cancel').addEventListener('click', closeSettings);
@@ -197,6 +199,12 @@ function resetModal() {
   document.getElementById('cfg-macro-momentary').checked = false;
   document.getElementById('macro-actions-list').innerHTML = '';
 
+  document.getElementById('cfg-desktop-kind').value = 'launch';
+  document.getElementById('cfg-desktop-color').value = '#3aa6ff';
+  document.getElementById('cfg-desktop-target').value = '';
+  document.getElementById('cfg-desktop-args').value = '';
+  updateDesktopActionFields();
+
   document.getElementById('cfg-vu-source').selectedIndex = 0;
   document.getElementById('cfg-strip-select').selectedIndex = 0;
   document.querySelectorAll('#cfg-strip-routing input').forEach(input => {
@@ -246,6 +254,7 @@ function showConfigSection(type) {
     toggle: 'cfg-toggle',
     button: 'cfg-toggle',
     macro: 'cfg-macro',
+    desktop_action: 'cfg-desktop-action',
     vu_meter: 'cfg-vu',
     strip_panel: 'cfg-strip-panel',
     bus_panel: 'cfg-bus-panel',
@@ -297,6 +306,14 @@ function populateModal(control) {
 
   if (control.type === 'bus_panel') {
     document.getElementById('cfg-bus-select').value = String(config.busIndex ?? 0);
+  }
+
+  if (control.type === 'desktop_action') {
+    document.getElementById('cfg-desktop-kind').value = config.action || 'launch';
+    document.getElementById('cfg-desktop-color').value = config.activeColor || '#3aa6ff';
+    document.getElementById('cfg-desktop-target').value = config.target || '';
+    document.getElementById('cfg-desktop-args').value = config.args || '';
+    updateDesktopActionFields();
   }
 }
 
@@ -393,6 +410,25 @@ function buildControlConfig(type) {
     };
   }
 
+  if (type === 'desktop_action') {
+    const action = document.getElementById('cfg-desktop-kind').value;
+    const target = document.getElementById('cfg-desktop-target').value.trim();
+    const args = document.getElementById('cfg-desktop-args').value.trim();
+
+    if (requiresDesktopTarget(action) && !target) {
+      window.alert('This desktop action needs a target.');
+      return null;
+    }
+
+    return {
+      label: label || defaultDesktopActionLabel(action),
+      action,
+      target,
+      args,
+      activeColor: document.getElementById('cfg-desktop-color').value,
+    };
+  }
+
   if (type === 'vu_meter') {
     const [kind, indexValue] = document.getElementById('cfg-vu-source').value.split('-');
     const index = Number.parseInt(indexValue, 10) || 0;
@@ -461,6 +497,115 @@ function addMacroAction(preset = {}) {
   row.appendChild(valueInput);
   row.appendChild(removeButton);
   list.appendChild(row);
+}
+
+function updateDesktopActionFields() {
+  const action = document.getElementById('cfg-desktop-kind').value;
+  const targetGroup = document.getElementById('cfg-desktop-target-group');
+  const argsGroup = document.getElementById('cfg-desktop-args-group');
+  const targetLabel = document.getElementById('cfg-desktop-target-label');
+  const targetInput = document.getElementById('cfg-desktop-target');
+  const help = document.getElementById('cfg-desktop-help');
+
+  const hasTarget = requiresDesktopTarget(action);
+  const usesArgs = action === 'launch';
+
+  targetGroup.style.display = hasTarget ? 'flex' : 'none';
+  argsGroup.style.display = usesArgs ? 'flex' : 'none';
+
+  const config = desktopActionUiMeta(action);
+  targetLabel.textContent = config.label;
+  targetInput.placeholder = config.placeholder;
+  help.textContent = config.help;
+}
+
+function requiresDesktopTarget(action) {
+  return ['launch', 'open_url', 'key_combo'].includes(action);
+}
+
+function defaultDesktopActionLabel(action) {
+  const labels = {
+    launch: 'Launch',
+    open_url: 'Open URL',
+    screenshot: 'Screenshot',
+    media_play_pause: 'Play / Pause',
+    media_next: 'Next Track',
+    media_previous: 'Previous Track',
+    volume_up: 'Volume Up',
+    volume_down: 'Volume Down',
+    volume_mute: 'Mute',
+    lock: 'Lock PC',
+    sleep: 'Sleep PC',
+    key_combo: 'Shortcut',
+  };
+  return labels[action] || 'Shortcut';
+}
+
+function desktopActionUiMeta(action) {
+  const meta = {
+    launch: {
+      label: 'Path',
+      placeholder: 'C:\\Program Files\\App\\app.exe or .lnk',
+      help: 'Launch an app, folder, file, or shortcut on the Windows PC.',
+    },
+    open_url: {
+      label: 'URL',
+      placeholder: 'https://example.com',
+      help: 'Open a website in the default browser on the Windows PC.',
+    },
+    key_combo: {
+      label: 'Key Combo',
+      placeholder: 'ctrl+alt+m',
+      help: 'Send a keyboard shortcut like ctrl+shift+esc or win+d.',
+    },
+    screenshot: {
+      label: 'Target',
+      placeholder: '',
+      help: 'Save a full-screen screenshot in the Windows Pictures\\VM Control Screenshots folder.',
+    },
+    media_play_pause: {
+      label: 'Target',
+      placeholder: '',
+      help: 'Toggle media playback on the Windows PC.',
+    },
+    media_next: {
+      label: 'Target',
+      placeholder: '',
+      help: 'Skip to the next media track.',
+    },
+    media_previous: {
+      label: 'Target',
+      placeholder: '',
+      help: 'Go to the previous media track.',
+    },
+    volume_up: {
+      label: 'Target',
+      placeholder: '',
+      help: 'Raise the system volume with one press per tap.',
+    },
+    volume_down: {
+      label: 'Target',
+      placeholder: '',
+      help: 'Lower the system volume with one press per tap.',
+    },
+    volume_mute: {
+      label: 'Target',
+      placeholder: '',
+      help: 'Toggle the system mute state.',
+    },
+    lock: {
+      label: 'Target',
+      placeholder: '',
+      help: 'Lock the Windows workstation immediately.',
+    },
+    sleep: {
+      label: 'Target',
+      placeholder: '',
+      help: 'Put the Windows PC to sleep.',
+    },
+  };
+
+  return meta[action] || meta.launch;
 }
 
 function closeModal() {

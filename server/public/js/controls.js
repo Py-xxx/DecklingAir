@@ -1,4 +1,4 @@
-import { vmSet, vmMacro } from './socket.js';
+import { desktopAction, vmSet, vmMacro } from './socket.js';
 
 // ── VM parameter catalogue ────────────────────────────────────────────────────
 export const VM_STRIPS = Array.from({ length: 8 }, (_, i) => ({
@@ -94,7 +94,7 @@ export function updateVuColumn(col, linear) {
 }
 
 // ── Custom fader widget ───────────────────────────────────────────────────────
-// Returns a div.fader-widget that exposes .setValue(v) and .setLevelL(lin) / .setLevelR(lin)
+// Returns a div.fader-widget that exposes .setValue(v) and .setLevels(l, r).
 export function createFaderWidget({ min = -60, max = 12, step = 0.1, value = 0, showVu = true, onChange }) {
   const widget = document.createElement('div');
   widget.className = 'fader-widget';
@@ -195,8 +195,7 @@ export function createFaderWidget({ min = -60, max = 12, step = 0.1, value = 0, 
 
   widget.setValue = v => { current = parseFloat(v); updateDisplay(current); };
 
-  // VU update (linear 0-1+)
-  widget.setLevel = (linear) => {
+  function paintVu(linear) {
     if (!vuCol) return;
     const db   = linear > 0 ? 20 * Math.log10(linear) : -Infinity;
     const norm2 = Math.min(1, Math.max(0, (db + 60) / 66));
@@ -210,6 +209,15 @@ export function createFaderWidget({ min = -60, max = 12, step = 0.1, value = 0, 
         s.className = 'fw-vu-seg';
       }
     }
+  }
+
+  // Use the hotter of L/R so a strip doesn't appear dead when only one side has signal.
+  widget.setLevels = (left, right = left) => {
+    paintVu(Math.max(left ?? 0, right ?? 0));
+  };
+
+  widget.setLevel = (linear) => {
+    paintVu(linear);
   };
 
   return widget;
@@ -313,7 +321,10 @@ export function renderFader(ctrl, vmState) {
   };
   card._updateLevels = (levels) => {
     const m = param.match(/Strip\[(\d+)\]/);
-    if (m) widget.setLevel(levels[parseInt(m[1]) * 2] ?? 0);
+    if (m) {
+      const base = parseInt(m[1], 10) * 2;
+      widget.setLevels(levels[base] ?? 0, levels[base + 1] ?? levels[base] ?? 0);
+    }
   };
   return card;
 }
@@ -429,6 +440,53 @@ export function renderMacro(ctrl, vmState) {
   return card;
 }
 
+// ── Desktop shortcut button ──────────────────────────────────────────────────
+export function renderDesktopAction(ctrl) {
+  const cfg = ctrl.config || {};
+  const color = cfg.activeColor || '#3aa6ff';
+  const action = cfg.action || 'launch';
+
+  const card = document.createElement('div');
+  card.className = 'control-card desktop-action-card';
+  card.dataset.id = ctrl.id;
+  applyGridPlacement(card, ctrl);
+
+  const r = parseInt(color.slice(1, 3), 16);
+  const g = parseInt(color.slice(3, 5), 16);
+  const b = parseInt(color.slice(5, 7), 16);
+  card.style.background = `rgba(${r},${g},${b},0.18)`;
+  card.style.borderColor = `rgba(${r},${g},${b},0.35)`;
+  card.style.boxShadow = `0 0 18px rgba(${r},${g},${b},0.14)`;
+
+  const labelEl = document.createElement('div');
+  labelEl.className = 'desktop-action-label';
+  labelEl.textContent = cfg.label || desktopActionTitle(action);
+
+  const metaEl = document.createElement('div');
+  metaEl.className = 'desktop-action-meta';
+  metaEl.textContent = desktopActionMeta(action, cfg.target);
+
+  card.appendChild(dragHandle());
+  card.appendChild(labelEl);
+  card.appendChild(metaEl);
+  card.appendChild(editOverlay(ctrl.id));
+  card.appendChild(resizeHandle());
+
+  card.addEventListener('click', e => {
+    if (isEditMode()) return;
+    if (e.target.closest('.edit-overlay, .drag-handle, .resize-handle')) return;
+    desktopAction({
+      action,
+      target: cfg.target || '',
+      args: cfg.args || '',
+      label: cfg.label || desktopActionTitle(action),
+    });
+  });
+
+  card._updateState = () => {};
+  return card;
+}
+
 // ── Strip Panel ───────────────────────────────────────────────────────────────
 export function renderStripPanel(ctrl, vmState) {
   const cfg   = ctrl.config || {};
@@ -495,7 +553,10 @@ export function renderStripPanel(ctrl, vmState) {
     else if (p === strip.params.mute) { muteBtn.classList.toggle('muted', !!v); muteBtn.textContent = v ? 'MUTED' : 'MUTE'; }
     else { Object.entries(routingBtns).forEach(([k, btn]) => { if (p === strip.params[k]) btn.classList.toggle('active', !!v); }); }
   };
-  card._updateLevels = (levels) => widget.setLevel(levels[si * 2] ?? 0);
+  card._updateLevels = (levels) => {
+    const base = si * 2;
+    widget.setLevels(levels[base] ?? 0, levels[base + 1] ?? levels[base] ?? 0);
+  };
   return card;
 }
 
@@ -628,6 +689,7 @@ export function renderControl(ctrl, vmState) {
     case 'toggle':
     case 'button':      return renderToggle(ctrl, vmState);
     case 'macro':       return renderMacro(ctrl, vmState);
+    case 'desktop_action': return renderDesktopAction(ctrl);
     case 'strip_panel': return renderStripPanel(ctrl, vmState);
     case 'bus_panel':   return renderBusPanel(ctrl, vmState);
     case 'vu_meter':    return renderVuMeter(ctrl, vmState);
@@ -641,4 +703,46 @@ export function renderControl(ctrl, vmState) {
       return d;
     }
   }
+}
+
+function desktopActionTitle(action) {
+  const labels = {
+    launch: 'Launch',
+    open_url: 'Open URL',
+    screenshot: 'Screenshot',
+    media_play_pause: 'Play / Pause',
+    media_next: 'Next Track',
+    media_previous: 'Previous Track',
+    volume_up: 'Volume Up',
+    volume_down: 'Volume Down',
+    volume_mute: 'Mute',
+    lock: 'Lock PC',
+    sleep: 'Sleep PC',
+    key_combo: 'Shortcut',
+  };
+  return labels[action] || 'Shortcut';
+}
+
+function desktopActionMeta(action, target) {
+  if (action === 'launch' && target) return trimMeta(target);
+  if (action === 'open_url' && target) return trimMeta(target);
+  if (action === 'key_combo' && target) return target.toUpperCase();
+
+  const meta = {
+    screenshot: 'Desktop',
+    media_play_pause: 'Media',
+    media_next: 'Media',
+    media_previous: 'Media',
+    volume_up: 'System Audio',
+    volume_down: 'System Audio',
+    volume_mute: 'System Audio',
+    lock: 'Security',
+    sleep: 'Power',
+  };
+
+  return meta[action] || 'Desktop';
+}
+
+function trimMeta(text) {
+  return text.length > 28 ? `${text.slice(0, 28)}…` : text;
 }

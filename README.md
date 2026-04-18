@@ -154,6 +154,7 @@ The `dist\VMControlBridge.exe` can be used instead of `python bridge.py`. Place 
    - **Bus Panel** — output bus with fader and mute
    - **Toggle** — on/off button for any parameter (mute, solo, A1/B1 routing...)
    - **Macro** — one button that sets multiple parameters at once
+   - **Shortcut** — desktop actions like launching apps, screenshots, media keys, volume, lock, sleep, or custom key combos
    - **VU Meter** — animated level display
    - **Label** — text separator/header
 4. Configure and click **Save**
@@ -175,6 +176,16 @@ Add a Macro control with these actions:
 - `Strip[2].Mute` = 1
 
 Enable **Momentary** if you want it to un-mute when released (push-to-talk style).
+
+### Desktop Shortcut Examples
+
+- Launch Discord: action `Launch App / File`, target `C:\Users\YourName\AppData\Local\Discord\Update.exe`, args `--processStart Discord.exe`
+- Open Spotify Web: action `Open URL`, target `https://open.spotify.com`
+- Media hotkeys: `Play / Pause`, `Next Track`, `Previous Track`
+- System actions: `Screenshot`, `Volume Up`, `Volume Down`, `Mute / Unmute`, `Lock PC`
+- Custom shortcut: action `Key Combo`, target `ctrl+shift+esc` or `win+d`
+
+Screenshots are saved on the Windows PC under `Pictures\VM Control Screenshots`.
 
 ---
 

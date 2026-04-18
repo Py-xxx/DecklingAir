@@ -27,6 +27,7 @@ const DEFAULT_SIZES = {
   toggle: [1, 1],
   button: [2, 1],
   macro: [2, 1],
+  desktop_action: [2, 1],
   vu_meter: [1, 3],
   strip_panel: [1, 4],
   bus_panel: [1, 3],

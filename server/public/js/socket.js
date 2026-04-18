@@ -24,6 +24,10 @@ export function vmMacro(params) {
   _socket?.emit('vm:macro', params);
 }
 
+export function desktopAction(action) {
+  _socket?.emit('desktop:action', action);
+}
+
 export function saveLayout(layout) {
   _socket?.emit('layout:save', layout);
 }

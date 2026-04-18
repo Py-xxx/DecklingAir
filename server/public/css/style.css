@@ -382,6 +382,20 @@ body.edit-mode .control-card .drag-handle { display: flex; }
 .macro-card:active { transform: scale(0.96); filter: brightness(.85); }
 .macro-label { font-size: 13px; font-weight: 700; color: white; text-align: center; }
 
+/* ═══ DESKTOP ACTION ═══ */
+.desktop-action-card {
+  min-height: 72px; padding: 12px 14px;
+  align-items: center; justify-content: center; gap: 6px;
+  text-align: center; cursor: pointer;
+  transition: filter var(--t), transform var(--t), border-color var(--t), box-shadow var(--t);
+}
+.desktop-action-card:active { transform: scale(0.97); filter: brightness(.92); }
+.desktop-action-label { font-size: 13px; font-weight: 700; color: white; text-align: center; }
+.desktop-action-meta {
+  font-size: 10px; color: rgba(255,255,255,0.72);
+  text-transform: uppercase; letter-spacing: .08em; text-align: center;
+}
+
 /* ═══ STRIP PANEL ═══ */
 .strip-panel-card { padding: 10px 8px; gap: 7px; min-height: 240px; }
 .strip-name {
@@ -498,6 +512,7 @@ body.edit-mode .control-card .drag-handle { display: flex; }
   border: 1px solid var(--border); background: var(--bg-3); cursor: pointer;
 }
 .cfg-section { display: flex; flex-direction: column; gap: 12px; }
+.cfg-note { font-size: 12px; line-height: 1.5; color: var(--text-3); }
 
 /* Size picker */
 .size-picker {

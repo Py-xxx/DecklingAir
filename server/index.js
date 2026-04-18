@@ -138,6 +138,10 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('desktop:action', (action) => {
+    sendToBridge({ type: 'desktopAction', action });
+  });
+
   socket.on('layout:save', (newLayout) => {
     layout = newLayout;
     saveLayout();

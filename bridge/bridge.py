@@ -5,16 +5,21 @@ Reads/writes VoiceMeeter parameters via the VoiceMeeter Remote API.
 Runs minimized to the system tray.
 """
 import asyncio
+import ctypes
 import json
 import logging
 import sys
 import threading
 import time
 import os
+import shlex
+import subprocess
+import webbrowser
+from datetime import datetime
 
 import websockets
 import pystray
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageGrab
 
 from voicemeeter import VoiceMeeterRemote
 
@@ -49,6 +54,37 @@ vm = VoiceMeeterRemote()
 running = True
 tray_icon = None
 status_text = "Starting..."
+SCREENSHOT_DIR = os.path.join(os.path.expanduser("~"), "Pictures", "VM Control Screenshots")
+KEYEVENTF_KEYUP = 0x0002
+
+VK_CODES = {
+    "ctrl": 0x11,
+    "control": 0x11,
+    "shift": 0x10,
+    "alt": 0x12,
+    "win": 0x5B,
+    "windows": 0x5B,
+    "cmd": 0x5B,
+    "meta": 0x5B,
+    "enter": 0x0D,
+    "return": 0x0D,
+    "space": 0x20,
+    "tab": 0x09,
+    "esc": 0x1B,
+    "escape": 0x1B,
+    "up": 0x26,
+    "down": 0x28,
+    "left": 0x25,
+    "right": 0x27,
+    "delete": 0x2E,
+    "del": 0x2E,
+    "backspace": 0x08,
+    "home": 0x24,
+    "end": 0x23,
+    "pageup": 0x21,
+    "pagedown": 0x22,
+    "insert": 0x2D,
+}
 
 # ── Tray icon ─────────────────────────────────────────────────────────────────
 def make_icon_image(color="#6c63ff"):
@@ -83,6 +119,118 @@ def setup_tray():
     )
     tray_icon = pystray.Icon("VMControl", icon_img, "VM Control Bridge", menu)
     return tray_icon
+
+
+def send_virtual_key(vk_code: int):
+    ctypes.windll.user32.keybd_event(vk_code, 0, 0, 0)
+    time.sleep(0.03)
+    ctypes.windll.user32.keybd_event(vk_code, 0, KEYEVENTF_KEYUP, 0)
+
+
+def parse_key_token(token: str):
+    token = token.strip().lower()
+    if not token:
+        return None
+    if token in VK_CODES:
+        return VK_CODES[token]
+    if len(token) == 1 and "a" <= token <= "z":
+        return ord(token.upper())
+    if len(token) == 1 and token.isdigit():
+        return ord(token)
+    if token.startswith("f") and token[1:].isdigit():
+        idx = int(token[1:])
+        if 1 <= idx <= 24:
+            return 0x70 + idx - 1
+    return None
+
+
+def send_key_combo(combo: str):
+    tokens = [token.strip() for token in combo.replace(" ", "").split("+") if token.strip()]
+    codes = [parse_key_token(token) for token in tokens]
+    if not codes or any(code is None for code in codes):
+        raise RuntimeError(f"Unsupported key combo: {combo}")
+
+    for code in codes[:-1]:
+        ctypes.windll.user32.keybd_event(code, 0, 0, 0)
+        time.sleep(0.02)
+
+    last = codes[-1]
+    ctypes.windll.user32.keybd_event(last, 0, 0, 0)
+    time.sleep(0.03)
+    ctypes.windll.user32.keybd_event(last, 0, KEYEVENTF_KEYUP, 0)
+
+    for code in reversed(codes[:-1]):
+        time.sleep(0.02)
+        ctypes.windll.user32.keybd_event(code, 0, KEYEVENTF_KEYUP, 0)
+
+
+def capture_screenshot() -> str:
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    out_path = os.path.join(SCREENSHOT_DIR, f"vm-control-{stamp}.png")
+    try:
+        image = ImageGrab.grab(all_screens=True)
+    except TypeError:
+        image = ImageGrab.grab()
+    image.save(out_path, "PNG")
+    return out_path
+
+
+def launch_target(target: str, args: str = ""):
+    target = target.strip()
+    if not target:
+        raise RuntimeError("No launch target provided")
+
+    if target.lower().startswith(("http://", "https://")):
+        webbrowser.open(target)
+        return
+
+    if args:
+        command = [target, *shlex.split(args, posix=False)]
+        subprocess.Popen(command, shell=False)
+        return
+
+    os.startfile(target)
+
+
+def run_desktop_action(action_data: dict):
+    action = (action_data or {}).get("action", "")
+    target = (action_data or {}).get("target", "")
+    args = (action_data or {}).get("args", "")
+
+    media_keys = {
+        "media_play_pause": 0xB3,
+        "media_next": 0xB0,
+        "media_previous": 0xB1,
+        "volume_up": 0xAF,
+        "volume_down": 0xAE,
+        "volume_mute": 0xAD,
+    }
+
+    if action == "launch":
+        launch_target(target, args)
+        return
+    if action == "open_url":
+        webbrowser.open(target)
+        return
+    if action == "screenshot":
+        path = capture_screenshot()
+        log.info("Screenshot saved to %s", path)
+        return
+    if action in media_keys:
+        send_virtual_key(media_keys[action])
+        return
+    if action == "lock":
+        ctypes.windll.user32.LockWorkStation()
+        return
+    if action == "sleep":
+        subprocess.Popen(["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"], shell=False)
+        return
+    if action == "key_combo":
+        send_key_combo(target)
+        return
+
+    raise RuntimeError(f"Unsupported desktop action: {action}")
 
 # ── WebSocket bridge session ──────────────────────────────────────────────────
 async def run_bridge():
@@ -173,6 +321,12 @@ async def receive_loop(ws):
                     vm.set_string(param, str(value))
                 except Exception as e:
                     log.error("Failed to set string %s: %s", param, e)
+
+        elif msg_type == "desktopAction":
+            try:
+                run_desktop_action(msg.get("action", {}))
+            except Exception as e:
+                log.error("Desktop action failed: %s", e)
 
 async def poll_loop(ws):
     """Periodically poll VoiceMeeter for state changes and level data."""

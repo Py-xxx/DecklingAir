@@ -113,6 +113,12 @@
               <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
               Macro
             </button>
+            <button class="type-card" data-type="desktop_action">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/><path d="M8 9h8"/>
+              </svg>
+              Shortcut
+            </button>
             <button class="type-card" data-type="vu_meter">
               <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 20v-5M7 20v-9M11 20v-13M15 20v-8M19 20v-4M21 20H1"/></svg>
               VU Meter
@@ -183,6 +189,48 @@
             <label class="form-label">Actions</label>
             <div id="macro-actions-list"></div>
             <button class="btn-secondary btn-sm" id="btn-add-macro-action">+ Add Action</button>
+          </div>
+
+          <!-- Desktop shortcut config -->
+          <div id="cfg-desktop-action" class="cfg-section" style="display:none">
+            <div class="form-row">
+              <div class="form-group fg-grow">
+                <label class="form-label">Action</label>
+                <select id="cfg-desktop-kind" class="form-select">
+                  <option value="launch">Launch App / File</option>
+                  <option value="open_url">Open URL</option>
+                  <option value="screenshot">Take Screenshot</option>
+                  <option value="media_play_pause">Play / Pause</option>
+                  <option value="media_next">Next Track</option>
+                  <option value="media_previous">Previous Track</option>
+                  <option value="volume_up">Volume Up</option>
+                  <option value="volume_down">Volume Down</option>
+                  <option value="volume_mute">Mute / Unmute</option>
+                  <option value="lock">Lock PC</option>
+                  <option value="sleep">Sleep PC</option>
+                  <option value="key_combo">Key Combo</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Color</label>
+                <input type="color" id="cfg-desktop-color" class="form-color" value="#3aa6ff">
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group fg-grow" id="cfg-desktop-target-group">
+                <label class="form-label" id="cfg-desktop-target-label">Target</label>
+                <input type="text" id="cfg-desktop-target" class="form-input" placeholder="Path, URL, or key combo">
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group fg-grow" id="cfg-desktop-args-group">
+                <label class="form-label">Arguments</label>
+                <input type="text" id="cfg-desktop-args" class="form-input" placeholder="Optional launch arguments">
+              </div>
+            </div>
+            <p class="cfg-note" id="cfg-desktop-help">
+              Launch apps, send media keys, take screenshots, or trigger custom desktop shortcuts.
+            </p>
           </div>
 
           <!-- VU Meter config -->
