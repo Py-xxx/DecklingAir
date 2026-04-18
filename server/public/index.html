@@ -11,15 +11,15 @@
 <body>
   <div id="app">
 
-    <!-- Header -->
     <header id="header">
       <div class="header-left">
         <div class="app-logo">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <rect x="2" y="3" width="4" height="18" rx="1"/><rect x="10" y="6" width="4" height="15" rx="1"/>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="3" width="4" height="18" rx="1"/>
+            <rect x="10" y="6" width="4" height="15" rx="1"/>
             <rect x="18" y="9" width="4" height="12" rx="1"/>
           </svg>
-          VM Control
+          <span>VM Control</span>
         </div>
         <div id="bridge-status" class="status-badge status-offline">
           <span class="status-dot"></span>
@@ -30,20 +30,15 @@
       <nav id="page-tabs" class="page-tabs"></nav>
 
       <div class="header-right">
-        <button id="btn-add-page" class="icon-btn" title="Add page" style="display:none">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-            <path d="M12 5v14M5 12h14"/>
-          </svg>
-        </button>
-        <button id="btn-edit" class="header-btn">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <button id="btn-edit" class="header-btn" title="Toggle edit mode">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
             <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
           </svg>
           Edit
         </button>
         <button id="btn-settings" class="icon-btn" title="Settings">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="3"/>
             <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
           </svg>
@@ -51,218 +46,146 @@
       </div>
     </header>
 
-    <!-- Main grid area -->
     <main id="main-area">
+      <!-- Grid overlay (edit mode) — sits behind controls -->
+      <div id="grid-overlay" class="grid-overlay"></div>
+      <!-- Controls grid -->
       <div id="control-grid" class="control-grid"></div>
+      <!-- Drop preview (shown during drag) -->
+      <div id="drop-preview" class="drop-preview" style="display:none"></div>
 
-      <!-- Empty state -->
       <div id="empty-state" class="empty-state" style="display:none">
-        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <rect x="2" y="3" width="4" height="18" rx="1"/><rect x="10" y="6" width="4" height="15" rx="1"/>
+        <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".4">
+          <rect x="2" y="3" width="4" height="18" rx="1"/>
+          <rect x="10" y="6" width="4" height="15" rx="1"/>
           <rect x="18" y="9" width="4" height="12" rx="1"/>
         </svg>
-        <p>No controls yet</p>
-        <button class="btn-primary" id="empty-add-btn">Add your first control</button>
+        <p>No controls yet.<br>Enter edit mode and press <strong>+</strong> to add one.</p>
       </div>
 
-      <!-- Edit mode: Add control FAB -->
       <button id="fab-add" class="fab" style="display:none" title="Add control">
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
           <path d="M12 5v14M5 12h14"/>
         </svg>
       </button>
     </main>
-
   </div>
 
-  <!-- ═══ MODALS ═══ -->
-
-  <!-- Control Editor Modal -->
+  <!-- ═══ Add / Edit Control Modal ═══ -->
   <div id="modal-backdrop" class="modal-backdrop" style="display:none">
     <div id="modal-editor" class="modal">
       <div class="modal-header">
         <h2 id="modal-title">Add Control</h2>
-        <button class="modal-close" id="modal-close">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-            <path d="M18 6 6 18M6 6l12 12"/>
-          </svg>
-        </button>
+        <button class="modal-close" id="modal-close">&times;</button>
       </div>
-      <div class="modal-body">
 
-        <!-- Step 1: Type selector -->
-        <div id="step-type" class="modal-step">
-          <label class="form-label">Control Type</label>
+      <div class="modal-body">
+        <!-- Type selector (shown when adding) -->
+        <div id="step-type">
+          <p class="step-hint">Choose a control type</p>
           <div class="type-grid">
             <button class="type-card" data-type="fader">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <rect x="10" y="2" width="4" height="20" rx="2"/>
-                <rect x="7" y="9" width="10" height="6" rx="1"/>
-              </svg>
-              <span>Fader</span>
-            </button>
-            <button class="type-card" data-type="toggle">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <rect x="2" y="7" width="20" height="10" rx="5"/>
-                <circle cx="16" cy="12" r="3"/>
-              </svg>
-              <span>Toggle</span>
-            </button>
-            <button class="type-card" data-type="button">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <rect x="3" y="7" width="18" height="10" rx="3"/>
-              </svg>
-              <span>Button</span>
-            </button>
-            <button class="type-card" data-type="macro">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
-              </svg>
-              <span>Macro</span>
-            </button>
-            <button class="type-card" data-type="vu_meter">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M3 20v-5M7 20v-9M11 20v-13M15 20v-8M19 20v-4M21 20H1"/>
-              </svg>
-              <span>VU Meter</span>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="10" y="2" width="4" height="20" rx="2"/><rect x="7" y="9" width="10" height="6" rx="1.5"/></svg>
+              Fader
             </button>
             <button class="type-card" data-type="strip_panel">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <rect x="5" y="2" width="14" height="20" rx="2"/>
-                <rect x="8" y="4" width="8" height="12" rx="1"/>
-                <circle cx="12" cy="19" r="1"/>
-              </svg>
-              <span>Strip Panel</span>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="2" width="14" height="20" rx="2"/><rect x="8" y="4" width="8" height="11" rx="1"/><circle cx="12" cy="19" r="1.5"/></svg>
+              Strip Panel
             </button>
             <button class="type-card" data-type="bus_panel">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <rect x="2" y="5" width="20" height="14" rx="2"/>
-                <path d="M7 9h10M7 13h7"/>
-              </svg>
-              <span>Bus Panel</span>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M7 9h10M7 13h7"/></svg>
+              Bus Panel
+            </button>
+            <button class="type-card" data-type="toggle">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="10" rx="5"/><circle cx="16" cy="12" r="3"/></svg>
+              Toggle
+            </button>
+            <button class="type-card" data-type="button">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="7" width="18" height="10" rx="3"/><path d="M9 12h6"/></svg>
+              Button
+            </button>
+            <button class="type-card" data-type="macro">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+              Macro
+            </button>
+            <button class="type-card" data-type="vu_meter">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 20v-5M7 20v-9M11 20v-13M15 20v-8M19 20v-4M21 20H1"/></svg>
+              VU Meter
             </button>
             <button class="type-card" data-type="label">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M4 6h16M4 12h10M4 18h6"/>
-              </svg>
-              <span>Label</span>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h10M4 18h6"/></svg>
+              Label
             </button>
           </div>
         </div>
 
-        <!-- Step 2: Configuration -->
-        <div id="step-config" class="modal-step" style="display:none">
+        <!-- Config (shown after type selected or when editing) -->
+        <div id="step-config" style="display:none">
           <div class="form-row">
-            <div class="form-group">
+            <div class="form-group fg-grow">
               <label class="form-label">Label</label>
-              <input type="text" id="cfg-label" class="form-input" placeholder="Control label">
+              <input type="text" id="cfg-label" class="form-input" placeholder="Name">
             </div>
-            <div class="form-group form-group-sm">
-              <label class="form-label">Width</label>
-              <select id="cfg-col-span" class="form-select">
-                <option value="1">1</option><option value="2">2</option>
-                <option value="3">3</option><option value="4">4</option>
-              </select>
-            </div>
-            <div class="form-group form-group-sm">
-              <label class="form-label">Height</label>
-              <select id="cfg-row-span" class="form-select">
-                <option value="1">1</option><option value="2">2</option>
-                <option value="3">3</option><option value="4" selected>4</option>
-              </select>
-            </div>
+          </div>
+
+          <!-- Size picker -->
+          <div class="form-group" id="size-picker-group">
+            <label class="form-label">Size — <span id="size-display">1 × 2</span></label>
+            <div id="size-picker" class="size-picker"></div>
           </div>
 
           <!-- Fader config -->
           <div id="cfg-fader" class="cfg-section" style="display:none">
             <div class="form-row">
-              <div class="form-group">
-                <label class="form-label">Parameter</label>
+              <div class="form-group fg-grow">
+                <label class="form-label">Parameter (Gain)</label>
                 <select id="cfg-fader-param" class="form-select"></select>
               </div>
             </div>
             <div class="form-row">
-              <div class="form-group">
-                <label class="form-label">Min (dB)</label>
-                <input type="number" id="cfg-fader-min" class="form-input" value="-60" step="1">
-              </div>
-              <div class="form-group">
-                <label class="form-label">Max (dB)</label>
-                <input type="number" id="cfg-fader-max" class="form-input" value="12" step="1">
-              </div>
-              <div class="form-group">
-                <label class="form-label">Step</label>
-                <input type="number" id="cfg-fader-step" class="form-input" value="0.1" step="0.01" min="0.01">
-              </div>
+              <div class="form-group"><label class="form-label">Min dB</label><input type="number" id="cfg-fader-min" class="form-input" value="-60" step="1"></div>
+              <div class="form-group"><label class="form-label">Max dB</label><input type="number" id="cfg-fader-max" class="form-input" value="12" step="1"></div>
+              <div class="form-group"><label class="form-label">Step</label><input type="number" id="cfg-fader-step" class="form-input" value="0.1" step="0.01" min="0.01"></div>
             </div>
             <div class="form-row">
               <div class="form-group">
-                <label class="form-label">Show VU</label>
-                <label class="toggle-switch">
-                  <input type="checkbox" id="cfg-fader-vu" checked>
-                  <span class="toggle-slider"></span>
-                </label>
+                <label class="form-label">VU Meter</label>
+                <label class="toggle-switch"><input type="checkbox" id="cfg-fader-vu" checked><span class="toggle-slider"></span></label>
               </div>
             </div>
           </div>
 
-          <!-- Toggle / Button config -->
+          <!-- Toggle/Button config -->
           <div id="cfg-toggle" class="cfg-section" style="display:none">
             <div class="form-row">
-              <div class="form-group">
+              <div class="form-group fg-grow">
                 <label class="form-label">Parameter</label>
                 <select id="cfg-toggle-param" class="form-select"></select>
               </div>
             </div>
             <div class="form-row">
-              <div class="form-group">
-                <label class="form-label">Active Color</label>
-                <input type="color" id="cfg-toggle-color" class="form-color" value="#6c63ff">
-              </div>
-              <div class="form-group" id="cfg-momentary-group">
-                <label class="form-label">Momentary</label>
-                <label class="toggle-switch">
-                  <input type="checkbox" id="cfg-toggle-momentary">
-                  <span class="toggle-slider"></span>
-                </label>
-              </div>
+              <div class="form-group"><label class="form-label">Active Color</label><input type="color" id="cfg-toggle-color" class="form-color" value="#6c63ff"></div>
+              <div class="form-group"><label class="form-label">Momentary</label><label class="toggle-switch"><input type="checkbox" id="cfg-toggle-momentary"><span class="toggle-slider"></span></label></div>
             </div>
           </div>
 
           <!-- Macro config -->
           <div id="cfg-macro" class="cfg-section" style="display:none">
             <div class="form-row">
-              <div class="form-group">
-                <label class="form-label">Active Color</label>
-                <input type="color" id="cfg-macro-color" class="form-color" value="#ff9800">
-              </div>
-              <div class="form-group">
-                <label class="form-label">Momentary</label>
-                <label class="toggle-switch">
-                  <input type="checkbox" id="cfg-macro-momentary">
-                  <span class="toggle-slider"></span>
-                </label>
-              </div>
+              <div class="form-group"><label class="form-label">Color</label><input type="color" id="cfg-macro-color" class="form-color" value="#ff9800"></div>
+              <div class="form-group"><label class="form-label">Momentary</label><label class="toggle-switch"><input type="checkbox" id="cfg-macro-momentary"><span class="toggle-slider"></span></label></div>
             </div>
-            <label class="form-label">Actions (when activated)</label>
+            <label class="form-label">Actions</label>
             <div id="macro-actions-list"></div>
-            <button class="btn-secondary" id="btn-add-macro-action">+ Add Action</button>
+            <button class="btn-secondary btn-sm" id="btn-add-macro-action">+ Add Action</button>
           </div>
 
           <!-- VU Meter config -->
           <div id="cfg-vu" class="cfg-section" style="display:none">
             <div class="form-row">
-              <div class="form-group">
-                <label class="form-label">Strip / Bus</label>
+              <div class="form-group fg-grow">
+                <label class="form-label">Source</label>
                 <select id="cfg-vu-source" class="form-select"></select>
-              </div>
-              <div class="form-group">
-                <label class="form-label">Channel</label>
-                <select id="cfg-vu-channel" class="form-select">
-                  <option value="both">L+R</option>
-                  <option value="0">Left only</option>
-                  <option value="1">Right only</option>
-                </select>
               </div>
             </div>
           </div>
@@ -270,16 +193,16 @@
           <!-- Strip Panel config -->
           <div id="cfg-strip-panel" class="cfg-section" style="display:none">
             <div class="form-row">
-              <div class="form-group">
+              <div class="form-group fg-grow">
                 <label class="form-label">Strip</label>
                 <select id="cfg-strip-select" class="form-select"></select>
               </div>
             </div>
-            <label class="form-label">Show routing buttons</label>
+            <label class="form-label">Routing Buttons</label>
             <div class="checkbox-group" id="cfg-strip-routing">
               <label><input type="checkbox" value="A1" checked> A1</label>
               <label><input type="checkbox" value="A2" checked> A2</label>
-              <label><input type="checkbox" value="A3" checked> A3</label>
+              <label><input type="checkbox" value="A3"> A3</label>
               <label><input type="checkbox" value="A4"> A4</label>
               <label><input type="checkbox" value="A5"> A5</label>
               <label><input type="checkbox" value="B1" checked> B1</label>
@@ -291,48 +214,40 @@
           <!-- Bus Panel config -->
           <div id="cfg-bus-panel" class="cfg-section" style="display:none">
             <div class="form-row">
-              <div class="form-group">
+              <div class="form-group fg-grow">
                 <label class="form-label">Bus</label>
                 <select id="cfg-bus-select" class="form-select"></select>
               </div>
             </div>
           </div>
-
         </div>
       </div>
 
       <div class="modal-footer">
+        <button class="btn-secondary" id="modal-back" style="display:none">← Back</button>
+        <div style="flex:1"></div>
         <button class="btn-secondary" id="modal-cancel">Cancel</button>
-        <button class="btn-primary" id="modal-save">Save</button>
+        <button class="btn-primary" id="modal-save" style="display:none">Save</button>
       </div>
     </div>
   </div>
 
-  <!-- Settings Modal -->
+  <!-- ═══ Settings Modal ═══ -->
   <div id="settings-modal" class="modal-backdrop" style="display:none">
     <div class="modal modal-settings">
       <div class="modal-header">
         <h2>Settings</h2>
-        <button class="modal-close" id="settings-close">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-            <path d="M18 6 6 18M6 6l12 12"/>
-          </svg>
-        </button>
+        <button class="modal-close" id="settings-close">&times;</button>
       </div>
       <div class="modal-body">
         <section class="settings-section">
-          <h3>Bridge Connection</h3>
-          <div class="info-card" id="bridge-info-card">
+          <h3>Bridge Status</h3>
+          <div class="info-card">
             <div class="info-row"><span>Status</span><span id="s-status">—</span></div>
-            <div class="info-row"><span>VoiceMeeter Type</span><span id="s-vm-type">—</span></div>
+            <div class="info-row"><span>VoiceMeeter</span><span id="s-vm-type">—</span></div>
             <div class="info-row"><span>Version</span><span id="s-vm-version">—</span></div>
           </div>
-          <p class="settings-help">
-            The bridge app on your Windows PC connects to this server on port <strong>3001</strong>.
-            Make sure the bridge config points to this Pi's IP address.
-          </p>
         </section>
-
         <section class="settings-section">
           <h3>Appearance</h3>
           <div class="form-row">
@@ -344,57 +259,47 @@
               <label class="form-label">Grid Columns</label>
               <select id="s-grid-cols" class="form-select">
                 <option value="4">4</option><option value="6">6</option>
-                <option value="8" selected>8</option><option value="10">10</option>
-                <option value="12">12</option>
+                <option value="8" selected>8</option><option value="10">10</option><option value="12">12</option>
               </select>
             </div>
           </div>
         </section>
-
         <section class="settings-section">
           <h3>Pages</h3>
           <div id="pages-list"></div>
-          <button class="btn-secondary" id="s-add-page">+ Add Page</button>
+          <button class="btn-secondary btn-sm" id="s-add-page">+ Add Page</button>
         </section>
-
         <section class="settings-section">
           <h3>Layout</h3>
           <div class="btn-row">
-            <button class="btn-secondary" id="s-export">Export Layout</button>
-            <button class="btn-secondary" id="s-import">Import Layout</button>
+            <button class="btn-secondary btn-sm" id="s-export">Export JSON</button>
+            <button class="btn-secondary btn-sm" id="s-import">Import JSON</button>
             <input type="file" id="s-import-file" accept=".json" style="display:none">
           </div>
         </section>
-
         <section class="settings-section">
           <h3>VoiceMeeter</h3>
-          <p class="settings-help">Potato has 5 hardware strips, 3 virtual strips, 5 hardware buses (A1-A5), 3 virtual buses (B1-B3).</p>
-          <div class="btn-row">
-            <button class="btn-danger-outline" id="s-vm-restart">Restart Audio Engine</button>
-          </div>
+          <button class="btn-danger-outline btn-sm" id="s-vm-restart">Restart Audio Engine</button>
         </section>
       </div>
       <div class="modal-footer">
+        <button class="btn-secondary" id="settings-cancel">Cancel</button>
         <button class="btn-primary" id="settings-apply">Apply</button>
       </div>
     </div>
   </div>
 
-  <!-- Page Name Modal -->
+  <!-- ═══ Page Name Modal ═══ -->
   <div id="page-modal" class="modal-backdrop" style="display:none">
     <div class="modal modal-sm">
       <div class="modal-header">
         <h2 id="page-modal-title">Add Page</h2>
-        <button class="modal-close" id="page-modal-close">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-            <path d="M18 6 6 18M6 6l12 12"/>
-          </svg>
-        </button>
+        <button class="modal-close" id="page-modal-close">&times;</button>
       </div>
       <div class="modal-body">
         <div class="form-group">
           <label class="form-label">Page Name</label>
-          <input type="text" id="page-name-input" class="form-input" placeholder="e.g. Gaming, Music, Stream">
+          <input type="text" id="page-name-input" class="form-input" placeholder="e.g. Gaming, Music">
         </div>
       </div>
       <div class="modal-footer">
