@@ -3,8 +3,13 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="VM Control">
+  <meta name="theme-color" content="#090910">
   <title>VM Control</title>
   <link rel="stylesheet" href="css/style.css">
 </head>
@@ -122,16 +127,16 @@
         <!-- Config (shown after type selected or when editing) -->
         <div id="step-config" style="display:none">
           <div class="form-row">
-            <div class="form-group fg-grow">
+            <div class="form-group fg-grow modal-primary-fields">
               <label class="form-label">Label</label>
               <input type="text" id="cfg-label" class="form-input" placeholder="Name">
-            </div>
-          </div>
 
-          <!-- Size picker -->
-          <div class="form-group" id="size-picker-group">
-            <label class="form-label">Size — <span id="size-display">1 × 2</span></label>
-            <div id="size-picker" class="size-picker"></div>
+              <!-- Size picker -->
+              <div class="form-group size-inline-group" id="size-picker-group">
+                <label class="form-label">Size — <span id="size-display">1 × 2</span></label>
+                <div id="size-picker" class="size-picker"></div>
+              </div>
+            </div>
           </div>
 
           <!-- Fader config -->
@@ -309,7 +314,14 @@
     </div>
   </div>
 
-  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistrations()
+        .then(registrations => Promise.all(registrations.map(registration => registration.unregister())))
+        .catch(() => {});
+    }
+  </script>
+  <script src="/vendor/socket.io.js"></script>
   <script type="module" src="js/app.js"></script>
 </body>
 </html>

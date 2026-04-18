@@ -272,7 +272,7 @@ body.edit-mode .control-card .drag-handle { display: flex; }
 
 /* ═══ CUSTOM FADER ═══ */
 .fader-card {
-  padding: 12px 8px 10px; gap: 8px;
+  padding: 12px 10px 10px; gap: 8px;
   min-height: 200px;
 }
 .fader-label {
@@ -289,7 +289,7 @@ body.edit-mode .control-card .drag-handle { display: flex; }
 .fader-widget {
   flex: 1; width: 100%; min-height: 0;
   display: flex; align-items: stretch;
-  justify-content: center; gap: 5px;
+  justify-content: center; gap: 8px;
   touch-action: none; position: relative;
 }
 .fw-vu {
@@ -305,8 +305,11 @@ body.edit-mode .control-card .drag-handle { display: flex; }
 .fw-vu-seg.lit-r { background: var(--danger); }
 
 .fw-track-wrap {
-  flex: 0 0 auto; width: 8px; position: relative;
+  flex: 0 0 auto; width: 52px; min-width: 52px; position: relative;
   cursor: ns-resize; display: flex; align-items: center; justify-content: center;
+  border-radius: 18px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.018), rgba(255,255,255,0.006));
+  touch-action: none;
 }
 .fw-track {
   width: 8px; height: 100%; border-radius: 4px;
@@ -473,6 +476,8 @@ body.edit-mode .control-card .drag-handle { display: flex; }
 .form-row  { display: flex; gap: 10px; flex-wrap: wrap; }
 .form-group { display: flex; flex-direction: column; gap: 6px; }
 .fg-grow { flex: 1; min-width: 120px; }
+.modal-primary-fields { gap: 10px; }
+.size-inline-group { margin-top: 2px; }
 .form-label {
   font-size: 10px; font-weight: 700; color: var(--text-2);
   text-transform: uppercase; letter-spacing: .06em;
@@ -498,15 +503,23 @@ body.edit-mode .control-card .drag-handle { display: flex; }
 .size-picker {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: 4px; margin-top: 6px;
+  gap: 8px; margin-top: 8px;
 }
 .size-cell {
-  height: 28px; border-radius: 5px;
-  background: var(--bg-3); border: 1px solid var(--border);
-  cursor: pointer; transition: var(--t);
+  min-height: 42px; height: 42px; border-radius: 8px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.015));
+  border: 1px solid var(--border-hi);
+  cursor: pointer; transition: transform var(--t), border-color var(--t), background var(--t), box-shadow var(--t);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
 }
+.size-cell:hover { transform: translateY(-1px); border-color: rgba(108,99,255,.24); }
 .size-cell.preview { background: var(--accent-dim); border-color: rgba(108,99,255,.3); }
-.size-cell.selected { background: var(--accent); border-color: var(--accent); }
+.size-cell.selected {
+  background: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.06), 0 8px 20px rgba(0,0,0,0.2);
+}
 
 /* Toggle switch */
 .toggle-switch { position: relative; display: inline-block; width: 38px; height: 21px; }
@@ -611,6 +624,9 @@ body.edit-mode #btn-edit { background: var(--accent-dim); color: var(--accent); 
   .app-logo span { display: none; }
 }
 @media (pointer: coarse) {
+  .fader-card { padding-inline: 12px; }
+  .fader-widget { gap: 10px; }
+  .fw-track-wrap { width: 60px; min-width: 60px; }
   .fw-thumb { width: 52px; height: 18px; }
   .routing-btn { min-height: 28px; }
   .toggle-card { min-height: 70px; }

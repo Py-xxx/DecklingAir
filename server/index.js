@@ -7,11 +7,22 @@ const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-const io = new SocketIOServer(server, { cors: { origin: '*' } });
+const io = new SocketIOServer(server, {
+  cors: { origin: '*' },
+  pingInterval: 10000,
+  pingTimeout: 5000,
+  serveClient: false,
+});
 
 const PORT = process.env.PORT || 3002;
 const BRIDGE_PORT = process.env.BRIDGE_PORT || 3003;
 const LAYOUT_FILE = path.join(__dirname, 'data', 'layout.json');
+const SOCKET_IO_CLIENT_FILE = path.join(
+  path.dirname(require.resolve('socket.io')),
+  '..',
+  'client-dist',
+  'socket.io.js'
+);
 
 const dataDir = path.join(__dirname, 'data');
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
@@ -55,8 +66,36 @@ let vmLevels = [];
 let bridgeWs = null;
 let bridgeInfo = { connected: false, vmType: null, vmVersion: null };
 
+app.disable('etag');
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+app.use((req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, s-maxage=0');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Surrogate-Control', 'no-store');
+  res.setHeader('Last-Modified', new Date(0).toUTCString());
+  next();
+});
+app.use(express.static(path.join(__dirname, 'public'), {
+  etag: false,
+  lastModified: false,
+  setHeaders(res) {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, s-maxage=0');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('Surrogate-Control', 'no-store');
+  },
+}));
+app.get('/vendor/socket.io.js', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, s-maxage=0');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Surrogate-Control', 'no-store');
+  res.sendFile(SOCKET_IO_CLIENT_FILE, {
+    etag: false,
+    lastModified: false,
+  });
+});
 
 app.get('/api/layout', (req, res) => res.json(layout));
 app.post('/api/layout', (req, res) => {
@@ -108,6 +147,8 @@ io.on('connection', (socket) => {
   socket.on('layout:get', () => socket.emit('layout:data', layout));
 
   socket.on('bridge:request_state', () => {
+    socket.emit('bridge:status', bridgeInfo);
+    socket.emit('vm:state', vmState);
     sendToBridge({ type: 'requestState' });
   });
 
