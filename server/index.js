@@ -66,6 +66,7 @@ let vmLevels = [];
 let bridgeWs = null;
 let bridgeInfo = { connected: false, vmType: null, vmVersion: null, capabilities: {} };
 const desktopIconCache = new Map();
+const desktopIconPending = new Set();
 
 app.disable('etag');
 app.use(express.json());
@@ -164,7 +165,9 @@ io.on('connection', (socket) => {
 
     if (!bridgeWs || bridgeWs.readyState !== WebSocket.OPEN) return;
     if (!bridgeInfo.capabilities?.desktopIcons) return;
+    if (desktopIconPending.has(resolvedTarget)) return;
 
+    desktopIconPending.add(resolvedTarget);
     sendToBridge({ type: 'desktopIconRequest', target: resolvedTarget });
   });
 
@@ -219,6 +222,7 @@ wss.on('connection', (ws, req) => {
         break;
       case 'desktopIcon':
         if (msg.target && typeof msg.icon === 'string') {
+          desktopIconPending.delete(msg.target);
           desktopIconCache.set(msg.target, msg.icon);
           io.emit('desktop:icon', { target: msg.target, icon: msg.icon });
         }
@@ -249,6 +253,7 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     console.log('Bridge disconnected');
     bridgeWs = null;
+    desktopIconPending.clear();
     bridgeInfo = { connected: false, vmType: null, vmVersion: null, capabilities: {} };
     io.emit('bridge:status', bridgeInfo);
   });

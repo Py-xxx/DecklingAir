@@ -128,6 +128,17 @@ def send_virtual_key(vk_code: int):
     ctypes.windll.user32.keybd_event(vk_code, 0, KEYEVENTF_KEYUP, 0)
 
 
+def hidden_subprocess_kwargs():
+    kwargs = {}
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+        kwargs["startupinfo"] = startupinfo
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return kwargs
+
+
 def parse_key_token(token: str):
     token = token.strip().lower()
     if not token:
@@ -187,8 +198,7 @@ def launch_target(target: str, args: str = ""):
         return
 
     if args:
-        command = [target, *shlex.split(args, posix=False)]
-        subprocess.Popen(command, shell=False)
+        os.startfile(target, arguments=args)
         return
 
     os.startfile(target)
@@ -225,7 +235,11 @@ def run_desktop_action(action_data: dict):
         ctypes.windll.user32.LockWorkStation()
         return
     if action == "sleep":
-        subprocess.Popen(["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"], shell=False)
+        subprocess.Popen(
+            ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"],
+            shell=False,
+            **hidden_subprocess_kwargs(),
+        )
         return
     if action == "key_combo":
         send_key_combo(target)
@@ -260,6 +274,7 @@ $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
             text=True,
             timeout=12,
             check=False,
+            **hidden_subprocess_kwargs(),
         )
         base64_data = (result.stdout or "").strip()
         if not base64_data:
