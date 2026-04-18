@@ -9,8 +9,8 @@ const app = express();
 const server = http.createServer(app);
 const io = new SocketIOServer(server, { cors: { origin: '*' } });
 
-const PORT = process.env.PORT || 3000;
-const BRIDGE_PORT = process.env.BRIDGE_PORT || 3001;
+const PORT = process.env.PORT || 3002;
+const BRIDGE_PORT = process.env.BRIDGE_PORT || 3003;
 const LAYOUT_FILE = path.join(__dirname, 'data', 'layout.json');
 
 const dataDir = path.join(__dirname, 'data');
