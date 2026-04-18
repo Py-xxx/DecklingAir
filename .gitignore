@@ -1,0 +1,5 @@
+node_modules/
+server/data/layout.json
+bridge/dist/
+bridge/__pycache__/
+bridge/*.spec

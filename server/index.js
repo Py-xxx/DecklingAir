@@ -1,0 +1,184 @@
+const express = require('express');
+const http = require('http');
+const { Server: SocketIOServer } = require('socket.io');
+const WebSocket = require('ws');
+const fs = require('fs');
+const path = require('path');
+
+const app = express();
+const server = http.createServer(app);
+const io = new SocketIOServer(server, { cors: { origin: '*' } });
+
+const PORT = process.env.PORT || 3000;
+const BRIDGE_PORT = process.env.BRIDGE_PORT || 3001;
+const LAYOUT_FILE = path.join(__dirname, 'data', 'layout.json');
+
+const dataDir = path.join(__dirname, 'data');
+if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+
+const DEFAULT_LAYOUT = {
+  version: '1.0',
+  pages: [
+    {
+      id: 'main',
+      name: 'Main',
+      grid: { columns: 8 },
+      controls: []
+    }
+  ],
+  settings: {
+    theme: 'dark',
+    accentColor: '#6c63ff',
+    gridColumns: 8
+  }
+};
+
+let layout = DEFAULT_LAYOUT;
+try {
+  if (fs.existsSync(LAYOUT_FILE)) {
+    layout = JSON.parse(fs.readFileSync(LAYOUT_FILE, 'utf8'));
+  }
+} catch (e) {
+  console.error('Failed to load layout:', e.message);
+}
+
+function saveLayout() {
+  try {
+    fs.writeFileSync(LAYOUT_FILE, JSON.stringify(layout, null, 2));
+  } catch (e) {
+    console.error('Failed to save layout:', e.message);
+  }
+}
+
+let vmState = {};
+let vmLevels = [];
+let bridgeWs = null;
+let bridgeInfo = { connected: false, vmType: null, vmVersion: null };
+
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.get('/api/layout', (req, res) => res.json(layout));
+app.post('/api/layout', (req, res) => {
+  layout = req.body;
+  saveLayout();
+  io.emit('layout:data', layout);
+  res.json({ success: true });
+});
+app.get('/api/state', (req, res) => res.json(vmState));
+app.get('/api/bridge', (req, res) => res.json(bridgeInfo));
+
+function sendToBridge(msg) {
+  if (bridgeWs && bridgeWs.readyState === WebSocket.OPEN) {
+    bridgeWs.send(JSON.stringify(msg));
+    return true;
+  }
+  return false;
+}
+
+io.on('connection', (socket) => {
+  console.log(`Browser connected: ${socket.id}`);
+
+  socket.emit('layout:data', layout);
+  socket.emit('vm:state', vmState);
+  socket.emit('bridge:status', bridgeInfo);
+
+  socket.on('vm:set', ({ param, value }) => {
+    if (sendToBridge({ type: 'set', param, value })) {
+      vmState[param] = value;
+      socket.broadcast.emit('vm:update', { param, value });
+    }
+  });
+
+  socket.on('vm:macro', (params) => {
+    if (sendToBridge({ type: 'macro', params })) {
+      params.forEach(({ param, value }) => {
+        vmState[param] = value;
+      });
+      socket.broadcast.emit('vm:state_patch', params);
+    }
+  });
+
+  socket.on('layout:save', (newLayout) => {
+    layout = newLayout;
+    saveLayout();
+    io.emit('layout:data', layout);
+  });
+
+  socket.on('layout:get', () => socket.emit('layout:data', layout));
+
+  socket.on('bridge:request_state', () => {
+    sendToBridge({ type: 'requestState' });
+  });
+
+  socket.on('disconnect', () => {
+    console.log(`Browser disconnected: ${socket.id}`);
+  });
+});
+
+// WebSocket server for the Windows bridge
+const wss = new WebSocket.Server({ port: BRIDGE_PORT });
+console.log(`Bridge WebSocket listening on port ${BRIDGE_PORT}`);
+
+wss.on('connection', (ws, req) => {
+  const clientIp = req.socket.remoteAddress;
+  console.log(`Bridge connected from ${clientIp}`);
+
+  if (bridgeWs) {
+    bridgeWs.terminate();
+  }
+  bridgeWs = ws;
+
+  ws.send(JSON.stringify({ type: 'requestState' }));
+
+  ws.on('message', (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    switch (msg.type) {
+      case 'hello':
+        bridgeInfo = { connected: true, vmType: msg.vmType, vmVersion: msg.vmVersion };
+        io.emit('bridge:status', bridgeInfo);
+        console.log(`VM type: ${msg.vmType}, version: ${msg.vmVersion}`);
+        break;
+
+      case 'state':
+        vmState = msg.data;
+        io.emit('vm:state', vmState);
+        break;
+
+      case 'update':
+        vmState[msg.param] = msg.value;
+        io.emit('vm:update', { param: msg.param, value: msg.value });
+        break;
+
+      case 'levels':
+        vmLevels = msg.data;
+        io.emit('vm:levels', msg.data);
+        break;
+
+      case 'error':
+        console.error('Bridge error:', msg.message);
+        io.emit('bridge:error', msg.message);
+        break;
+    }
+  });
+
+  ws.on('close', () => {
+    console.log('Bridge disconnected');
+    bridgeWs = null;
+    bridgeInfo = { connected: false, vmType: null, vmVersion: null };
+    io.emit('bridge:status', bridgeInfo);
+  });
+
+  ws.on('error', (err) => {
+    console.error('Bridge WS error:', err.message);
+  });
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`\nVoiceMeeter Control Server`);
+  console.log(`  Web UI:  http://0.0.0.0:${PORT}`);
+  console.log(`  Bridge:  ws://0.0.0.0:${BRIDGE_PORT}`);
+  console.log(`  Layout:  ${LAYOUT_FILE}\n`);
+});
