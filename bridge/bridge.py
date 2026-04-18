@@ -56,6 +56,7 @@ tray_icon = None
 status_text = "Starting..."
 SCREENSHOT_DIR = os.path.join(os.path.expanduser("~"), "Pictures", "VM Control Screenshots")
 KEYEVENTF_KEYUP = 0x0002
+ICON_CACHE = {}
 
 VK_CODES = {
     "ctrl": 0x11,
@@ -232,6 +233,44 @@ def run_desktop_action(action_data: dict):
 
     raise RuntimeError(f"Unsupported desktop action: {action}")
 
+
+def resolve_desktop_icon(target: str):
+    target = (target or "").strip()
+    if not target:
+        return None
+    if target in ICON_CACHE:
+        return ICON_CACHE[target]
+
+    ps_script = r"""
+Add-Type -AssemblyName System.Drawing
+$target = $args[0]
+if (-not (Test-Path -LiteralPath $target)) { exit 0 }
+$icon = [System.Drawing.Icon]::ExtractAssociatedIcon((Resolve-Path -LiteralPath $target))
+if ($null -eq $icon) { exit 0 }
+$bitmap = $icon.ToBitmap()
+$stream = New-Object System.IO.MemoryStream
+$bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
+[Convert]::ToBase64String($stream.ToArray())
+"""
+
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script, target],
+            capture_output=True,
+            text=True,
+            timeout=12,
+            check=False,
+        )
+        base64_data = (result.stdout or "").strip()
+        if not base64_data:
+            return None
+        data_url = f"data:image/png;base64,{base64_data}"
+        ICON_CACHE[target] = data_url
+        return data_url
+    except Exception as e:
+        log.warning("Icon resolve failed for %s: %s", target, e)
+        return None
+
 # ── WebSocket bridge session ──────────────────────────────────────────────────
 async def run_bridge():
     url = f"ws://{PI_HOST}:{PI_PORT}"
@@ -252,6 +291,7 @@ async def run_bridge():
                     "vmVersion": vm_ver,
                     "capabilities": {
                         "desktopActions": True,
+                        "desktopIcons": True,
                     },
                 }))
                 log.info("VoiceMeeter type=%d version=%s", vm_type, vm_ver)
@@ -334,6 +374,19 @@ async def receive_loop(ws):
                     "type": "error",
                     "message": f"Desktop action failed: {e}",
                 }))
+
+        elif msg_type == "desktopIconRequest":
+            target = msg.get("target", "")
+            try:
+                icon = resolve_desktop_icon(target)
+                if icon:
+                    await ws.send(json.dumps({
+                        "type": "desktopIcon",
+                        "target": target,
+                        "icon": icon,
+                    }))
+            except Exception as e:
+                log.error("Desktop icon resolve failed: %s", e)
 
 async def poll_loop(ws):
     """Periodically poll VoiceMeeter for state changes and level data."""

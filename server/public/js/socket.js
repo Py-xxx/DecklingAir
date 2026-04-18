@@ -28,6 +28,11 @@ export function desktopAction(action) {
   _socket?.emit('desktop:action', action);
 }
 
+export function requestDesktopIcon(target) {
+  if (!target) return;
+  _socket?.emit('desktop:icon_request', { target });
+}
+
 export function saveLayout(layout) {
   _socket?.emit('layout:save', layout);
 }
@@ -97,6 +102,7 @@ function attachSocketHandlers(socket) {
   socket.on('bridge:status', info => _handlers.onBridgeStatus?.(info));
   socket.on('bridge:error', msg => _handlers.onBridgeError?.(msg));
   socket.on('layout:data', layout => _handlers.onLayout?.(layout));
+  socket.on('desktop:icon', payload => _handlers.onDesktopIcon?.(payload));
 }
 
 function detachSocketHandlers(socket) {

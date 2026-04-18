@@ -1,4 +1,4 @@
-import { initSocket, saveLayout } from './socket.js';
+import { initSocket, requestDesktopIcon, saveLayout } from './socket.js';
 import { renderControl, setStateRef } from './controls.js';
 import {
   initEditor,
@@ -37,6 +37,7 @@ const DEFAULT_SIZES = {
 const state = {
   layout: normalizeLayout(DEFAULT_LAYOUT),
   vmState: {},
+  desktopIcons: {},
   levels: [],
   bridge: { connected: false, vmType: null, vmVersion: null },
   ui: { currentPage: 0, editMode: false },
@@ -52,7 +53,7 @@ const statusBadgeEl = document.getElementById('bridge-status');
 const statusTextEl = document.getElementById('status-text');
 const btnSettingsEl = document.getElementById('btn-settings');
 
-setStateRef(state.vmState);
+setStateRef(state.vmState, state.desktopIcons);
 
 initEditor(state, {
   commitLayout({ persist = true, rerender = true } = {}) {
@@ -94,19 +95,29 @@ initSocket({
   },
   onBridgeStatus(info) {
     setBridgeStatus(info);
+    if (info?.connected && info?.capabilities?.desktopIcons) {
+      requestDesktopIconsForLayout();
+    }
   },
   onBridgeError(msg) {
     console.warn('Bridge error:', msg);
+  },
+  onDesktopIcon({ target, icon }) {
+    if (!target || typeof icon !== 'string') return;
+    state.desktopIcons[target] = icon;
+    if (currentPageHasDesktopTarget(target)) renderCurrentPage();
   },
   onLayout(layout) {
     state.layout = normalizeLayout(layout);
     clampCurrentPage();
     applySettings();
+    requestDesktopIconsForLayout();
     renderCurrentPage();
   },
 });
 
 applySettings();
+requestDesktopIconsForLayout();
 renderCurrentPage();
 
 function normalizeLayout(layout) {
@@ -214,6 +225,28 @@ function renderCurrentPage() {
     cardRegistry.set(control.id, card);
     if (state.levels.length) card._updateLevels?.(state.levels);
   });
+}
+
+function requestDesktopIconsForLayout() {
+  const targets = new Set();
+  (state.layout.pages || []).forEach(page => {
+    (page.controls || []).forEach(control => {
+      if (control.type !== 'desktop_action') return;
+      const target = control.config?.target?.trim();
+      const action = control.config?.action;
+      if (action !== 'launch' || !target) return;
+      if (state.desktopIcons[target]) return;
+      targets.add(target);
+    });
+  });
+
+  targets.forEach(target => requestDesktopIcon(target));
+}
+
+function currentPageHasDesktopTarget(target) {
+  return (getCurrentPage()?.controls || []).some(control =>
+    control.type === 'desktop_action' && control.config?.target === target
+  );
 }
 
 function renderGridOverlay(rows) {

@@ -46,7 +46,11 @@ export function buildParamOptions(gainsOnly = false) {
 
 // ── Shared state refs ─────────────────────────────────────────────────────────
 let _vmState = {};
-export function setStateRef(stateObj) { _vmState = stateObj; }
+let _desktopIcons = {};
+export function setStateRef(stateObj, desktopIcons = {}) {
+  _vmState = stateObj;
+  _desktopIcons = desktopIcons;
+}
 
 function isEditMode() {
   return document.body.classList.contains('edit-mode');
@@ -458,17 +462,18 @@ export function renderDesktopAction(ctrl) {
   card.style.borderColor = `rgba(${r},${g},${b},0.35)`;
   card.style.boxShadow = `0 0 18px rgba(${r},${g},${b},0.14)`;
 
+  const iconWrap = document.createElement('div');
+  iconWrap.className = 'desktop-action-icon';
+  const iconImg = desktopActionIcon(action, cfg.target);
+  if (iconImg) iconWrap.appendChild(iconImg);
+
   const labelEl = document.createElement('div');
   labelEl.className = 'desktop-action-label';
   labelEl.textContent = cfg.label || desktopActionTitle(action);
 
-  const metaEl = document.createElement('div');
-  metaEl.className = 'desktop-action-meta';
-  metaEl.textContent = desktopActionMeta(action, cfg.target);
-
   card.appendChild(dragHandle());
+  card.appendChild(iconWrap);
   card.appendChild(labelEl);
-  card.appendChild(metaEl);
   card.appendChild(editOverlay(ctrl.id));
   card.appendChild(resizeHandle());
 
@@ -723,26 +728,36 @@ function desktopActionTitle(action) {
   return labels[action] || 'Shortcut';
 }
 
-function desktopActionMeta(action, target) {
-  if (action === 'launch' && target) return trimMeta(target);
-  if (action === 'open_url' && target) return trimMeta(target);
-  if (action === 'key_combo' && target) return target.toUpperCase();
+function desktopActionIcon(action, target) {
+  if (action === 'launch' && target && _desktopIcons[target]) {
+    const img = document.createElement('img');
+    img.className = 'desktop-action-app-icon';
+    img.src = _desktopIcons[target];
+    img.alt = '';
+    return img;
+  }
 
-  const meta = {
-    screenshot: 'Desktop',
-    media_play_pause: 'Media',
-    media_next: 'Media',
-    media_previous: 'Media',
-    volume_up: 'System Audio',
-    volume_down: 'System Audio',
-    volume_mute: 'System Audio',
-    lock: 'Security',
-    sleep: 'Power',
-  };
-
-  return meta[action] || 'Desktop';
+  const fallback = document.createElement('div');
+  fallback.className = 'desktop-action-glyph';
+  fallback.innerHTML = desktopActionSvg(action);
+  return fallback;
 }
 
-function trimMeta(text) {
-  return text.length > 28 ? `${text.slice(0, 28)}…` : text;
+function desktopActionSvg(action) {
+  const icons = {
+    launch: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="12" rx="2"/><path d="M8.5 19.5h7"/><path d="M12 16.5v3"/></svg>`,
+    open_url: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><path d="M4 12h16"/><path d="M12 4a12 12 0 0 1 0 16"/><path d="M12 4a12 12 0 0 0 0 16"/></svg>`,
+    screenshot: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6l1.5-2h5L16 6h2a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h2z"/><circle cx="12" cy="12" r="3.5"/></svg>`,
+    media_play_pause: `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 5h3v14H6zM15 5h3v14h-3z"/></svg>`,
+    media_next: `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M5 6.5v11l8-5.5-8-5.5zM14 6.5v11l8-5.5-8-5.5z"/></svg>`,
+    media_previous: `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M19 6.5v11l-8-5.5 8-5.5zM10 6.5v11L2 12l8-5.5z"/></svg>`,
+    volume_up: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14h4l5 4V6L8 10H4z"/><path d="M17 9a4 4 0 0 1 0 6"/><path d="M19.5 6.5a7.5 7.5 0 0 1 0 11"/></svg>`,
+    volume_down: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14h4l5 4V6L8 10H4z"/><path d="M18 9.5a4 4 0 0 1 0 5"/></svg>`,
+    volume_mute: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14h4l5 4V6L8 10H4z"/><path d="M17 9l5 6"/><path d="M22 9l-5 6"/></svg>`,
+    lock: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15" r="1"/></svg>`,
+    sleep: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M18 14.5A6.5 6.5 0 1 1 9.5 6 5.5 5.5 0 0 0 18 14.5z"/></svg>`,
+    key_combo: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="6.5" width="17" height="11" rx="2"/><path d="M7 11.5h2M11 11.5h2M15 11.5h2"/><path d="M6 15h12"/></svg>`,
+  };
+
+  return icons[action] || icons.launch;
 }

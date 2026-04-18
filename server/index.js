@@ -65,6 +65,7 @@ let vmState = {};
 let vmLevels = [];
 let bridgeWs = null;
 let bridgeInfo = { connected: false, vmType: null, vmVersion: null, capabilities: {} };
+const desktopIconCache = new Map();
 
 app.disable('etag');
 app.use(express.json());
@@ -152,6 +153,21 @@ io.on('connection', (socket) => {
     sendToBridge({ type: 'desktopAction', action });
   });
 
+  socket.on('desktop:icon_request', ({ target }) => {
+    const resolvedTarget = typeof target === 'string' ? target.trim() : '';
+    if (!resolvedTarget) return;
+
+    if (desktopIconCache.has(resolvedTarget)) {
+      socket.emit('desktop:icon', { target: resolvedTarget, icon: desktopIconCache.get(resolvedTarget) });
+      return;
+    }
+
+    if (!bridgeWs || bridgeWs.readyState !== WebSocket.OPEN) return;
+    if (!bridgeInfo.capabilities?.desktopIcons) return;
+
+    sendToBridge({ type: 'desktopIconRequest', target: resolvedTarget });
+  });
+
   socket.on('layout:save', (newLayout) => {
     layout = newLayout;
     saveLayout();
@@ -200,6 +216,12 @@ wss.on('connection', (ws, req) => {
         };
         io.emit('bridge:status', bridgeInfo);
         console.log(`VM type: ${msg.vmType}, version: ${msg.vmVersion}`);
+        break;
+      case 'desktopIcon':
+        if (msg.target && typeof msg.icon === 'string') {
+          desktopIconCache.set(msg.target, msg.icon);
+          io.emit('desktop:icon', { target: msg.target, icon: msg.icon });
+        }
         break;
 
       case 'state':

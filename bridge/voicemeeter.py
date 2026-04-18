@@ -33,6 +33,23 @@ STRIP_BOOL_PARAMS = [
 BUS_FLOAT_PARAMS = ["Gain"]
 BUS_BOOL_PARAMS  = ["Mute", "EQ.on"]
 
+# Official VB-Audio Remote API "Voicemeeter Potato Input Channel Organization"
+# lists the input level indices as:
+# In1=0, In2=2, In3=4, In4=6, In5=8, V1=10, V2=18, V3=26
+# with hardware strips using 2 channels and virtual inputs using 8 channels.
+# We expose a simplified 8-strip stereo view to the web UI by taking L/R from
+# each strip's documented starting index.
+STRIP_LEVEL_INPUT_INDICES = [
+    0,   # In 1
+    2,   # In 2
+    4,   # In 3
+    6,   # In 4
+    8,   # In 5
+    10,  # Virtual In 1
+    18,  # Virtual In 2
+    26,  # Virtual In 3
+]
+
 
 class VoiceMeeterRemote:
     def __init__(self):
@@ -142,14 +159,18 @@ class VoiceMeeterRemote:
     def get_all_levels(self) -> list:
         """
         Returns a flat list of linear level values:
-          [0..15]  = strip channels (8 strips × 2ch L+R), type=2 (post-mute)
+          [0..15]  = strip channels (8 strips × 2ch L+R), using VB-Audio's
+                     documented Potato input indices with GetLevel(0, idx)
           [16..79] = bus channels  (8 buses × 8ch surround), type=3
-        We use only L+R (indices 0,1 per bus) for simplicity.
+        We use only L+R for strip widgets and only the first bus channel in some
+        UI widgets, but keep the full bus block for flexibility.
         """
         levels = []
-        # Strip levels (post-mute): 8 strips × 2 channels = 16
-        for ch in range(16):
-            levels.append(self.get_level(2, ch))
+        # Strip/input levels. Virtual inputs are 8-channel blocks on Potato,
+        # so they do not follow the simple 0..15 stereo pattern.
+        for start_idx in STRIP_LEVEL_INPUT_INDICES:
+            levels.append(self.get_level(0, start_idx))
+            levels.append(self.get_level(0, start_idx + 1))
         # Bus output levels: 8 buses × 8 channels = 64
         for ch in range(64):
             levels.append(self.get_level(3, ch))
