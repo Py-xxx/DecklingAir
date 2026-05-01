@@ -1,5 +1,5 @@
 import { VM_STRIPS, VM_BUSES, buildParamOptions } from './controls.js';
-import { vmMacro } from './socket.js';
+import { vmMacro, requestSoundboardDevices } from './socket.js';
 
 const DEFAULT_SIZES = {
   fader: [1, 4],
@@ -7,11 +7,22 @@ const DEFAULT_SIZES = {
   button: [2, 1],
   macro: [2, 1],
   desktop_action: [2, 1],
+  soundboard: [2, 1],
   vu_meter: [1, 3],
   strip_panel: [1, 4],
   bus_panel: [1, 3],
   label: [2, 1],
 };
+
+const VM_ONLY_TYPES = new Set([
+  'fader',
+  'toggle',
+  'button',
+  'macro',
+  'vu_meter',
+  'strip_panel',
+  'bus_panel',
+]);
 
 let _state = null;
 let _callbacks = {};
@@ -24,6 +35,34 @@ let _gridGesture = null;
 const previewEl = document.getElementById('drop-preview');
 const mainAreaEl = document.getElementById('main-area');
 
+/**
+ * Called from app.js whenever the active bridge sends back a soundboard device list.
+ * Repopulates the device dropdown while preserving the current selection.
+ */
+export function updateSoundboardDeviceList(devices) {
+  const select = document.getElementById('cfg-soundboard-device');
+  if (!select) return;
+  const currentValue = select.value;
+  select.innerHTML = '<option value="">Default Output Device</option>';
+  (devices || []).forEach(d => {
+    const opt = document.createElement('option');
+    opt.value = d.name;
+    opt.textContent = d.name;
+    select.appendChild(opt);
+  });
+  if (currentValue) {
+    select.value = currentValue;
+    // If device is no longer in list, keep it as a custom option so the saved path isn't lost
+    if (!select.value) {
+      const opt = document.createElement('option');
+      opt.value = currentValue;
+      opt.textContent = currentValue;
+      select.appendChild(opt);
+      select.value = currentValue;
+    }
+  }
+}
+
 export function initEditor(state, callbacks) {
   _state = state;
   _callbacks = callbacks;
@@ -34,7 +73,10 @@ export function initEditor(state, callbacks) {
   buildSizePicker();
 
   document.querySelectorAll('.type-card').forEach(card => {
-    card.addEventListener('click', () => selectType(card.dataset.type));
+    card.addEventListener('click', () => {
+      if (card.classList.contains('disabled')) return;
+      selectType(card.dataset.type);
+    });
   });
 
   document.getElementById('fab-add').addEventListener('click', () => openModal(null));
@@ -50,6 +92,14 @@ export function initEditor(state, callbacks) {
 
   document.getElementById('btn-add-macro-action').addEventListener('click', () => addMacroAction());
   document.getElementById('cfg-desktop-kind').addEventListener('change', updateDesktopActionFields);
+
+  document.getElementById('cfg-soundboard-refresh').addEventListener('click', () => {
+    requestSoundboardDevicesForEditor();
+  });
+  document.getElementById('cfg-soundboard-volume').addEventListener('input', () => {
+    document.getElementById('cfg-soundboard-volume-display').textContent =
+      document.getElementById('cfg-soundboard-volume').value + '%';
+  });
 
   document.getElementById('settings-close').addEventListener('click', closeSettings);
   document.getElementById('settings-cancel').addEventListener('click', closeSettings);
@@ -123,6 +173,7 @@ export function initGridEvents(gridEl) {
 export function openModal(controlId) {
   _editingId = controlId;
   resetModal();
+  updateTypeAvailability();
 
   if (controlId) {
     const control = findControl(controlId);
@@ -155,12 +206,18 @@ export function openSettings() {
     2: 'VoiceMeeter Banana',
     3: 'VoiceMeeter Potato',
   };
+  const hasVoiceMeeter = !!bridge.capabilities?.voiceMeeter;
+  const restartButton = document.getElementById('s-vm-restart');
 
   document.getElementById('s-accent-color').value = settings.accentColor || '#6c63ff';
   document.getElementById('s-grid-cols').value = String(settings.gridColumns || 8);
   document.getElementById('s-status').textContent = bridge.connected ? 'Connected' : 'Disconnected';
-  document.getElementById('s-vm-type').textContent = vmTypeNames[bridge.vmType] || '—';
+  document.getElementById('s-device-name').textContent = bridge.deviceName || _state.layout.name || '—';
+  document.getElementById('s-platform').textContent = currentPlatformLabel();
+  document.getElementById('s-vm-type').textContent = hasVoiceMeeter ? (vmTypeNames[bridge.vmType] || 'Connected') : 'Not available';
   document.getElementById('s-vm-version').textContent = bridge.vmVersion || '—';
+  restartButton.disabled = !hasVoiceMeeter;
+  restartButton.textContent = hasVoiceMeeter ? 'Restart Audio Engine' : 'No Mixer Available';
 
   renderPagesList();
   document.getElementById('settings-modal').style.display = 'flex';
@@ -205,6 +262,12 @@ function resetModal() {
   document.getElementById('cfg-desktop-args').value = '';
   updateDesktopActionFields();
 
+  document.getElementById('cfg-soundboard-file').value = '';
+  document.getElementById('cfg-soundboard-device').innerHTML = '<option value="">Default Output Device</option>';
+  document.getElementById('cfg-soundboard-volume').value = '100';
+  document.getElementById('cfg-soundboard-volume-display').textContent = '100%';
+  document.getElementById('cfg-soundboard-color').value = '#22c55e';
+
   document.getElementById('cfg-vu-source').selectedIndex = 0;
   document.getElementById('cfg-strip-select').selectedIndex = 0;
   document.querySelectorAll('#cfg-strip-routing input').forEach(input => {
@@ -230,6 +293,7 @@ function highlightSelectedType(type) {
 }
 
 function showTypeStep() {
+  updateTypeAvailability();
   document.getElementById('step-type').style.display = 'block';
   document.getElementById('step-config').style.display = 'none';
   document.getElementById('modal-back').style.display = 'none';
@@ -255,6 +319,7 @@ function showConfigSection(type) {
     button: 'cfg-toggle',
     macro: 'cfg-macro',
     desktop_action: 'cfg-desktop-action',
+    soundboard: 'cfg-soundboard',
     vu_meter: 'cfg-vu',
     strip_panel: 'cfg-strip-panel',
     bus_panel: 'cfg-bus-panel',
@@ -263,6 +328,10 @@ function showConfigSection(type) {
   const sectionId = sectionMap[type];
   if (sectionId) document.getElementById(sectionId).style.display = 'flex';
   document.getElementById('size-picker-group').style.display = 'block';
+
+  if (type === 'soundboard') {
+    requestSoundboardDevicesForEditor();
+  }
 }
 
 function populateModal(control) {
@@ -306,6 +375,24 @@ function populateModal(control) {
 
   if (control.type === 'bus_panel') {
     document.getElementById('cfg-bus-select').value = String(config.busIndex ?? 0);
+  }
+
+  if (control.type === 'soundboard') {
+    const vol = Math.round((config.volume ?? 1.0) * 100);
+    document.getElementById('cfg-soundboard-file').value = config.file || '';
+    document.getElementById('cfg-soundboard-volume').value = String(vol);
+    document.getElementById('cfg-soundboard-volume-display').textContent = vol + '%';
+    document.getElementById('cfg-soundboard-color').value = config.color || '#22c55e';
+    // Pre-populate saved device so it isn't lost while the async list loads
+    const sel = document.getElementById('cfg-soundboard-device');
+    sel.innerHTML = '<option value="">Default Output Device</option>';
+    if (config.device) {
+      const opt = document.createElement('option');
+      opt.value = config.device;
+      opt.textContent = config.device;
+      sel.appendChild(opt);
+      sel.value = config.device;
+    }
   }
 
   if (control.type === 'desktop_action') {
@@ -429,6 +516,22 @@ function buildControlConfig(type) {
     };
   }
 
+  if (type === 'soundboard') {
+    const file = document.getElementById('cfg-soundboard-file').value.trim();
+    if (!file) {
+      window.alert('Please enter a file path for the sound.');
+      return null;
+    }
+    const rawVol = Number.parseInt(document.getElementById('cfg-soundboard-volume').value, 10) || 100;
+    return {
+      label: label || 'Sound',
+      file,
+      device: document.getElementById('cfg-soundboard-device').value || null,
+      volume: Math.max(0, Math.min(2, rawVol / 100)),
+      color: document.getElementById('cfg-soundboard-color').value,
+    };
+  }
+
   if (type === 'vu_meter') {
     const [kind, indexValue] = document.getElementById('cfg-vu-source').value.split('-');
     const index = Number.parseInt(indexValue, 10) || 0;
@@ -519,6 +622,12 @@ function updateDesktopActionFields() {
   help.textContent = config.help;
 }
 
+function requestSoundboardDevicesForEditor() {
+  const deviceId = _state?.ui?.activeDeviceId;
+  if (!deviceId) return;
+  requestSoundboardDevices(deviceId);
+}
+
 function requiresDesktopTarget(action) {
   return ['launch', 'open_url', 'key_combo'].includes(action);
 }
@@ -534,78 +643,108 @@ function defaultDesktopActionLabel(action) {
     volume_up: 'Volume Up',
     volume_down: 'Volume Down',
     volume_mute: 'Mute',
-    lock: 'Lock PC',
-    sleep: 'Sleep PC',
+    lock: 'Lock Device',
+    sleep: 'Sleep Device',
     key_combo: 'Shortcut',
   };
   return labels[action] || 'Shortcut';
 }
 
 function desktopActionUiMeta(action) {
+  const isMac = currentPlatform() === 'macos';
+  const platformLabel = currentPlatformLabel();
   const meta = {
     launch: {
-      label: 'Path',
-      placeholder: 'C:\\Program Files\\App\\app.exe or .lnk',
-      help: 'Launch an app, folder, file, or shortcut on the Windows PC.',
+      label: isMac ? 'Path or App Bundle' : 'Path',
+      placeholder: isMac ? '/Applications/Safari.app' : 'C:\\Program Files\\App\\app.exe or .lnk',
+      help: `Launch an app, folder, file, or shortcut on the selected ${platformLabel} device.`,
     },
     open_url: {
       label: 'URL',
       placeholder: 'https://example.com',
-      help: 'Open a website in the default browser on the Windows PC.',
+      help: `Open a website in the default browser on the selected ${platformLabel} device.`,
     },
     key_combo: {
       label: 'Key Combo',
-      placeholder: 'ctrl+alt+m',
-      help: 'Send a keyboard shortcut like ctrl+shift+esc or win+d.',
+      placeholder: isMac ? 'cmd+shift+4' : 'ctrl+alt+m',
+      help: isMac
+        ? 'Send a keyboard shortcut like cmd+space or cmd+shift+4.'
+        : 'Send a keyboard shortcut like ctrl+shift+esc or win+d.',
     },
     screenshot: {
       label: 'Target',
       placeholder: '',
-      help: 'Save a full-screen screenshot in the Windows Pictures\\VM Control Screenshots folder.',
+      help: `Save a full-screen screenshot on the selected ${platformLabel} device.`,
     },
     media_play_pause: {
       label: 'Target',
       placeholder: '',
-      help: 'Toggle media playback on the Windows PC.',
+      help: `Toggle media playback on the selected ${platformLabel} device.`,
     },
     media_next: {
       label: 'Target',
       placeholder: '',
-      help: 'Skip to the next media track.',
+      help: `Skip to the next media track on the selected ${platformLabel} device.`,
     },
     media_previous: {
       label: 'Target',
       placeholder: '',
-      help: 'Go to the previous media track.',
+      help: `Go to the previous media track on the selected ${platformLabel} device.`,
     },
     volume_up: {
       label: 'Target',
       placeholder: '',
-      help: 'Raise the system volume with one press per tap.',
+      help: `Raise the system volume on the selected ${platformLabel} device.`,
     },
     volume_down: {
       label: 'Target',
       placeholder: '',
-      help: 'Lower the system volume with one press per tap.',
+      help: `Lower the system volume on the selected ${platformLabel} device.`,
     },
     volume_mute: {
       label: 'Target',
       placeholder: '',
-      help: 'Toggle the system mute state.',
+      help: `Toggle the system mute state on the selected ${platformLabel} device.`,
     },
     lock: {
       label: 'Target',
       placeholder: '',
-      help: 'Lock the Windows workstation immediately.',
+      help: `Lock the selected ${platformLabel} device immediately.`,
     },
     sleep: {
       label: 'Target',
       placeholder: '',
-      help: 'Put the Windows PC to sleep.',
+      help: `Put the selected ${platformLabel} device to sleep.`,
     },
   };
 
   return meta[action] || meta.launch;
+}
+
+function updateTypeAvailability() {
+  const supportsVm = !!_state.bridge?.capabilities?.voiceMeeter;
+  document.querySelectorAll('.type-card').forEach(card => {
+    const disabled = VM_ONLY_TYPES.has(card.dataset.type) && !supportsVm;
+    card.classList.toggle('disabled', disabled);
+    card.title = disabled ? 'This control type is only available on devices with VoiceMeeter.' : '';
+  });
+}
+
+function currentPlatform() {
+  const platform = String(_state.bridge?.platform || _state.layout?.platform || 'unknown').toLowerCase();
+  if (platform === 'darwin') return 'macos';
+  if (platform === 'win32') return 'windows';
+  return platform;
+}
+
+function currentPlatformLabel() {
+  const labels = {
+    macos: 'macOS',
+    windows: 'Windows',
+    linux: 'Linux',
+    unknown: 'Unknown',
+  };
+  return labels[currentPlatform()] || 'Unknown';
 }
 
 function closeModal() {

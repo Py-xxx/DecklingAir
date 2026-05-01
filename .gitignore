@@ -1,4 +1,4 @@
-node_modules/
+gitnode_modules/
 server/data/layout.json
 bridge/dist/
 bridge/__pycache__/

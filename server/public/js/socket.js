@@ -1,44 +1,59 @@
-// Socket.io wrapper — handles connection, lifecycle recovery, and refreshes.
+// Socket.io wrapper — handles connection, lifecycle recovery, and device-aware updates.
 
 let _socket = null;
 let _reconnectTimer = null;
 let _visibilityTimer = null;
 let _lifecycleBound = false;
 let _handlers = {};
+let _deviceGetter = () => null;
 
 const RESUME_RECONNECT_DELAY_MS = 150;
 const VISIBLE_RECONNECT_DELAY_MS = 500;
 
 export function initSocket(handlers) {
   _handlers = { ...handlers };
+  _deviceGetter = typeof handlers.getActiveDeviceId === 'function' ? handlers.getActiveDeviceId : () => null;
   createSocket();
   bindLifecycleHandlers();
   return _socket;
 }
 
-export function vmSet(param, value) {
-  _socket?.emit('vm:set', { param, value });
+export function vmSet(param, value, deviceId = currentDeviceId()) {
+  if (!deviceId) return;
+  _socket?.emit('vm:set', { deviceId, param, value });
 }
 
-export function vmMacro(params) {
-  _socket?.emit('vm:macro', params);
+export function vmMacro(params, deviceId = currentDeviceId()) {
+  if (!deviceId) return;
+  _socket?.emit('vm:macro', { deviceId, params });
 }
 
-export function desktopAction(action) {
-  _socket?.emit('desktop:action', action);
+export function desktopAction(action, deviceId = currentDeviceId()) {
+  if (!deviceId) return;
+  _socket?.emit('desktop:action', { deviceId, action });
 }
 
-export function requestDesktopIcon(target) {
-  if (!target) return;
-  _socket?.emit('desktop:icon_request', { target });
+export function soundboardPlay(file, device, volume = 1.0, deviceId = currentDeviceId()) {
+  if (!deviceId || !file) return;
+  _socket?.emit('soundboard:play', { deviceId, file, device: device || null, volume });
+}
+
+export function requestSoundboardDevices(deviceId = currentDeviceId()) {
+  if (!deviceId) return;
+  _socket?.emit('soundboard:devices_request', { deviceId });
+}
+
+export function requestDesktopIcon(target, deviceId = currentDeviceId()) {
+  if (!target || !deviceId) return;
+  _socket?.emit('desktop:icon_request', { deviceId, target });
 }
 
 export function saveLayout(layout) {
   _socket?.emit('layout:save', layout);
 }
 
-export function requestState() {
-  requestSnapshot();
+export function requestState(deviceId = null) {
+  requestSnapshot(deviceId);
 }
 
 export function forceReconnect(reason = 'manual') {
@@ -50,7 +65,6 @@ export function forceReconnect(reason = 'manual') {
   clearTimeout(_reconnectTimer);
   console.info('[socket] forcing reconnect:', reason);
 
-  // Closing first prevents stale iOS/BFCache sessions from lingering.
   if (_socket.connected || _socket.active) {
     _socket.disconnect();
   }
@@ -58,6 +72,14 @@ export function forceReconnect(reason = 'manual') {
   _reconnectTimer = window.setTimeout(() => {
     _socket.connect();
   }, RESUME_RECONNECT_DELAY_MS);
+}
+
+function currentDeviceId() {
+  try {
+    return _deviceGetter?.() || null;
+  } catch {
+    return null;
+  }
 }
 
 function createSocket() {
@@ -93,26 +115,33 @@ function attachSocketHandlers(socket) {
     _handlers.onConnectError?.(error);
   });
 
-  socket.on('vm:state', state => _handlers.onVmState?.(state));
-  socket.on('vm:update', ({ param, value }) => _handlers.onVmUpdate?.(param, value));
-  socket.on('vm:state_patch', params => {
-    params.forEach(({ param, value }) => _handlers.onVmUpdate?.(param, value));
+  socket.on('devices:data', devices => _handlers.onDevicesData?.(devices));
+  socket.on('vm:state', ({ deviceId, state }) => _handlers.onVmState?.(deviceId, state));
+  socket.on('vm:update', ({ deviceId, param, value }) => _handlers.onVmUpdate?.(deviceId, param, value));
+  socket.on('vm:state_patch', ({ deviceId, params }) => {
+    params.forEach(({ param, value }) => _handlers.onVmUpdate?.(deviceId, param, value));
   });
-  socket.on('vm:levels', levels => _handlers.onLevels?.(levels));
-  socket.on('bridge:status', info => _handlers.onBridgeStatus?.(info));
-  socket.on('bridge:error', msg => _handlers.onBridgeError?.(msg));
+  socket.on('vm:levels', ({ deviceId, levels }) => _handlers.onLevels?.(deviceId, levels));
+  socket.on('bridge:error', payload => {
+    if (typeof payload === 'string') {
+      _handlers.onBridgeError?.(null, payload);
+      return;
+    }
+    _handlers.onBridgeError?.(payload?.deviceId || null, payload?.message || '');
+  });
   socket.on('layout:data', layout => _handlers.onLayout?.(layout));
   socket.on('desktop:icon', payload => _handlers.onDesktopIcon?.(payload));
+  socket.on('soundboard:devices', payload => _handlers.onSoundboardDevices?.(payload));
 }
 
 function detachSocketHandlers(socket) {
   socket.removeAllListeners();
 }
 
-function requestSnapshot() {
+function requestSnapshot(deviceId = null) {
   if (!_socket?.connected) return;
   _socket.emit('layout:get');
-  _socket.emit('bridge:request_state');
+  _socket.emit('bridge:request_state', deviceId ? { deviceId } : {});
 }
 
 function bindLifecycleHandlers() {
@@ -130,8 +159,6 @@ function bindLifecycleHandlers() {
 
   window.addEventListener('pagehide', event => {
     clearTimeout(_visibilityTimer);
-    // Safari home-screen apps often BFCache the page. Drop the session so restore
-    // starts cleanly instead of resuming a half-dead transport.
     if (event.persisted) {
       _socket?.disconnect();
     }

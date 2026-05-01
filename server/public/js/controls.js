@@ -1,4 +1,4 @@
-import { desktopAction, vmSet, vmMacro } from './socket.js';
+import { desktopAction, soundboardPlay, vmSet, vmMacro } from './socket.js';
 
 // ── VM parameter catalogue ────────────────────────────────────────────────────
 export const VM_STRIPS = Array.from({ length: 8 }, (_, i) => ({
@@ -687,6 +687,52 @@ export function renderLabel(ctrl) {
   return card;
 }
 
+// ── Soundboard button ─────────────────────────────────────────────────────────
+export function renderSoundboard(ctrl) {
+  const cfg   = ctrl.config || {};
+  const color = cfg.color || '#22c55e';
+
+  const card = document.createElement('div');
+  card.className = 'control-card soundboard-card';
+  card.dataset.id = ctrl.id;
+  applyGridPlacement(card, ctrl);
+
+  const r = parseInt(color.slice(1, 3), 16);
+  const g = parseInt(color.slice(3, 5), 16);
+  const b = parseInt(color.slice(5, 7), 16);
+  card.style.background  = `rgba(${r},${g},${b},0.15)`;
+  card.style.borderColor = `rgba(${r},${g},${b},0.3)`;
+
+  const iconWrap = document.createElement('div');
+  iconWrap.className = 'soundboard-icon';
+  iconWrap.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"
+      stroke-linecap="round" stroke-linejoin="round">
+    <polygon points="5 3 19 12 5 21 5 3" fill="currentColor" opacity=".85"/>
+  </svg>`;
+
+  const labelEl = document.createElement('div');
+  labelEl.className = 'soundboard-label';
+  labelEl.textContent = cfg.label || 'Sound';
+
+  card.appendChild(dragHandle());
+  card.appendChild(iconWrap);
+  card.appendChild(labelEl);
+  card.appendChild(editOverlay(ctrl.id));
+  card.appendChild(resizeHandle());
+
+  card.addEventListener('pointerdown', e => {
+    if (isEditMode()) return;
+    if (e.target.closest('.edit-overlay, .drag-handle, .resize-handle')) return;
+    soundboardPlay(cfg.file, cfg.device || null, cfg.volume ?? 1.0);
+    card.classList.add('playing');
+  });
+  card.addEventListener('pointerup',     () => window.setTimeout(() => card.classList.remove('playing'), 260));
+  card.addEventListener('pointercancel', () => card.classList.remove('playing'));
+
+  card._updateState = () => {};
+  return card;
+}
+
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 export function renderControl(ctrl, vmState) {
   switch (ctrl.type) {
@@ -695,6 +741,7 @@ export function renderControl(ctrl, vmState) {
     case 'button':      return renderToggle(ctrl, vmState);
     case 'macro':       return renderMacro(ctrl, vmState);
     case 'desktop_action': return renderDesktopAction(ctrl);
+    case 'soundboard':     return renderSoundboard(ctrl);
     case 'strip_panel': return renderStripPanel(ctrl, vmState);
     case 'bus_panel':   return renderBusPanel(ctrl, vmState);
     case 'vu_meter':    return renderVuMeter(ctrl, vmState);
@@ -721,8 +768,8 @@ function desktopActionTitle(action) {
     volume_up: 'Volume Up',
     volume_down: 'Volume Down',
     volume_mute: 'Mute',
-    lock: 'Lock PC',
-    sleep: 'Sleep PC',
+    lock: 'Lock Device',
+    sleep: 'Sleep Device',
     key_combo: 'Shortcut',
   };
   return labels[action] || 'Shortcut';

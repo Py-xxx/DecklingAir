@@ -32,6 +32,7 @@
         </div>
       </div>
 
+      <nav id="device-tabs" class="device-tabs"></nav>
       <nav id="page-tabs" class="page-tabs"></nav>
 
       <div class="header-right">
@@ -118,6 +119,12 @@
                 <rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/><path d="M8 9h8"/>
               </svg>
               Shortcut
+            </button>
+            <button class="type-card" data-type="soundboard">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polygon points="5 3 19 12 5 21 5 3"/>
+              </svg>
+              Soundboard
             </button>
             <button class="type-card" data-type="vu_meter">
               <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 20v-5M7 20v-9M11 20v-13M15 20v-8M19 20v-4M21 20H1"/></svg>
@@ -206,8 +213,8 @@
                   <option value="volume_up">Volume Up</option>
                   <option value="volume_down">Volume Down</option>
                   <option value="volume_mute">Mute / Unmute</option>
-                  <option value="lock">Lock PC</option>
-                  <option value="sleep">Sleep PC</option>
+                  <option value="lock">Lock Device</option>
+                  <option value="sleep">Sleep Device</option>
                   <option value="key_combo">Key Combo</option>
                 </select>
               </div>
@@ -273,6 +280,39 @@
               </div>
             </div>
           </div>
+
+          <!-- Soundboard config -->
+          <div id="cfg-soundboard" class="cfg-section" style="display:none">
+            <div class="form-row">
+              <div class="form-group fg-grow">
+                <label class="form-label">Audio File Path</label>
+                <input type="text" id="cfg-soundboard-file" class="form-input" placeholder="C:\Sounds\boom.wav">
+                <span class="form-hint">Full path to the audio file on the Windows PC (WAV, MP3, FLAC, OGG…)</span>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group fg-grow">
+                <label class="form-label">Output Device</label>
+                <div class="soundboard-device-row">
+                  <select id="cfg-soundboard-device" class="form-select">
+                    <option value="">Default Output Device</option>
+                  </select>
+                  <button type="button" id="cfg-soundboard-refresh" class="btn-secondary btn-sm" title="Refresh device list">↻</button>
+                </div>
+                <span class="form-hint">Route audio through a VoiceMeeter virtual input (e.g. "VoiceMeeter Input").</span>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group fg-grow">
+                <label class="form-label">Volume — <span id="cfg-soundboard-volume-display">100%</span></label>
+                <input type="range" id="cfg-soundboard-volume" class="form-range" min="0" max="200" value="100">
+              </div>
+              <div class="form-group">
+                <label class="form-label">Color</label>
+                <input type="color" id="cfg-soundboard-color" class="form-color" value="#22c55e">
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -294,10 +334,12 @@
       </div>
       <div class="modal-body">
         <section class="settings-section">
-          <h3>Bridge Status</h3>
+          <h3>Selected Device</h3>
           <div class="info-card">
             <div class="info-row"><span>Status</span><span id="s-status">—</span></div>
-            <div class="info-row"><span>VoiceMeeter</span><span id="s-vm-type">—</span></div>
+            <div class="info-row"><span>Device</span><span id="s-device-name">—</span></div>
+            <div class="info-row"><span>Platform</span><span id="s-platform">—</span></div>
+            <div class="info-row"><span>Mixer</span><span id="s-vm-type">—</span></div>
             <div class="info-row"><span>Version</span><span id="s-vm-version">—</span></div>
           </div>
         </section>
@@ -331,7 +373,7 @@
           </div>
         </section>
         <section class="settings-section">
-          <h3>VoiceMeeter</h3>
+          <h3>Mixer</h3>
           <button class="btn-danger-outline btn-sm" id="s-vm-restart">Restart Audio Engine</button>
         </section>
       </div>

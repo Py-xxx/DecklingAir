@@ -14,6 +14,7 @@ import time
 import os
 import shlex
 import subprocess
+import socket
 import webbrowser
 from datetime import datetime
 
@@ -22,6 +23,15 @@ import pystray
 from PIL import Image, ImageDraw, ImageGrab
 
 from voicemeeter import VoiceMeeterRemote
+
+try:
+    import sounddevice as sd
+    import soundfile as sf
+    _sounddevice_available = True
+except ImportError:
+    sd = None
+    sf = None
+    _sounddevice_available = False
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -35,9 +45,20 @@ def load_config():
 
 cfg = load_config()
 PI_HOST    = cfg.get("pi_host", "192.168.1.100")
-PI_PORT    = cfg.get("bridge_port", 3001)
+PI_PORT    = cfg.get("bridge_port", 3003)
 LOG_LEVEL  = cfg.get("log_level", "INFO")
 POLL_MS    = cfg.get("poll_interval_ms", 50)
+
+
+def slugify_device_id(value: str) -> str:
+    cleaned = "".join(ch.lower() if ch.isalnum() else "-" for ch in str(value or "").strip())
+    while "--" in cleaned:
+        cleaned = cleaned.replace("--", "-")
+    return cleaned.strip("-") or "windows-device"
+
+
+DEVICE_NAME = cfg.get("device_name") or socket.gethostname()
+DEVICE_ID = cfg.get("device_id") or slugify_device_id(DEVICE_NAME)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -248,6 +269,45 @@ def run_desktop_action(action_data: dict):
     raise RuntimeError(f"Unsupported desktop action: {action}")
 
 
+def get_output_devices():
+    """Return list of audio output devices available on this system."""
+    if not _sounddevice_available:
+        return []
+    try:
+        result = []
+        for i, d in enumerate(sd.query_devices()):
+            if d.get('max_output_channels', 0) > 0:
+                result.append({'id': i, 'name': d['name']})
+        return result
+    except Exception as e:
+        log.error("Failed to query audio devices: %s", e)
+        return []
+
+
+def play_sound(file_path: str, device=None, volume: float = 1.0):
+    """Play an audio file through the specified output device (by name substring)."""
+    if not _sounddevice_available:
+        raise RuntimeError("sounddevice/soundfile not installed – run: pip install sounddevice soundfile")
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"Sound file not found: {file_path}")
+
+    data, samplerate = sf.read(file_path, dtype='float32', always_2d=True)
+    if volume != 1.0:
+        data = data * max(0.0, min(2.0, float(volume)))
+
+    device_idx = None
+    if device:
+        try:
+            for i, d in enumerate(sd.query_devices()):
+                if d.get('max_output_channels', 0) > 0 and device.lower() in d['name'].lower():
+                    device_idx = i
+                    break
+        except Exception:
+            pass
+
+    sd.play(data, samplerate, device=device_idx, blocking=False)
+
+
 def resolve_desktop_icon(target: str):
     target = (target or "").strip()
     if not target:
@@ -302,11 +362,16 @@ async def run_bridge():
                 vm_ver  = vm.get_version()
                 await ws.send(json.dumps({
                     "type": "hello",
+                    "deviceId": DEVICE_ID,
+                    "deviceName": DEVICE_NAME,
+                    "platform": "windows",
                     "vmType": vm_type,
                     "vmVersion": vm_ver,
                     "capabilities": {
+                        "voiceMeeter": True,
                         "desktopActions": True,
                         "desktopIcons": True,
+                        "soundboard": _sounddevice_available,
                     },
                 }))
                 log.info("VoiceMeeter type=%d version=%s", vm_type, vm_ver)
@@ -389,6 +454,27 @@ async def receive_loop(ws):
                     "type": "error",
                     "message": f"Desktop action failed: {e}",
                 }))
+
+        elif msg_type == "soundboard":
+            file_path = msg.get("file", "")
+            device    = msg.get("device") or None
+            volume    = float(msg.get("volume", 1.0))
+            if file_path:
+                try:
+                    play_sound(file_path, device, volume)
+                    log.info("Soundboard: playing %s via %s", file_path, device or "default")
+                except Exception as e:
+                    log.error("Soundboard playback failed: %s", e)
+                    await ws.send(json.dumps({
+                        "type": "error",
+                        "message": f"Soundboard playback failed: {e}",
+                    }))
+
+        elif msg_type == "soundboardDevicesRequest":
+            await ws.send(json.dumps({
+                "type": "soundboardDevices",
+                "devices": get_output_devices(),
+            }))
 
         elif msg_type == "desktopIconRequest":
             target = msg.get("target", "")

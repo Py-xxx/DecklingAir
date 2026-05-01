@@ -1,14 +1,16 @@
-import { initSocket, requestDesktopIcon, saveLayout } from './socket.js';
+import { initSocket, requestDesktopIcon, requestState, saveLayout, requestSoundboardDevices } from './socket.js';
 import { renderControl, setStateRef } from './controls.js';
 import {
   initEditor,
   initGridEvents,
   openPageNameModal,
   openSettings,
+  updateSoundboardDeviceList,
 } from './editor.js';
 
-const DEFAULT_LAYOUT = {
-  version: '1.1',
+const DEFAULT_DEVICE_LAYOUT = {
+  name: 'Primary Device',
+  platform: 'unknown',
   pages: [
     {
       id: 'page_main',
@@ -22,12 +24,21 @@ const DEFAULT_LAYOUT = {
   },
 };
 
+const DEFAULT_LAYOUT_STORE = {
+  version: '2.0',
+  deviceOrder: ['default'],
+  devices: {
+    default: DEFAULT_DEVICE_LAYOUT,
+  },
+};
+
 const DEFAULT_SIZES = {
   fader: [1, 4],
   toggle: [1, 1],
   button: [2, 1],
   macro: [2, 1],
   desktop_action: [2, 1],
+  soundboard: [2, 1],
   vu_meter: [1, 3],
   strip_panel: [1, 4],
   bus_panel: [1, 3],
@@ -35,36 +46,52 @@ const DEFAULT_SIZES = {
 };
 
 const state = {
-  layout: normalizeLayout(DEFAULT_LAYOUT),
+  layoutStore: normalizeLayoutStore(DEFAULT_LAYOUT_STORE),
+  layout: normalizeDeviceLayout(DEFAULT_DEVICE_LAYOUT),
+  devices: {},
   vmState: {},
   desktopIcons: {},
   levels: [],
-  bridge: { connected: false, vmType: null, vmVersion: null },
-  ui: { currentPage: 0, editMode: false },
+  bridge: createDeviceRuntime('default'),
+  ui: {
+    activeDeviceId: null,
+    currentPage: 0,
+    currentPageByDevice: {},
+    editMode: false,
+  },
 };
 
 const cardRegistry = new Map();
 
 const gridEl = document.getElementById('control-grid');
 const gridOverlayEl = document.getElementById('grid-overlay');
+const deviceTabsEl = document.getElementById('device-tabs');
 const pageTabsEl = document.getElementById('page-tabs');
 const emptyStateEl = document.getElementById('empty-state');
 const statusBadgeEl = document.getElementById('bridge-status');
 const statusTextEl = document.getElementById('status-text');
 const btnSettingsEl = document.getElementById('btn-settings');
 
+syncActiveContext();
 setStateRef(state.vmState, state.desktopIcons);
 
 initEditor(state, {
   commitLayout({ persist = true, rerender = true } = {}) {
-    state.layout = normalizeLayout(state.layout);
+    normalizeActiveLayout();
     clampCurrentPage();
     if (persist) persistLayout();
     if (rerender) renderCurrentPage();
   },
   replaceLayout(nextLayout) {
-    state.layout = normalizeLayout(nextLayout);
-    clampCurrentPage();
+    const deviceId = ensureActiveDeviceId();
+    if (!deviceId) return;
+
+    const existing = getDeviceLayout(deviceId);
+    state.layoutStore.devices[deviceId] = normalizeDeviceLayout(nextLayout, {
+      name: existing.name,
+      platform: existing.platform,
+    });
+    syncActiveContext();
     persistLayout();
     renderCurrentPage();
   },
@@ -77,39 +104,72 @@ initGridEvents(gridEl);
 btnSettingsEl.addEventListener('click', () => openSettings());
 
 initSocket({
+  getActiveDeviceId: () => state.ui.activeDeviceId,
   onConnect() {},
   onDisconnect() {
-    setBridgeStatus({ connected: false, vmType: null, vmVersion: null });
+    setBridgeStatus({ ...state.bridge, connected: false });
   },
-  onVmState(vmState) {
-    Object.assign(state.vmState, vmState);
-    refreshAllCards();
+  onDevicesData(devices) {
+    applyDevicesSnapshot(devices);
+    syncActiveContext();
+    renderHeaderState();
   },
-  onVmUpdate(param, value) {
-    state.vmState[param] = value;
-    cardRegistry.forEach(card => card._updateState?.(param, value));
-  },
-  onLevels(levels) {
-    state.levels = Array.isArray(levels) ? levels : [];
-    cardRegistry.forEach(card => card._updateLevels?.(state.levels));
-  },
-  onBridgeStatus(info) {
-    setBridgeStatus(info);
-    if (info?.connected && info?.capabilities?.desktopIcons) {
-      requestDesktopIconsForLayout();
+  onVmState(deviceId, vmState) {
+    const runtime = ensureDeviceRuntime(deviceId);
+    runtime.vmState = vmState && typeof vmState === 'object' ? vmState : {};
+
+    if (deviceId === state.ui.activeDeviceId) {
+      syncActiveContext();
+      refreshAllCards();
     }
   },
-  onBridgeError(msg) {
-    console.warn('Bridge error:', msg);
+  onVmUpdate(deviceId, param, value) {
+    const runtime = ensureDeviceRuntime(deviceId);
+    runtime.vmState[param] = value;
+
+    if (deviceId === state.ui.activeDeviceId) {
+      state.vmState[param] = value;
+      cardRegistry.forEach(card => card._updateState?.(param, value));
+    }
   },
-  onDesktopIcon({ target, icon }) {
-    if (!target || typeof icon !== 'string') return;
-    state.desktopIcons[target] = icon;
-    if (currentPageHasDesktopTarget(target)) renderCurrentPage();
+  onLevels(deviceId, levels) {
+    const runtime = ensureDeviceRuntime(deviceId);
+    runtime.levels = Array.isArray(levels) ? levels : [];
+
+    if (deviceId === state.ui.activeDeviceId) {
+      state.levels = runtime.levels;
+      cardRegistry.forEach(card => card._updateLevels?.(state.levels));
+    }
   },
-  onLayout(layout) {
-    state.layout = normalizeLayout(layout);
-    clampCurrentPage();
+  onBridgeError(deviceId, msg) {
+    if (!msg) return;
+    if (!deviceId || deviceId === state.ui.activeDeviceId) {
+      console.warn('Bridge error:', msg);
+    } else {
+      console.warn(`Bridge error (${deviceId}):`, msg);
+    }
+  },
+  onSoundboardDevices({ deviceId, devices }) {
+    if (!deviceId) return;
+    const runtime = ensureDeviceRuntime(deviceId);
+    runtime.soundboardDevices = Array.isArray(devices) ? devices : [];
+    if (deviceId === state.ui.activeDeviceId) {
+      updateSoundboardDeviceList(runtime.soundboardDevices);
+    }
+  },
+  onDesktopIcon({ deviceId, target, icon }) {
+    if (!deviceId || !target || typeof icon !== 'string') return;
+    const runtime = ensureDeviceRuntime(deviceId);
+    runtime.desktopIcons[target] = icon;
+
+    if (deviceId === state.ui.activeDeviceId && currentPageHasDesktopTarget(target)) {
+      renderCurrentPage();
+    }
+  },
+  onLayout(layoutStore) {
+    state.layoutStore = normalizeLayoutStore(layoutStore);
+    ensureRuntimeEntriesForLayouts();
+    syncActiveContext();
     applySettings();
     requestDesktopIconsForLayout();
     renderCurrentPage();
@@ -117,22 +177,128 @@ initSocket({
 });
 
 applySettings();
-requestDesktopIconsForLayout();
 renderCurrentPage();
 
-function normalizeLayout(layout) {
+function createDeviceRuntime(deviceId, patch = {}) {
+  return {
+    deviceId,
+    connected: false,
+    deviceName: patch.deviceName || null,
+    platform: patch.platform || 'unknown',
+    vmType: patch.vmType ?? null,
+    vmVersion: patch.vmVersion ?? null,
+    capabilities: patch.capabilities || {},
+    vmState: patch.vmState || {},
+    levels: patch.levels || [],
+    desktopIcons: patch.desktopIcons || {},
+    soundboardDevices: patch.soundboardDevices || [],
+  };
+}
+
+function ensureDeviceRuntime(deviceId, patch = {}) {
+  if (!deviceId) return createDeviceRuntime('unknown');
+  if (!state.devices[deviceId]) {
+    state.devices[deviceId] = createDeviceRuntime(deviceId, patch);
+  }
+
+  const runtime = state.devices[deviceId];
+  if (patch.deviceName) runtime.deviceName = patch.deviceName;
+  if (patch.platform) runtime.platform = patch.platform;
+  if (patch.vmType !== undefined) runtime.vmType = patch.vmType;
+  if (patch.vmVersion !== undefined) runtime.vmVersion = patch.vmVersion;
+  if (patch.capabilities) runtime.capabilities = patch.capabilities;
+  return runtime;
+}
+
+function ensureRuntimeEntriesForLayouts() {
+  Object.keys(state.layoutStore.devices || {}).forEach(deviceId => {
+    const stored = state.layoutStore.devices[deviceId];
+    ensureDeviceRuntime(deviceId, {
+      deviceName: stored?.name || null,
+      platform: stored?.platform || 'unknown',
+    });
+  });
+}
+
+function applyDevicesSnapshot(devices) {
+  ensureRuntimeEntriesForLayouts();
+
+  (Array.isArray(devices) ? devices : []).forEach(device => {
+    const deviceId = device?.deviceId;
+    if (!deviceId) return;
+
+    ensureDeviceRuntime(deviceId, {
+      deviceName: device.deviceName || state.layoutStore.devices[deviceId]?.name || prettifyDeviceId(deviceId),
+      platform: device.platform || state.layoutStore.devices[deviceId]?.platform || 'unknown',
+      vmType: device.vmType ?? null,
+      vmVersion: device.vmVersion ?? null,
+      capabilities: device.capabilities || {},
+    }).connected = !!device.connected;
+
+    ensureDeviceLayout(deviceId, {
+      name: device.deviceName || prettifyDeviceId(deviceId),
+      platform: device.platform || 'unknown',
+    });
+  });
+}
+
+function normalizeLayoutStore(layoutStore) {
+  if (layoutStore && typeof layoutStore === 'object' && Array.isArray(layoutStore.pages)) {
+    return {
+      version: '2.0',
+      deviceOrder: ['default'],
+      devices: {
+        default: normalizeDeviceLayout(layoutStore, { name: 'Primary Device', platform: 'unknown' }),
+      },
+    };
+  }
+
+  const raw = layoutStore && typeof layoutStore === 'object' ? layoutStore : {};
+  const rawDevices = raw.devices && typeof raw.devices === 'object' ? raw.devices : {};
+  const devices = {};
+  const deviceOrder = [];
+
+  Object.entries(rawDevices).forEach(([deviceId, deviceLayout]) => {
+    if (!deviceId) return;
+    devices[deviceId] = normalizeDeviceLayout(deviceLayout, {
+      name: deviceLayout?.name || prettifyDeviceId(deviceId),
+      platform: deviceLayout?.platform || 'unknown',
+    });
+    deviceOrder.push(deviceId);
+  });
+
+  (Array.isArray(raw.deviceOrder) ? raw.deviceOrder : []).forEach(deviceId => {
+    if (devices[deviceId] && !deviceOrder.includes(deviceId)) {
+      deviceOrder.push(deviceId);
+    }
+  });
+
+  if (!deviceOrder.length) {
+    deviceOrder.push('default');
+    devices.default = normalizeDeviceLayout(DEFAULT_DEVICE_LAYOUT);
+  }
+
+  return {
+    version: raw.version || '2.0',
+    deviceOrder,
+    devices,
+  };
+}
+
+function normalizeDeviceLayout(layout, fallback = {}) {
   const input = layout && typeof layout === 'object' ? layout : {};
   const settings = {
-    ...DEFAULT_LAYOUT.settings,
+    ...DEFAULT_DEVICE_LAYOUT.settings,
     ...(input.settings || {}),
   };
 
   const pages = Array.isArray(input.pages) && input.pages.length
     ? input.pages.map((page, pageIndex) => normalizePage(page, pageIndex, settings.gridColumns))
-    : DEFAULT_LAYOUT.pages.map((page, pageIndex) => normalizePage(page, pageIndex, settings.gridColumns));
+    : DEFAULT_DEVICE_LAYOUT.pages.map((page, pageIndex) => normalizePage(page, pageIndex, settings.gridColumns));
 
   return {
-    version: input.version || DEFAULT_LAYOUT.version,
+    name: input.name || fallback.name || 'Device',
+    platform: input.platform || fallback.platform || 'unknown',
     settings,
     pages,
   };
@@ -181,30 +347,123 @@ function normalizeControl(control, controlIndex, existingControls, gridColumns) 
   };
 }
 
-function applySettings() {
-  const settings = state.layout.settings || DEFAULT_LAYOUT.settings;
-  const accent = settings.accentColor || DEFAULT_LAYOUT.settings.accentColor;
-  const cols = clampInt(settings.gridColumns, 4, 12);
+function ensureDeviceLayout(deviceId, patch = {}) {
+  if (!state.layoutStore.devices[deviceId]) {
+    state.layoutStore.devices[deviceId] = normalizeDeviceLayout(null, {
+      name: patch.name || prettifyDeviceId(deviceId),
+      platform: patch.platform || 'unknown',
+    });
+  }
 
-  state.layout.settings.accentColor = accent;
-  state.layout.settings.gridColumns = cols;
+  if (!state.layoutStore.deviceOrder.includes(deviceId)) {
+    state.layoutStore.deviceOrder.push(deviceId);
+  }
 
-  setAccentColor(accent);
-  document.documentElement.style.setProperty('--grid-cols', String(cols));
-  gridEl.style.setProperty('--grid-cols', String(cols));
-  gridOverlayEl.style.setProperty('--grid-cols', String(cols));
+  if (patch.name) state.layoutStore.devices[deviceId].name = patch.name;
+  if (patch.platform) state.layoutStore.devices[deviceId].platform = patch.platform;
+
+  return state.layoutStore.devices[deviceId];
 }
 
-function setAccentColor(hex) {
-  const rgb = hexToRgb(hex) || { r: 108, g: 99, b: 255 };
-  document.documentElement.style.setProperty('--accent', hex);
-  document.documentElement.style.setProperty('--accent-dim', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.16)`);
-  document.documentElement.style.setProperty('--accent-glow', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.4)`);
+function getKnownDeviceIds() {
+  const ids = [];
+  (state.layoutStore.deviceOrder || []).forEach(deviceId => {
+    if (state.layoutStore.devices[deviceId] && !ids.includes(deviceId)) ids.push(deviceId);
+  });
+  Object.keys(state.layoutStore.devices || {}).forEach(deviceId => {
+    if (!ids.includes(deviceId)) ids.push(deviceId);
+  });
+  Object.keys(state.devices || {}).forEach(deviceId => {
+    if (!ids.includes(deviceId)) ids.push(deviceId);
+  });
+  return ids;
+}
+
+function ensureActiveDeviceId() {
+  const deviceIds = getKnownDeviceIds();
+  if (!deviceIds.length) {
+    state.ui.activeDeviceId = null;
+    return null;
+  }
+
+  if (state.ui.activeDeviceId && deviceIds.includes(state.ui.activeDeviceId)) {
+    return state.ui.activeDeviceId;
+  }
+
+  const firstConnected = deviceIds.find(deviceId => state.devices[deviceId]?.connected);
+  state.ui.activeDeviceId = firstConnected || deviceIds[0];
+  return state.ui.activeDeviceId;
+}
+
+function syncActiveContext() {
+  const activeDeviceId = ensureActiveDeviceId();
+  if (!activeDeviceId) {
+    state.layout = normalizeDeviceLayout(DEFAULT_DEVICE_LAYOUT);
+    state.vmState = {};
+    state.desktopIcons = {};
+    state.levels = [];
+    state.bridge = createDeviceRuntime('none');
+    setStateRef(state.vmState, state.desktopIcons);
+    return;
+  }
+
+  const runtime = ensureDeviceRuntime(activeDeviceId, {
+    deviceName: state.layoutStore.devices[activeDeviceId]?.name || prettifyDeviceId(activeDeviceId),
+    platform: state.layoutStore.devices[activeDeviceId]?.platform || 'unknown',
+  });
+  const deviceLayout = ensureDeviceLayout(activeDeviceId, {
+    name: runtime.deviceName || prettifyDeviceId(activeDeviceId),
+    platform: runtime.platform || 'unknown',
+  });
+
+  state.layout = deviceLayout;
+  state.vmState = runtime.vmState;
+  state.desktopIcons = runtime.desktopIcons;
+  state.levels = runtime.levels;
+  state.bridge = runtime;
+  state.ui.currentPage = state.ui.currentPageByDevice[activeDeviceId] || 0;
+
+  clampCurrentPage();
+  setStateRef(state.vmState, state.desktopIcons);
+}
+
+function normalizeActiveLayout() {
+  const deviceId = ensureActiveDeviceId();
+  if (!deviceId) return;
+
+  const existing = state.layoutStore.devices[deviceId];
+  state.layoutStore.devices[deviceId] = normalizeDeviceLayout(state.layout, {
+    name: existing?.name || state.bridge.deviceName || prettifyDeviceId(deviceId),
+    platform: existing?.platform || state.bridge.platform || 'unknown',
+  });
+  state.layout = state.layoutStore.devices[deviceId];
+  setStateRef(state.vmState, state.desktopIcons);
+}
+
+function switchDevice(deviceId) {
+  if (!deviceId || deviceId === state.ui.activeDeviceId) return;
+
+  if (state.ui.activeDeviceId) {
+    state.ui.currentPageByDevice[state.ui.activeDeviceId] = state.ui.currentPage;
+  }
+
+  state.ui.activeDeviceId = deviceId;
+  syncActiveContext();
+  applySettings();
+  requestDesktopIconsForLayout();
+  requestState(deviceId);
+  renderCurrentPage();
+}
+
+function renderHeaderState() {
+  renderDeviceTabs();
+  setBridgeStatus(state.bridge);
 }
 
 function renderCurrentPage() {
   clampCurrentPage();
   applySettings();
+  renderHeaderState();
   renderPageTabs();
 
   const page = getCurrentPage();
@@ -227,37 +486,41 @@ function renderCurrentPage() {
   });
 }
 
-function requestDesktopIconsForLayout() {
-  const targets = new Set();
-  (state.layout.pages || []).forEach(page => {
-    (page.controls || []).forEach(control => {
-      if (control.type !== 'desktop_action') return;
-      const target = control.config?.target?.trim();
-      const action = control.config?.action;
-      if (action !== 'launch' || !target) return;
-      if (state.desktopIcons[target]) return;
-      targets.add(target);
-    });
+function renderDeviceTabs() {
+  deviceTabsEl.innerHTML = '';
+
+  getKnownDeviceIds().forEach(deviceId => {
+    const runtime = ensureDeviceRuntime(deviceId);
+    const deviceLayout = state.layoutStore.devices[deviceId];
+    const platform = runtime.platform && runtime.platform !== 'unknown'
+      ? runtime.platform
+      : deviceLayout?.platform || 'unknown';
+    const tab = document.createElement('button');
+    tab.type = 'button';
+    tab.className = `device-tab${deviceId === state.ui.activeDeviceId ? ' active' : ''}${runtime.connected ? '' : ' offline'}`;
+    tab.title = `${runtime.deviceName || deviceLayout?.name || prettifyDeviceId(deviceId)}${runtime.connected ? '' : ' (offline)'}`;
+
+    const dot = document.createElement('span');
+    dot.className = 'device-tab-dot';
+
+    const textWrap = document.createElement('span');
+    textWrap.className = 'device-tab-text';
+
+    const name = document.createElement('span');
+    name.className = 'device-tab-name';
+    name.textContent = runtime.deviceName || deviceLayout?.name || prettifyDeviceId(deviceId);
+
+    const meta = document.createElement('span');
+    meta.className = 'device-tab-meta';
+    meta.textContent = platformLabel(platform);
+
+    textWrap.appendChild(name);
+    textWrap.appendChild(meta);
+    tab.appendChild(dot);
+    tab.appendChild(textWrap);
+    tab.addEventListener('click', () => switchDevice(deviceId));
+    deviceTabsEl.appendChild(tab);
   });
-
-  targets.forEach(target => requestDesktopIcon(target));
-}
-
-function currentPageHasDesktopTarget(target) {
-  return (getCurrentPage()?.controls || []).some(control =>
-    control.type === 'desktop_action' && control.config?.target === target
-  );
-}
-
-function renderGridOverlay(rows) {
-  const cols = state.layout.settings.gridColumns || DEFAULT_LAYOUT.settings.gridColumns;
-  gridOverlayEl.innerHTML = '';
-
-  for (let i = 0; i < cols * rows; i += 1) {
-    const cell = document.createElement('div');
-    cell.className = 'grid-cell';
-    gridOverlayEl.appendChild(cell);
-  }
 }
 
 function renderPageTabs() {
@@ -316,12 +579,14 @@ function renderPageTabs() {
 
     tab.addEventListener('click', () => {
       state.ui.currentPage = index;
+      state.ui.currentPageByDevice[state.ui.activeDeviceId] = index;
       renderCurrentPage();
     });
     tab.addEventListener('keydown', event => {
       if (event.key === 'Enter' || event.key === ' ') {
         event.preventDefault();
         state.ui.currentPage = index;
+        state.ui.currentPageByDevice[state.ui.activeDeviceId] = index;
         renderCurrentPage();
       }
     });
@@ -337,6 +602,42 @@ function renderPageTabs() {
     addTab.innerHTML = '<span>+</span><span>Page</span>';
     addTab.addEventListener('click', () => openPageNameModal(null));
     pageTabsEl.appendChild(addTab);
+  }
+}
+
+function requestDesktopIconsForLayout() {
+  const canResolveIcons = !!state.bridge.capabilities?.desktopIcons;
+  if (!canResolveIcons) return;
+
+  const targets = new Set();
+  (state.layout.pages || []).forEach(page => {
+    (page.controls || []).forEach(control => {
+      if (control.type !== 'desktop_action') return;
+      const target = control.config?.target?.trim();
+      const action = control.config?.action;
+      if (action !== 'launch' || !target) return;
+      if (state.desktopIcons[target]) return;
+      targets.add(target);
+    });
+  });
+
+  targets.forEach(target => requestDesktopIcon(target));
+}
+
+function currentPageHasDesktopTarget(target) {
+  return (getCurrentPage()?.controls || []).some(control =>
+    control.type === 'desktop_action' && control.config?.target === target
+  );
+}
+
+function renderGridOverlay(rows) {
+  const cols = state.layout.settings.gridColumns || DEFAULT_DEVICE_LAYOUT.settings.gridColumns;
+  gridOverlayEl.innerHTML = '';
+
+  for (let i = 0; i < cols * rows; i += 1) {
+    const cell = document.createElement('div');
+    cell.className = 'grid-cell';
+    gridOverlayEl.appendChild(cell);
   }
 }
 
@@ -360,14 +661,24 @@ function setBridgeStatus(info) {
   };
 
   statusBadgeEl.className = `status-badge ${online ? 'status-online' : 'status-offline'}`;
-  statusTextEl.textContent = online
+  if (!state.ui.activeDeviceId) {
+    statusTextEl.textContent = 'No Device';
+    return;
+  }
+
+  if (!online) {
+    statusTextEl.textContent = 'Offline';
+    return;
+  }
+
+  statusTextEl.textContent = state.bridge.capabilities?.voiceMeeter
     ? vmNames[state.bridge.vmType] || 'Connected'
-    : 'Offline';
+    : state.bridge.deviceName || platformLabel(state.bridge.platform);
 }
 
 function persistLayout() {
-  state.layout = normalizeLayout(state.layout);
-  saveLayout(state.layout);
+  normalizeActiveLayout();
+  saveLayout(state.layoutStore);
 }
 
 function getCurrentPage() {
@@ -378,6 +689,9 @@ function getCurrentPage() {
 function clampCurrentPage() {
   const maxIndex = Math.max(0, state.layout.pages.length - 1);
   state.ui.currentPage = clampInt(state.ui.currentPage, 0, maxIndex);
+  if (state.ui.activeDeviceId) {
+    state.ui.currentPageByDevice[state.ui.activeDeviceId] = state.ui.currentPage;
+  }
 }
 
 function getGridRowCount(page) {
@@ -430,6 +744,47 @@ function rectsOverlap(a, b) {
   const bBottom = b.row + b.rowSpan - 1;
 
   return !(aRight < bLeft || bRight < aLeft || aBottom < bTop || bBottom < aTop);
+}
+
+function applySettings() {
+  const settings = state.layout.settings || DEFAULT_DEVICE_LAYOUT.settings;
+  const accent = settings.accentColor || DEFAULT_DEVICE_LAYOUT.settings.accentColor;
+  const cols = clampInt(settings.gridColumns, 4, 12);
+
+  state.layout.settings.accentColor = accent;
+  state.layout.settings.gridColumns = cols;
+
+  setAccentColor(accent);
+  document.documentElement.style.setProperty('--grid-cols', String(cols));
+  gridEl.style.setProperty('--grid-cols', String(cols));
+  gridOverlayEl.style.setProperty('--grid-cols', String(cols));
+}
+
+function setAccentColor(hex) {
+  const rgb = hexToRgb(hex) || { r: 108, g: 99, b: 255 };
+  document.documentElement.style.setProperty('--accent', hex);
+  document.documentElement.style.setProperty('--accent-dim', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.16)`);
+  document.documentElement.style.setProperty('--accent-glow', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.4)`);
+}
+
+function platformLabel(platform) {
+  const labels = {
+    darwin: 'macOS',
+    macos: 'macOS',
+    win32: 'Windows',
+    windows: 'Windows',
+    linux: 'Linux',
+    unknown: 'Unknown',
+  };
+  return labels[String(platform || 'unknown').toLowerCase()] || prettifyDeviceId(platform || 'unknown');
+}
+
+function prettifyDeviceId(deviceId) {
+  return String(deviceId || 'device')
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
 }
 
 function clampInt(value, min, max) {
