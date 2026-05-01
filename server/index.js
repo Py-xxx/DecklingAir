@@ -41,6 +41,7 @@ const DEFAULT_DEVICE_LAYOUT = {
 
 const DEFAULT_LAYOUT = {
   version: '2.0',
+  globalSettings: {},
   deviceOrder: ['default'],
   devices: {
     default: {
@@ -438,6 +439,9 @@ function normalizeLayoutStore(input) {
 
   return {
     version: raw.version || '2.0',
+    globalSettings: raw.globalSettings && typeof raw.globalSettings === 'object'
+      ? { ...raw.globalSettings }
+      : {},
     deviceOrder,
     devices,
   };

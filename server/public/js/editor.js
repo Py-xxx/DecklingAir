@@ -31,6 +31,7 @@ let _selectedType = null;
 let _selectedSize = { colSpan: 1, rowSpan: 2 };
 let _pageEditIndex = null;
 let _gridGesture = null;
+let _importParsed = null;
 
 const previewEl = document.getElementById('drop-preview');
 const mainAreaEl = document.getElementById('main-area');
@@ -112,7 +113,18 @@ export function initEditor(state, callbacks) {
   document.getElementById('s-import').addEventListener('click', () => {
     document.getElementById('s-import-file').click();
   });
-  document.getElementById('s-import-file').addEventListener('change', importLayout);
+  document.getElementById('s-import-file').addEventListener('change', openImportModal);
+
+  document.getElementById('import-modal-close').addEventListener('click', closeImportModal);
+  document.getElementById('import-modal-cancel').addEventListener('click', closeImportModal);
+  document.getElementById('import-modal-apply').addEventListener('click', applyImport);
+  document.getElementById('import-modal').addEventListener('click', event => {
+    if (event.target === document.getElementById('import-modal')) closeImportModal();
+  });
+
+  document.getElementById('s-default-device').addEventListener('change', event => {
+    _callbacks.setDefaultDevice?.(event.target.value || null);
+  });
   document.getElementById('s-vm-restart').addEventListener('click', () => {
     vmMacro([{ param: 'Command.Restart', value: 1 }]);
   });
@@ -201,24 +213,16 @@ export function openModal(controlId) {
 export function openSettings() {
   const settings = _state.layout.settings || {};
   const bridge = _state.bridge || {};
-  const vmTypeNames = {
-    1: 'VoiceMeeter',
-    2: 'VoiceMeeter Banana',
-    3: 'VoiceMeeter Potato',
-  };
   const hasVoiceMeeter = !!bridge.capabilities?.voiceMeeter;
   const restartButton = document.getElementById('s-vm-restart');
 
   document.getElementById('s-accent-color').value = settings.accentColor || '#6c63ff';
   document.getElementById('s-grid-cols').value = String(settings.gridColumns || 8);
-  document.getElementById('s-status').textContent = bridge.connected ? 'Connected' : 'Disconnected';
-  document.getElementById('s-device-name').textContent = bridge.deviceName || _state.layout.name || '—';
-  document.getElementById('s-platform').textContent = currentPlatformLabel();
-  document.getElementById('s-vm-type').textContent = hasVoiceMeeter ? (vmTypeNames[bridge.vmType] || 'Connected') : 'Not available';
-  document.getElementById('s-vm-version').textContent = bridge.vmVersion || '—';
   restartButton.disabled = !hasVoiceMeeter;
   restartButton.textContent = hasVoiceMeeter ? 'Restart Audio Engine' : 'No Mixer Available';
 
+  renderDeviceManagementList();
+  renderDefaultDeviceDropdown();
   renderPagesList();
   document.getElementById('settings-modal').style.display = 'flex';
 }
@@ -756,6 +760,135 @@ function closeSettings() {
   document.getElementById('settings-modal').style.display = 'none';
 }
 
+function renderDeviceManagementList() {
+  const listEl = document.getElementById('s-devices-list');
+  if (!listEl) return;
+  listEl.innerHTML = '';
+
+  const store = _state.layoutStore || {};
+  const deviceIds = (store.deviceOrder || []).filter(id => store.devices?.[id]);
+  // Also include any devices not in deviceOrder
+  Object.keys(store.devices || {}).forEach(id => {
+    if (!deviceIds.includes(id)) deviceIds.push(id);
+  });
+
+  const defaultId = store.globalSettings?.defaultDeviceId || null;
+
+  if (!deviceIds.length) {
+    const empty = document.createElement('p');
+    empty.className = 'settings-empty';
+    empty.textContent = 'No devices configured.';
+    listEl.appendChild(empty);
+    return;
+  }
+
+  deviceIds.forEach(deviceId => {
+    const device = store.devices[deviceId] || {};
+    const runtime = _state.devices?.[deviceId] || {};
+    const isDefault = deviceId === defaultId;
+    const isActive = deviceId === _state.ui?.activeDeviceId;
+
+    const item = document.createElement('div');
+    item.className = `device-item${isActive ? ' device-item-active' : ''}`;
+
+    const dot = document.createElement('span');
+    dot.className = `device-item-dot ${runtime.connected ? 'connected' : 'offline'}`;
+    dot.title = runtime.connected ? 'Connected' : 'Offline';
+
+    const info = document.createElement('div');
+    info.className = 'device-item-info';
+
+    const nameInput = document.createElement('input');
+    nameInput.className = 'device-item-name';
+    nameInput.value = runtime.deviceName || device.name || prettifyId(deviceId);
+    nameInput.title = 'Click to rename';
+    nameInput.addEventListener('change', () => {
+      _callbacks.renameDevice?.(deviceId, nameInput.value.trim() || prettifyId(deviceId));
+    });
+
+    const metaEl = document.createElement('span');
+    metaEl.className = 'device-item-meta';
+    const plat = devicePlatformLabel(runtime.platform || device.platform || 'unknown');
+    const vmTypeNames = { 1: 'VoiceMeeter', 2: 'Banana', 3: 'Potato' };
+    const vmStr = runtime.connected && runtime.capabilities?.voiceMeeter
+      ? ` · ${vmTypeNames[runtime.vmType] || 'VM'}`
+      : '';
+    metaEl.textContent = `${plat}${vmStr} · ${runtime.connected ? 'Connected' : 'Offline'}`;
+
+    info.appendChild(nameInput);
+    info.appendChild(metaEl);
+
+    const starBtn = document.createElement('button');
+    starBtn.type = 'button';
+    starBtn.className = `device-item-star${isDefault ? ' active' : ''}`;
+    starBtn.title = isDefault ? 'Default on startup (click to clear)' : 'Set as default on startup';
+    starBtn.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14" fill="${isDefault ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
+      <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+    </svg>`;
+    starBtn.addEventListener('click', () => {
+      _callbacks.setDefaultDevice?.(isDefault ? null : deviceId);
+      renderDeviceManagementList();
+      renderDefaultDeviceDropdown();
+    });
+
+    const delBtn = document.createElement('button');
+    delBtn.type = 'button';
+    delBtn.className = 'device-item-del';
+    delBtn.title = `Remove ${device.name || deviceId}`;
+    delBtn.innerHTML = '&times;';
+    delBtn.addEventListener('click', () => {
+      const name = runtime.deviceName || device.name || deviceId;
+      if (!window.confirm(`Remove "${name}"?\n\nThis permanently deletes its layout and cannot be undone.`)) return;
+      _callbacks.deleteDevice?.(deviceId);
+      renderDeviceManagementList();
+      renderDefaultDeviceDropdown();
+    });
+
+    item.appendChild(dot);
+    item.appendChild(info);
+    item.appendChild(starBtn);
+    item.appendChild(delBtn);
+    listEl.appendChild(item);
+  });
+}
+
+function renderDefaultDeviceDropdown() {
+  const select = document.getElementById('s-default-device');
+  if (!select) return;
+  const store = _state.layoutStore || {};
+  const defaultId = store.globalSettings?.defaultDeviceId || '';
+  const deviceIds = (store.deviceOrder || []).filter(id => store.devices?.[id]);
+  Object.keys(store.devices || {}).forEach(id => {
+    if (!deviceIds.includes(id)) deviceIds.push(id);
+  });
+
+  select.innerHTML = '<option value="">Auto — first connected device</option>';
+  deviceIds.forEach(deviceId => {
+    const device = store.devices[deviceId] || {};
+    const runtime = _state.devices?.[deviceId] || {};
+    const opt = document.createElement('option');
+    opt.value = deviceId;
+    opt.textContent = runtime.deviceName || device.name || prettifyId(deviceId);
+    select.appendChild(opt);
+  });
+  select.value = defaultId;
+}
+
+function prettifyId(deviceId) {
+  return String(deviceId || 'device')
+    .split(/[-_]+/).filter(Boolean)
+    .map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(' ');
+}
+
+function devicePlatformLabel(platform) {
+  const map = {
+    darwin: 'macOS', macos: 'macOS',
+    win32: 'Windows', windows: 'Windows',
+    linux: 'Linux',
+  };
+  return map[String(platform || '').toLowerCase()] || 'Unknown';
+}
+
 function applySettings() {
   const accentColor = document.getElementById('s-accent-color').value;
   const gridColumns = clampInt(document.getElementById('s-grid-cols').value, 4, 12);
@@ -861,22 +994,163 @@ function exportLayout() {
   URL.revokeObjectURL(url);
 }
 
-function importLayout(event) {
-  const file = event.target.files?.[0];
+function openImportModal(event) {
+  const file = event?.target?.files?.[0];
+  if (event?.target) event.target.value = '';
   if (!file) return;
 
   const reader = new FileReader();
   reader.onload = loadEvent => {
     try {
-      const imported = JSON.parse(loadEvent.target.result);
-      _callbacks.replaceLayout?.(imported);
-      closeSettings();
+      _importParsed = JSON.parse(loadEvent.target.result);
     } catch {
-      window.alert('Invalid layout JSON.');
+      window.alert('Invalid JSON file — could not parse.');
+      return;
     }
+    renderImportModal(_importParsed);
+    document.getElementById('import-modal').style.display = 'flex';
   };
   reader.readAsText(file);
-  event.target.value = '';
+}
+
+function renderImportModal(data) {
+  const { type, label, summary } = detectImportFormat(data);
+
+  const badgeEl = document.getElementById('import-detect-badge');
+  badgeEl.textContent = label;
+  badgeEl.className = `import-detect-badge import-badge-${type}`;
+
+  document.getElementById('import-summary').innerHTML = summary;
+
+  const optionsEl = document.getElementById('import-options');
+  optionsEl.innerHTML = '';
+
+  if (type === 'v2') {
+    optionsEl.innerHTML = `
+      <label class="import-option">
+        <input type="radio" name="import-mode" value="merge" checked>
+        <div class="import-option-body">
+          <strong>Merge</strong>
+          <span>Add / update devices from the file; keep any devices not in the file.</span>
+        </div>
+      </label>
+      <label class="import-option">
+        <input type="radio" name="import-mode" value="replace">
+        <div class="import-option-body">
+          <strong>Replace all</strong>
+          <span>Remove all current devices and import fresh. <em>Cannot be undone.</em></span>
+        </div>
+      </label>`;
+  } else if (type === 'legacy') {
+    const store = _state.layoutStore || {};
+    const deviceIds = (store.deviceOrder || []).filter(id => store.devices?.[id]);
+    Object.keys(store.devices || {}).forEach(id => { if (!deviceIds.includes(id)) deviceIds.push(id); });
+    const deviceOpts = deviceIds.map(id => {
+      const d = store.devices[id] || {};
+      const r = _state.devices?.[id] || {};
+      const name = r.deviceName || d.name || prettifyId(id);
+      return `<option value="${id}">${name}</option>`;
+    }).join('');
+    const activeId = _state.ui?.activeDeviceId || '';
+
+    optionsEl.innerHTML = `
+      <label class="import-option">
+        <input type="radio" name="import-mode" value="active" checked>
+        <div class="import-option-body">
+          <strong>Replace active device layout</strong>
+          <span>Overwrites the currently selected device's pages and controls.</span>
+        </div>
+      </label>
+      <label class="import-option">
+        <input type="radio" name="import-mode" value="specific">
+        <div class="import-option-body">
+          <strong>Replace a specific device</strong>
+          <select id="import-target-device" class="form-select" style="margin-top:6px">${deviceOpts}</select>
+        </div>
+      </label>
+      <label class="import-option">
+        <input type="radio" name="import-mode" value="new">
+        <div class="import-option-body">
+          <strong>Import as a new device</strong>
+          <input id="import-new-device-name" type="text" class="form-input" placeholder="Device name" style="margin-top:6px" value="Imported Device">
+        </div>
+      </label>`;
+
+    // Pre-select current device in "specific" dropdown
+    window.setTimeout(() => {
+      const sel = document.getElementById('import-target-device');
+      if (sel && activeId) sel.value = activeId;
+    }, 0);
+  } else {
+    optionsEl.innerHTML = `<p class="cfg-note" style="color:var(--danger)">
+      Unable to recognise this file format. Make sure it was exported from VM Control.
+    </p>`;
+    document.getElementById('import-modal-apply').disabled = true;
+  }
+}
+
+function applyImport() {
+  if (!_importParsed) { closeImportModal(); return; }
+  const mode = document.querySelector('input[name="import-mode"]:checked')?.value;
+  const { type } = detectImportFormat(_importParsed);
+
+  if (type === 'v2') {
+    if (mode === 'replace') {
+      _callbacks.replaceLayoutStore?.(_importParsed);
+    } else {
+      _callbacks.mergeLayoutStore?.(_importParsed);
+    }
+  } else if (type === 'legacy') {
+    if (mode === 'active') {
+      _callbacks.replaceLayout?.(_importParsed);
+    } else if (mode === 'specific') {
+      const deviceId = document.getElementById('import-target-device')?.value;
+      if (deviceId) _callbacks.importIntoDevice?.(deviceId, _importParsed);
+    } else if (mode === 'new') {
+      const rawName = (document.getElementById('import-new-device-name')?.value || '').trim() || 'Imported Device';
+      const deviceId = rawName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'imported';
+      _callbacks.importIntoDevice?.(deviceId, _importParsed, rawName);
+    }
+  }
+
+  closeImportModal();
+  closeSettings();
+}
+
+function closeImportModal() {
+  document.getElementById('import-modal').style.display = 'none';
+  document.getElementById('import-modal-apply').disabled = false;
+  _importParsed = null;
+}
+
+function detectImportFormat(data) {
+  if (!data || typeof data !== 'object') {
+    return { type: 'unknown', label: 'Unknown format', summary: '' };
+  }
+
+  if (Array.isArray(data.pages)) {
+    const pages = data.pages.length;
+    const controls = data.pages.reduce((n, p) => n + (p.controls?.length || 0), 0);
+    return {
+      type: 'legacy',
+      label: 'Legacy single-device layout',
+      summary: `<p>Detected an older single-device export — <strong>${pages} page${pages !== 1 ? 's' : ''}</strong>, <strong>${controls} control${controls !== 1 ? 's' : ''}</strong>. Choose where to import it:</p>`,
+    };
+  }
+
+  if (data.devices && typeof data.devices === 'object') {
+    const deviceCount = Object.keys(data.devices).length;
+    const pageCount = Object.values(data.devices).reduce((n, d) => n + (d.pages?.length || 0), 0);
+    const ctrlCount = Object.values(data.devices).reduce(
+      (n, d) => n + (d.pages || []).reduce((m, p) => m + (p.controls?.length || 0), 0), 0);
+    return {
+      type: 'v2',
+      label: 'v2.0 multi-device layout',
+      summary: `<p>Detected a v2.0 multi-device export — <strong>${deviceCount} device${deviceCount !== 1 ? 's' : ''}</strong>, <strong>${pageCount} page${pageCount !== 1 ? 's' : ''}</strong>, <strong>${ctrlCount} control${ctrlCount !== 1 ? 's' : ''}</strong>.</p>`,
+    };
+  }
+
+  return { type: 'unknown', label: 'Unrecognised format', summary: '' };
 }
 
 function buildSizePicker() {

@@ -26,6 +26,7 @@ const DEFAULT_DEVICE_LAYOUT = {
 
 const DEFAULT_LAYOUT_STORE = {
   version: '2.0',
+  globalSettings: {},
   deviceOrder: ['default'],
   devices: {
     default: DEFAULT_DEVICE_LAYOUT,
@@ -85,16 +86,22 @@ initEditor(state, {
   replaceLayout(nextLayout) {
     const deviceId = ensureActiveDeviceId();
     if (!deviceId) return;
-
-    const existing = getDeviceLayout(deviceId);
+    const existing = state.layoutStore.devices[deviceId];
     state.layoutStore.devices[deviceId] = normalizeDeviceLayout(nextLayout, {
-      name: existing.name,
-      platform: existing.platform,
+      name: existing?.name || prettifyDeviceId(deviceId),
+      platform: existing?.platform || 'unknown',
     });
     syncActiveContext();
+    applySettings();
     persistLayout();
     renderCurrentPage();
   },
+  deleteDevice,
+  renameDevice,
+  setDefaultDevice,
+  mergeLayoutStore,
+  replaceLayoutStore,
+  importIntoDevice,
   openPageSettings() {
     openSettings();
   },
@@ -280,6 +287,9 @@ function normalizeLayoutStore(layoutStore) {
 
   return {
     version: raw.version || '2.0',
+    globalSettings: raw.globalSettings && typeof raw.globalSettings === 'object'
+      ? { ...raw.globalSettings }
+      : {},
     deviceOrder,
     devices,
   };
@@ -390,6 +400,13 @@ function ensureActiveDeviceId() {
     return state.ui.activeDeviceId;
   }
 
+  // Prefer user-selected default device if it exists
+  const preferredId = state.layoutStore.globalSettings?.defaultDeviceId;
+  if (preferredId && deviceIds.includes(preferredId)) {
+    state.ui.activeDeviceId = preferredId;
+    return preferredId;
+  }
+
   const firstConnected = deviceIds.find(deviceId => state.devices[deviceId]?.connected);
   state.ui.activeDeviceId = firstConnected || deviceIds[0];
   return state.ui.activeDeviceId;
@@ -452,6 +469,98 @@ function switchDevice(deviceId) {
   applySettings();
   requestDesktopIconsForLayout();
   requestState(deviceId);
+  renderCurrentPage();
+}
+
+function deleteDevice(deviceId) {
+  if (!deviceId || !state.layoutStore.devices[deviceId]) return;
+  const wasActive = deviceId === state.ui.activeDeviceId;
+  delete state.layoutStore.devices[deviceId];
+  state.layoutStore.deviceOrder = state.layoutStore.deviceOrder.filter(id => id !== deviceId);
+  delete state.devices[deviceId];
+  if (state.layoutStore.globalSettings?.defaultDeviceId === deviceId) {
+    state.layoutStore.globalSettings.defaultDeviceId = null;
+  }
+  if (wasActive) {
+    state.ui.activeDeviceId = null;
+    syncActiveContext();
+  }
+  persistLayout();
+  renderCurrentPage();
+}
+
+function renameDevice(deviceId, name) {
+  const trimmed = (name || '').trim();
+  if (!deviceId || !trimmed) return;
+  if (state.layoutStore.devices[deviceId]) {
+    state.layoutStore.devices[deviceId].name = trimmed;
+  }
+  if (state.devices[deviceId]) {
+    state.devices[deviceId].deviceName = trimmed;
+  }
+  persistLayout();
+  renderHeaderState();
+}
+
+function setDefaultDevice(deviceId) {
+  if (!state.layoutStore.globalSettings) state.layoutStore.globalSettings = {};
+  state.layoutStore.globalSettings.defaultDeviceId = deviceId || null;
+  persistLayout();
+}
+
+function mergeLayoutStore(imported) {
+  const normalized = normalizeLayoutStore(imported);
+  Object.entries(normalized.devices || {}).forEach(([deviceId, deviceLayout]) => {
+    state.layoutStore.devices[deviceId] = deviceLayout;
+    if (!state.layoutStore.deviceOrder.includes(deviceId)) {
+      state.layoutStore.deviceOrder.push(deviceId);
+    }
+  });
+  ensureRuntimeEntriesForLayouts();
+  syncActiveContext();
+  applySettings();
+  requestDesktopIconsForLayout();
+  persistLayout();
+  renderCurrentPage();
+}
+
+function replaceLayoutStore(imported) {
+  const normalized = normalizeLayoutStore(imported);
+  // Preserve globalSettings (user prefs shouldn't be wiped by import)
+  normalized.globalSettings = {
+    ...(normalized.globalSettings || {}),
+    ...state.layoutStore.globalSettings,
+  };
+  state.layoutStore = normalized;
+  state.devices = {};
+  state.ui.activeDeviceId = null;
+  ensureRuntimeEntriesForLayouts();
+  syncActiveContext();
+  applySettings();
+  requestDesktopIconsForLayout();
+  persistLayout();
+  renderCurrentPage();
+}
+
+function importIntoDevice(deviceId, singleDeviceLayout, overrideName) {
+  const existingName = state.layoutStore.devices[deviceId]?.name
+    || overrideName
+    || prettifyDeviceId(deviceId);
+  const existingPlatform = state.layoutStore.devices[deviceId]?.platform || 'unknown';
+  const deviceLayout = normalizeDeviceLayout(singleDeviceLayout, {
+    name: existingName,
+    platform: existingPlatform,
+  });
+  if (overrideName) deviceLayout.name = overrideName;
+  state.layoutStore.devices[deviceId] = deviceLayout;
+  if (!state.layoutStore.deviceOrder.includes(deviceId)) {
+    state.layoutStore.deviceOrder.push(deviceId);
+  }
+  ensureRuntimeEntriesForLayouts();
+  syncActiveContext();
+  applySettings();
+  requestDesktopIconsForLayout();
+  persistLayout();
   renderCurrentPage();
 }
 

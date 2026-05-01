@@ -334,13 +334,16 @@
       </div>
       <div class="modal-body">
         <section class="settings-section">
-          <h3>Selected Device</h3>
-          <div class="info-card">
-            <div class="info-row"><span>Status</span><span id="s-status">—</span></div>
-            <div class="info-row"><span>Device</span><span id="s-device-name">—</span></div>
-            <div class="info-row"><span>Platform</span><span id="s-platform">—</span></div>
-            <div class="info-row"><span>Mixer</span><span id="s-vm-type">—</span></div>
-            <div class="info-row"><span>Version</span><span id="s-vm-version">—</span></div>
+          <h3>Devices</h3>
+          <div id="s-devices-list"></div>
+          <div class="form-row" style="margin-top:10px">
+            <div class="form-group fg-grow">
+              <label class="form-label">Default on startup</label>
+              <select id="s-default-device" class="form-select">
+                <option value="">Auto — first connected device</option>
+              </select>
+              <span class="form-hint">Which device to show when you open the app.</span>
+            </div>
           </div>
         </section>
         <section class="settings-section">
@@ -400,6 +403,25 @@
       <div class="modal-footer">
         <button class="btn-secondary" id="page-modal-cancel">Cancel</button>
         <button class="btn-primary" id="page-modal-save">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ Import / Migration Modal ═══ -->
+  <div id="import-modal" class="modal-backdrop" style="display:none">
+    <div class="modal modal-sm">
+      <div class="modal-header">
+        <h2>Import Layout</h2>
+        <button class="modal-close" id="import-modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="import-detect-badge" class="import-detect-badge"></div>
+        <div id="import-summary" class="import-summary"></div>
+        <div id="import-options" class="import-options"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-secondary" id="import-modal-cancel">Cancel</button>
+        <button class="btn-primary" id="import-modal-apply">Import</button>
       </div>
     </div>
   </div>
