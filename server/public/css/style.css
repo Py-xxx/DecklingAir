@@ -798,12 +798,31 @@ body.edit-mode .control-card .drag-handle { display: flex; }
 }
 .device-item-star:hover  { color: var(--warning); background: rgba(255,171,64,.12); }
 .device-item-star.active { color: var(--warning); }
+.device-item-eye {
+  background: none; border: none; color: var(--text-3);
+  cursor: pointer; padding: 4px; border-radius: 6px;
+  display: flex; align-items: center; justify-content: center;
+  transition: var(--t); flex-shrink: 0;
+}
+.device-item-eye:hover { color: var(--text); background: var(--surface-hover); }
 .device-item-del {
   background: none; border: none; color: var(--danger);
   cursor: pointer; font-size: 18px; padding: 0 4px;
-  border-radius: 4px; opacity: .5; transition: var(--t); flex-shrink: 0;
+  border-radius: 4px; opacity: .35; transition: var(--t); flex-shrink: 0;
 }
-.device-item-del:hover { opacity: 1; background: var(--danger-dim); }
+.device-item-del:hover:not(:disabled) { opacity: 1; background: var(--danger-dim); }
+.device-item-del:disabled { opacity: .15; cursor: not-allowed; }
+.device-item-hidden {
+  opacity: 0.45;
+  background: transparent;
+  border-style: dashed;
+}
+.device-item-hidden .device-item-name { color: var(--text-2); }
+.settings-section-sub {
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--text-3);
+  margin: 10px 0 5px; padding-left: 2px;
+}
 .settings-empty { font-size: 12px; color: var(--text-3); padding: 10px 0; }
 
 /* ═══ IMPORT / MIGRATION MODAL ═══ */

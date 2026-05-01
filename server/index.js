@@ -454,6 +454,7 @@ function normalizeDeviceLayout(input, fallback = {}) {
   return {
     name: raw.name || fallback.name || 'Device',
     platform: raw.platform || fallback.platform || 'unknown',
+    hidden: !!raw.hidden,
     pages: Array.isArray(raw.pages) && raw.pages.length ? raw.pages : base.pages,
     settings: {
       ...base.settings,
@@ -592,6 +593,7 @@ function serializeDevices() {
     return {
       deviceId,
       connected: !!runtime.connected,
+      hidden: !!stored?.hidden,
       deviceName: runtime.deviceName || stored?.name || prettifyDeviceId(deviceId),
       platform,
       vmType: runtime.vmType,

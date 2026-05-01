@@ -96,6 +96,8 @@ initEditor(state, {
     persistLayout();
     renderCurrentPage();
   },
+  hideDevice,
+  unhideDevice,
   deleteDevice,
   renameDevice,
   setDefaultDevice,
@@ -309,6 +311,7 @@ function normalizeDeviceLayout(layout, fallback = {}) {
   return {
     name: input.name || fallback.name || 'Device',
     platform: input.platform || fallback.platform || 'unknown',
+    hidden: !!input.hidden,
     settings,
     pages,
   };
@@ -389,25 +392,36 @@ function getKnownDeviceIds() {
   return ids;
 }
 
+function isDeviceHidden(deviceId) {
+  return !!state.layoutStore.devices[deviceId]?.hidden;
+}
+
 function ensureActiveDeviceId() {
-  const deviceIds = getKnownDeviceIds();
+  const allIds = getKnownDeviceIds();
+  // Visible devices only (hidden ones are not selectable as active)
+  const deviceIds = allIds.filter(id => !isDeviceHidden(id));
+
   if (!deviceIds.length) {
     state.ui.activeDeviceId = null;
     return null;
   }
 
+  // If current selection is still visible, keep it
   if (state.ui.activeDeviceId && deviceIds.includes(state.ui.activeDeviceId)) {
     return state.ui.activeDeviceId;
   }
 
-  // Prefer user-selected default device if it exists
+  // Current device became hidden — clear it so we pick a new one
+  state.ui.activeDeviceId = null;
+
+  // Prefer user-selected default device (if visible)
   const preferredId = state.layoutStore.globalSettings?.defaultDeviceId;
   if (preferredId && deviceIds.includes(preferredId)) {
     state.ui.activeDeviceId = preferredId;
     return preferredId;
   }
 
-  const firstConnected = deviceIds.find(deviceId => state.devices[deviceId]?.connected);
+  const firstConnected = deviceIds.find(id => state.devices[id]?.connected);
   state.ui.activeDeviceId = firstConnected || deviceIds[0];
   return state.ui.activeDeviceId;
 }
@@ -470,6 +484,27 @@ function switchDevice(deviceId) {
   requestDesktopIconsForLayout();
   requestState(deviceId);
   renderCurrentPage();
+}
+
+function hideDevice(deviceId) {
+  const device = state.layoutStore.devices[deviceId];
+  if (!device) return;
+  device.hidden = true;
+  // If this was the active device, switch away
+  if (deviceId === state.ui.activeDeviceId) {
+    state.ui.activeDeviceId = null;
+    syncActiveContext();
+  }
+  persistLayout();
+  renderCurrentPage();
+}
+
+function unhideDevice(deviceId) {
+  const device = state.layoutStore.devices[deviceId];
+  if (!device) return;
+  device.hidden = false;
+  persistLayout();
+  renderHeaderState();
 }
 
 function deleteDevice(deviceId) {
@@ -599,6 +634,7 @@ function renderDeviceTabs() {
   deviceTabsEl.innerHTML = '';
 
   getKnownDeviceIds().forEach(deviceId => {
+    if (isDeviceHidden(deviceId)) return; // hidden devices don't appear in the tab bar
     const runtime = ensureDeviceRuntime(deviceId);
     const deviceLayout = state.layoutStore.devices[deviceId];
     const platform = runtime.platform && runtime.platform !== 'unknown'

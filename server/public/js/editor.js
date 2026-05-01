@@ -786,21 +786,33 @@ function closeSettings() {
   document.getElementById('settings-modal').style.display = 'none';
 }
 
+const EYE_OFF_SVG = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
+  <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
+  <line x1="1" y1="1" x2="23" y2="23"/>
+</svg>`;
+const EYE_SVG = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+  <circle cx="12" cy="12" r="3"/>
+</svg>`;
+const STAR_SVG = (filled) => `<svg viewBox="0 0 24 24" width="14" height="14" fill="${filled ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
+  <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+</svg>`;
+
 function renderDeviceManagementList() {
   const listEl = document.getElementById('s-devices-list');
   if (!listEl) return;
   listEl.innerHTML = '';
 
   const store = _state.layoutStore || {};
-  const deviceIds = (store.deviceOrder || []).filter(id => store.devices?.[id]);
-  // Also include any devices not in deviceOrder
-  Object.keys(store.devices || {}).forEach(id => {
-    if (!deviceIds.includes(id)) deviceIds.push(id);
-  });
+  const allIds = [...(store.deviceOrder || []).filter(id => store.devices?.[id])];
+  Object.keys(store.devices || {}).forEach(id => { if (!allIds.includes(id)) allIds.push(id); });
 
-  const defaultId = store.globalSettings?.defaultDeviceId || null;
+  const visibleIds = allIds.filter(id => !store.devices[id]?.hidden);
+  const hiddenIds  = allIds.filter(id =>  store.devices[id]?.hidden);
+  const defaultId  = store.globalSettings?.defaultDeviceId || null;
 
-  if (!deviceIds.length) {
+  if (!allIds.length) {
     const empty = document.createElement('p');
     empty.className = 'settings-empty';
     empty.textContent = 'No devices configured.';
@@ -808,19 +820,25 @@ function renderDeviceManagementList() {
     return;
   }
 
-  deviceIds.forEach(deviceId => {
-    const device = store.devices[deviceId] || {};
+  const buildRow = (deviceId, isHidden) => {
+    const device  = store.devices[deviceId] || {};
     const runtime = _state.devices?.[deviceId] || {};
     const isDefault = deviceId === defaultId;
-    const isActive = deviceId === _state.ui?.activeDeviceId;
+    const isActive  = deviceId === _state.ui?.activeDeviceId;
 
     const item = document.createElement('div');
-    item.className = `device-item${isActive ? ' device-item-active' : ''}`;
+    item.className = [
+      'device-item',
+      isActive  ? 'device-item-active' : '',
+      isHidden  ? 'device-item-hidden' : '',
+    ].filter(Boolean).join(' ');
 
+    // Status dot
     const dot = document.createElement('span');
     dot.className = `device-item-dot ${runtime.connected ? 'connected' : 'offline'}`;
     dot.title = runtime.connected ? 'Connected' : 'Offline';
 
+    // Info column
     const info = document.createElement('div');
     info.className = 'device-item-info';
 
@@ -828,6 +846,7 @@ function renderDeviceManagementList() {
     nameInput.className = 'device-item-name';
     nameInput.value = runtime.deviceName || device.name || prettifyId(deviceId);
     nameInput.title = 'Click to rename';
+    nameInput.disabled = isHidden;
     nameInput.addEventListener('change', () => {
       _callbacks.renameDevice?.(deviceId, nameInput.value.trim() || prettifyId(deviceId));
     });
@@ -837,34 +856,59 @@ function renderDeviceManagementList() {
     const plat = devicePlatformLabel(runtime.platform || device.platform || 'unknown');
     const vmTypeNames = { 1: 'VoiceMeeter', 2: 'Banana', 3: 'Potato' };
     const vmStr = runtime.connected && runtime.capabilities?.voiceMeeter
-      ? ` · ${vmTypeNames[runtime.vmType] || 'VM'}`
-      : '';
+      ? ` · ${vmTypeNames[runtime.vmType] || 'VM'}` : '';
     metaEl.textContent = `${plat}${vmStr} · ${runtime.connected ? 'Connected' : 'Offline'}`;
 
     info.appendChild(nameInput);
     info.appendChild(metaEl);
 
+    // Star / default button (only for visible devices)
     const starBtn = document.createElement('button');
     starBtn.type = 'button';
     starBtn.className = `device-item-star${isDefault ? ' active' : ''}`;
-    starBtn.title = isDefault ? 'Default on startup (click to clear)' : 'Set as default on startup';
-    starBtn.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14" fill="${isDefault ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
-      <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
-    </svg>`;
+    starBtn.title = isDefault ? 'Startup default (click to clear)' : 'Set as startup default';
+    starBtn.innerHTML = STAR_SVG(isDefault);
+    starBtn.style.visibility = isHidden ? 'hidden' : '';
     starBtn.addEventListener('click', () => {
       _callbacks.setDefaultDevice?.(isDefault ? null : deviceId);
       renderDeviceManagementList();
       renderDefaultDeviceDropdown();
     });
 
+    // Hide / show button
+    const eyeBtn = document.createElement('button');
+    eyeBtn.type = 'button';
+    eyeBtn.className = 'device-item-eye';
+    if (isHidden) {
+      eyeBtn.innerHTML = EYE_SVG;
+      eyeBtn.title = 'Show device';
+      eyeBtn.addEventListener('click', () => {
+        _callbacks.unhideDevice?.(deviceId);
+        renderDeviceManagementList();
+        renderDefaultDeviceDropdown();
+      });
+    } else {
+      eyeBtn.innerHTML = EYE_OFF_SVG;
+      eyeBtn.title = 'Hide device (keeps layout, stops it appearing in the tab bar)';
+      eyeBtn.addEventListener('click', () => {
+        _callbacks.hideDevice?.(deviceId);
+        renderDeviceManagementList();
+        renderDefaultDeviceDropdown();
+      });
+    }
+
+    // Delete button (only for offline devices, or as a power-user action)
     const delBtn = document.createElement('button');
     delBtn.type = 'button';
     delBtn.className = 'device-item-del';
-    delBtn.title = `Remove ${device.name || deviceId}`;
+    delBtn.title = runtime.connected
+      ? 'Cannot delete a connected device — hide it instead'
+      : `Permanently delete "${device.name || deviceId}" and its layout`;
     delBtn.innerHTML = '&times;';
+    delBtn.disabled = !!runtime.connected;
     delBtn.addEventListener('click', () => {
       const name = runtime.deviceName || device.name || deviceId;
-      if (!window.confirm(`Remove "${name}"?\n\nThis permanently deletes its layout and cannot be undone.`)) return;
+      if (!window.confirm(`Permanently delete "${name}" and all its pages and controls?\n\nThis cannot be undone. If the bridge reconnects it will reappear — hide the device instead to prevent that.`)) return;
       _callbacks.deleteDevice?.(deviceId);
       renderDeviceManagementList();
       renderDefaultDeviceDropdown();
@@ -873,9 +917,20 @@ function renderDeviceManagementList() {
     item.appendChild(dot);
     item.appendChild(info);
     item.appendChild(starBtn);
+    item.appendChild(eyeBtn);
     item.appendChild(delBtn);
-    listEl.appendChild(item);
-  });
+    return item;
+  };
+
+  visibleIds.forEach(id => listEl.appendChild(buildRow(id, false)));
+
+  if (hiddenIds.length) {
+    const sep = document.createElement('p');
+    sep.className = 'settings-section-sub';
+    sep.textContent = 'Hidden';
+    listEl.appendChild(sep);
+    hiddenIds.forEach(id => listEl.appendChild(buildRow(id, true)));
+  }
 }
 
 function renderDefaultDeviceDropdown() {
