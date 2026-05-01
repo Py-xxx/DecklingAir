@@ -74,7 +74,7 @@ const statusTextEl = document.getElementById('status-text');
 const btnSettingsEl = document.getElementById('btn-settings');
 
 syncActiveContext();
-setStateRef(state.vmState, state.desktopIcons);
+setStateRef(state.vmState, state.desktopIcons, state.layoutStore.globalSettings?.soundboardDevice || null);
 
 initEditor(state, {
   commitLayout({ persist = true, rerender = true } = {}) {
@@ -420,7 +420,7 @@ function syncActiveContext() {
     state.desktopIcons = {};
     state.levels = [];
     state.bridge = createDeviceRuntime('none');
-    setStateRef(state.vmState, state.desktopIcons);
+    setStateRef(state.vmState, state.desktopIcons, state.layoutStore.globalSettings?.soundboardDevice || null);
     return;
   }
 
@@ -441,7 +441,7 @@ function syncActiveContext() {
   state.ui.currentPage = state.ui.currentPageByDevice[activeDeviceId] || 0;
 
   clampCurrentPage();
-  setStateRef(state.vmState, state.desktopIcons);
+  setStateRef(state.vmState, state.desktopIcons, state.layoutStore.globalSettings?.soundboardDevice || null);
 }
 
 function normalizeActiveLayout() {
@@ -454,7 +454,7 @@ function normalizeActiveLayout() {
     platform: existing?.platform || state.bridge.platform || 'unknown',
   });
   state.layout = state.layoutStore.devices[deviceId];
-  setStateRef(state.vmState, state.desktopIcons);
+  setStateRef(state.vmState, state.desktopIcons, state.layoutStore.globalSettings?.soundboardDevice || null);
 }
 
 function switchDevice(deviceId) {

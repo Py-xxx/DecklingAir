@@ -376,6 +376,19 @@
           </div>
         </section>
         <section class="settings-section">
+          <h3>Soundboard</h3>
+          <div class="form-group">
+            <label class="form-label">Default Output Device</label>
+            <div class="soundboard-device-row">
+              <select id="s-soundboard-device" class="form-select">
+                <option value="">System default</option>
+              </select>
+              <button type="button" id="s-soundboard-refresh" class="btn-secondary btn-sm" title="Refresh device list">↻</button>
+            </div>
+            <span class="form-hint">Audio route for all soundboard buttons that don't have a per-button override. Pick a VoiceMeeter virtual input (e.g. "VoiceMeeter Input") to route sound through the mixer.</span>
+          </div>
+        </section>
+        <section class="settings-section">
           <h3>Mixer</h3>
           <button class="btn-danger-outline btn-sm" id="s-vm-restart">Restart Audio Engine</button>
         </section>

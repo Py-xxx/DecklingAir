@@ -47,9 +47,11 @@ export function buildParamOptions(gainsOnly = false) {
 // ── Shared state refs ─────────────────────────────────────────────────────────
 let _vmState = {};
 let _desktopIcons = {};
-export function setStateRef(stateObj, desktopIcons = {}) {
+let _soundboardDevice = null; // global default output device for soundboard buttons
+export function setStateRef(stateObj, desktopIcons = {}, soundboardDevice = null) {
   _vmState = stateObj;
   _desktopIcons = desktopIcons;
+  _soundboardDevice = soundboardDevice || null;
 }
 
 function isEditMode() {
@@ -723,7 +725,7 @@ export function renderSoundboard(ctrl) {
   card.addEventListener('pointerdown', e => {
     if (isEditMode()) return;
     if (e.target.closest('.edit-overlay, .drag-handle, .resize-handle')) return;
-    soundboardPlay(cfg.file, cfg.device || null, cfg.volume ?? 1.0);
+    soundboardPlay(cfg.file, cfg.device || _soundboardDevice || null, cfg.volume ?? 1.0);
     card.classList.add('playing');
   });
   card.addEventListener('pointerup',     () => window.setTimeout(() => card.classList.remove('playing'), 260));

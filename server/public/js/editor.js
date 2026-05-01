@@ -41,10 +41,17 @@ const mainAreaEl = document.getElementById('main-area');
  * Repopulates the device dropdown while preserving the current selection.
  */
 export function updateSoundboardDeviceList(devices) {
-  const select = document.getElementById('cfg-soundboard-device');
+  // Update the per-button control editor dropdown
+  _repopulateSoundboardSelect('cfg-soundboard-device', devices, 'Use global default (Settings → Soundboard)');
+  // Also update the global settings dropdown if it's open
+  _repopulateSoundboardSelect('s-soundboard-device', devices, 'System default');
+}
+
+function _repopulateSoundboardSelect(selectId, devices, defaultLabel) {
+  const select = document.getElementById(selectId);
   if (!select) return;
   const currentValue = select.value;
-  select.innerHTML = '<option value="">Default Output Device</option>';
+  select.innerHTML = `<option value="">${defaultLabel}</option>`;
   (devices || []).forEach(d => {
     const opt = document.createElement('option');
     opt.value = d.name;
@@ -53,7 +60,7 @@ export function updateSoundboardDeviceList(devices) {
   });
   if (currentValue) {
     select.value = currentValue;
-    // If device is no longer in list, keep it as a custom option so the saved path isn't lost
+    // Preserve saved value even if it's not in the refreshed list
     if (!select.value) {
       const opt = document.createElement('option');
       opt.value = currentValue;
@@ -95,6 +102,9 @@ export function initEditor(state, callbacks) {
   document.getElementById('cfg-desktop-kind').addEventListener('change', updateDesktopActionFields);
 
   document.getElementById('cfg-soundboard-refresh').addEventListener('click', () => {
+    requestSoundboardDevicesForEditor();
+  });
+  document.getElementById('s-soundboard-refresh').addEventListener('click', () => {
     requestSoundboardDevicesForEditor();
   });
   document.getElementById('cfg-soundboard-volume').addEventListener('input', () => {
@@ -221,6 +231,22 @@ export function openSettings() {
   restartButton.disabled = !hasVoiceMeeter;
   restartButton.textContent = hasVoiceMeeter ? 'Restart Audio Engine' : 'No Mixer Available';
 
+  // Soundboard global device
+  const globalDevice = _state.layoutStore?.globalSettings?.soundboardDevice || '';
+  const sbSelect = document.getElementById('s-soundboard-device');
+  if (sbSelect) {
+    sbSelect.innerHTML = '<option value="">System default</option>';
+    if (globalDevice) {
+      const opt = document.createElement('option');
+      opt.value = globalDevice;
+      opt.textContent = globalDevice;
+      sbSelect.appendChild(opt);
+      sbSelect.value = globalDevice;
+    }
+  }
+  // Request fresh device list from bridge (populates dropdown when response arrives)
+  requestSoundboardDevicesForEditor();
+
   renderDeviceManagementList();
   renderDefaultDeviceDropdown();
   renderPagesList();
@@ -267,7 +293,7 @@ function resetModal() {
   updateDesktopActionFields();
 
   document.getElementById('cfg-soundboard-file').value = '';
-  document.getElementById('cfg-soundboard-device').innerHTML = '<option value="">Default Output Device</option>';
+  document.getElementById('cfg-soundboard-device').innerHTML = '<option value="">Use global default (Settings → Soundboard)</option>';
   document.getElementById('cfg-soundboard-volume').value = '100';
   document.getElementById('cfg-soundboard-volume-display').textContent = '100%';
   document.getElementById('cfg-soundboard-color').value = '#22c55e';
@@ -389,7 +415,7 @@ function populateModal(control) {
     document.getElementById('cfg-soundboard-color').value = config.color || '#22c55e';
     // Pre-populate saved device so it isn't lost while the async list loads
     const sel = document.getElementById('cfg-soundboard-device');
-    sel.innerHTML = '<option value="">Default Output Device</option>';
+    sel.innerHTML = '<option value="">Use global default (Settings → Soundboard)</option>';
     if (config.device) {
       const opt = document.createElement('option');
       opt.value = config.device;
@@ -892,6 +918,11 @@ function devicePlatformLabel(platform) {
 function applySettings() {
   const accentColor = document.getElementById('s-accent-color').value;
   const gridColumns = clampInt(document.getElementById('s-grid-cols').value, 4, 12);
+  const soundboardDevice = document.getElementById('s-soundboard-device')?.value || null;
+
+  // Save global soundboard device preference
+  if (!_state.layoutStore.globalSettings) _state.layoutStore.globalSettings = {};
+  _state.layoutStore.globalSettings.soundboardDevice = soundboardDevice || null;
 
   _state.layout.settings = {
     ...(_state.layout.settings || {}),
