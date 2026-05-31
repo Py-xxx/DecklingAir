@@ -94,10 +94,11 @@ app.get('/vendor/socket.io.js', (req, res) => {
 });
 
 // Spotify OAuth routes
+const SPOTIFY_REDIRECT_URI = 'https://pihost.typhon-vibe.ts.net/api/spotify/callback';
+
 app.get('/api/spotify/auth', (req, res) => {
   try {
-    const redirectUri = `${req.protocol}://${req.get('host')}/api/spotify/callback`;
-    const url = spotify.getAuthUrl(redirectUri);
+    const url = spotify.getAuthUrl(SPOTIFY_REDIRECT_URI);
     res.redirect(url);
   } catch (err) {
     res.status(400).send(`<p>Spotify not configured: ${err.message}</p>`);
@@ -110,8 +111,7 @@ app.get('/api/spotify/callback', async (req, res) => {
     return res.send(`<script>window.opener?.postMessage('spotify:error','*');window.close();</script>`);
   }
   try {
-    const redirectUri = `${req.protocol}://${req.get('host')}/api/spotify/callback`;
-    await spotify.exchangeCode(code, redirectUri);
+    await spotify.exchangeCode(code, SPOTIFY_REDIRECT_URI);
     spotify.startPolling();
     const status = await spotify.getAuthStatus();
     io.emit('spotify:auth_status', status);
