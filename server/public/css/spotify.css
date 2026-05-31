@@ -842,3 +842,14 @@
   background: currentColor;
   flex-shrink: 0;
 }
+
+.s-spotify-reauth-banner {
+  margin-top: 6px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: rgba(220, 80, 0, 0.15);
+  border: 1px solid rgba(220, 80, 0, 0.4);
+  color: #f90;
+  font-size: 12px;
+  line-height: 1.5;
+}

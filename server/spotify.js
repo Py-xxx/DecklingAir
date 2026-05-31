@@ -18,6 +18,7 @@ const SCOPES = [
   'user-read-playback-state',
   'user-modify-playback-state',
   'user-read-currently-playing',
+  'user-read-private',
   'playlist-read-private',
   'playlist-read-collaborative',
   'playlist-modify-public',
@@ -27,6 +28,15 @@ const SCOPES = [
   'user-read-recently-played',
   'user-top-read',
 ].join(' ');
+
+// Scopes that must be present in the stored token; if any are missing the user
+// needs to disconnect and reconnect to get a fresh authorisation.
+const REQUIRED_SCOPES = [
+  'user-library-modify',
+  'playlist-modify-public',
+  'playlist-modify-private',
+  'user-read-private',
+];
 
 const CONFIG_FILE = path.join(__dirname, 'data', 'spotify-config.json');
 const TOKENS_FILE = path.join(__dirname, 'data', 'spotify-tokens.json');
@@ -235,6 +245,7 @@ async function exchangeCode(code, redirectUri) {
     accessToken: data.access_token,
     refreshToken: data.refresh_token,
     expiresAt: Date.now() + data.expires_in * 1000,
+    scope: data.scope || '',
   };
 
   saveTokens(tokens);
@@ -380,7 +391,7 @@ async function getDevices() {
 }
 
 async function search(query, types = 'track', limit = 20) {
-  return api('GET', '/search', { params: { q: query, type: types, limit: String(limit), market: 'from_token' } });
+  return api('GET', '/search', { params: { q: query, type: types, limit: String(limit) } });
 }
 
 async function getQueue() {
@@ -480,6 +491,13 @@ async function getAuthStatus() {
     return { connected: false, configured: true };
   }
 
+  // Check whether the stored token has all required scopes.
+  // tokens.scope is only present for tokens obtained after this check was added;
+  // if it is missing we assume the token is old and needs reauth.
+  const grantedScopes = tokens.scope ? tokens.scope.split(' ') : [];
+  const missingScopes = REQUIRED_SCOPES.filter(s => !grantedScopes.includes(s));
+  const needsReauth = missingScopes.length > 0;
+
   try {
     const profile = await getUserProfile();
     return {
@@ -487,6 +505,8 @@ async function getAuthStatus() {
       configured: true,
       displayName: profile.display_name,
       userId: profile.id,
+      needsReauth,
+      missingScopes,
     };
   } catch {
     return { connected: false, configured: true };

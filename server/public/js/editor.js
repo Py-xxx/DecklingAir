@@ -85,6 +85,7 @@ export function updateSpotifySettingsStatus(status) {
   const statusTextEl = document.getElementById('s-spotify-status-text');
   const connectBtn = document.getElementById('s-spotify-connect');
   const disconnectBtn = document.getElementById('s-spotify-disconnect');
+  const reauthBanner = document.getElementById('s-spotify-reauth-banner');
 
   if (!statusEl) return; // Settings panel not yet in DOM
 
@@ -97,6 +98,10 @@ export function updateSpotifySettingsStatus(status) {
   if (connectBtn)    connectBtn.style.display    = connected ? 'none'  : '';
   if (disconnectBtn) disconnectBtn.style.display = connected ? ''      : 'none';
 
+  // Show reauth warning when connected but token is missing required scopes
+  if (reauthBanner) {
+    reauthBanner.style.display = (connected && status?.needsReauth) ? '' : 'none';
+  }
 }
 
 export function initEditor(state, callbacks) {
