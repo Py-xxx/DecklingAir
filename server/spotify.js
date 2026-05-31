@@ -201,6 +201,7 @@ function getAuthUrl(redirectUri) {
     client_id: cfg.clientId,
     scope: SCOPES,
     redirect_uri: redirectUri,
+    show_dialog: 'true',
   });
 
   return `https://accounts.spotify.com/authorize?${params.toString()}`;
@@ -379,7 +380,7 @@ async function getDevices() {
 }
 
 async function search(query, types = 'track', limit = 20) {
-  return api('GET', '/search', { params: { q: query, type: types, limit } });
+  return api('GET', '/search', { params: { q: query, type: types, limit: String(limit), market: 'from_token' } });
 }
 
 async function getQueue() {

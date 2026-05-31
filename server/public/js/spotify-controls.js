@@ -236,6 +236,40 @@ const SVG = {
 };
 
 // ---------------------------------------------------------------------------
+// Confirmation dialog helper
+// ---------------------------------------------------------------------------
+
+function _showConfirm(message, onConfirm) {
+  // Remove any existing confirm
+  document.querySelector('.sp-confirm-overlay')?.remove();
+
+  const overlay = document.createElement('div');
+  overlay.className = 'sp-confirm-overlay';
+  overlay.innerHTML = `
+    <div class="sp-confirm-box">
+      <p class="sp-confirm-msg"></p>
+      <div class="sp-confirm-btns">
+        <button class="sp-confirm-cancel">Cancel</button>
+        <button class="sp-confirm-ok">Remove</button>
+      </div>
+    </div>
+  `;
+  overlay.querySelector('.sp-confirm-msg').textContent = message;
+  document.body.appendChild(overlay);
+
+  const close = () => overlay.remove();
+
+  overlay.querySelector('.sp-confirm-cancel').addEventListener('pointerup', close);
+  overlay.querySelector('.sp-confirm-ok').addEventListener('pointerup', () => {
+    close();
+    onConfirm();
+  });
+  overlay.addEventListener('pointerdown', (e) => {
+    if (e.target === overlay) close();
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Popover singleton — Playlist picker
 // ---------------------------------------------------------------------------
 
@@ -654,13 +688,30 @@ function renderSpotifyPlayer(ctrl) {
     spotifyCmd(playing ? 'pause' : 'resume');
   });
 
+  function _setHeartState(liked) {
+    _liked = liked;
+    heartBtn.innerHTML = SVG.heart(_liked);
+    heartBtn.classList.toggle('liked', _liked);
+    heartBtn.setAttribute('aria-label', _liked ? 'Unlike' : 'Like');
+  }
+
   heartBtn.addEventListener('pointerup', () => {
     if (isEditMode()) return;
     if (!_currentTrack) return;
-    const cmd = _liked ? 'unlike' : 'like';
-    _liked = !_liked;
-    heartBtn.innerHTML = SVG.heart(_liked);
-    spotifyCmd(cmd, { trackId: _currentTrack.id });
+
+    if (_liked) {
+      // Confirm before removing from likes
+      _showConfirm(
+        `Remove "${_currentTrack.title}" from your liked songs?`,
+        () => {
+          _setHeartState(false);
+          spotifyCmd('unlike', { trackId: _currentTrack.id });
+        }
+      );
+    } else {
+      _setHeartState(true);
+      spotifyCmd('like', { trackId: _currentTrack.id });
+    }
   });
 
   addBtn.addEventListener('pointerup', () => {
@@ -733,7 +784,7 @@ function renderSpotifyPlayer(ctrl) {
       _applyMarquee(artistEl);
     }
 
-    heartBtn.innerHTML = SVG.heart(_liked);
+    _setHeartState(_liked);
     _applyRepeat();
     shuffleBtn.classList.toggle('active', _shuffle);
 

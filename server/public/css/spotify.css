@@ -197,6 +197,8 @@
 }
 .sp-icon-btn:hover { color: var(--text, #fff); }
 .sp-icon-btn:active { opacity: 0.7; }
+.sp-heart-btn.liked { color: var(--accent, #e05); }
+.sp-heart-btn.liked:hover { color: var(--accent, #e05); opacity: 0.8; }
 
 /* Seek row */
 .sp-seek-row {
@@ -547,6 +549,7 @@
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
+  min-height: 2.6em;
 }
 
 /* =============================================================================
@@ -764,6 +767,59 @@
 .sp-toast.sp-toast-out {
   animation: spToastOut 0.25s ease forwards;
 }
+
+/* =============================================================================
+   CONFIRM DIALOG
+   ============================================================================= */
+.sp-confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 4000;
+}
+.sp-confirm-box {
+  background: var(--bg-1, #141414);
+  border: 1px solid var(--sp-border-strong);
+  border-radius: 10px;
+  padding: 20px 24px 16px;
+  max-width: 320px;
+  width: 90%;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+}
+.sp-confirm-msg {
+  margin: 0 0 16px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text, #fff);
+}
+.sp-confirm-btns {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.sp-confirm-cancel,
+.sp-confirm-ok {
+  padding: 6px 16px;
+  border-radius: 20px;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  transition: opacity 0.15s;
+}
+.sp-confirm-cancel {
+  background: var(--bg-3, #2a2a2a);
+  color: var(--text-2, #aaa);
+}
+.sp-confirm-cancel:hover { opacity: 0.8; }
+.sp-confirm-ok {
+  background: var(--danger, #e05);
+  color: #fff;
+}
+.sp-confirm-ok:hover { opacity: 0.85; }
 
 /* =============================================================================
    SETTINGS PANEL — Spotify section
