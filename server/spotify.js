@@ -779,7 +779,13 @@ function init(io) {
         setTimeout(() => poll(), 800);
       } catch (err) {
         const status = err.status ? ` (HTTP ${err.status})` : '';
-        console.error(`[Spotify] Command error (${action})${status}:`, err.message, err.body || '');
+        console.error(`[Spotify] Command error (${action})${status}:`, err.message);
+        if (err.body) console.error(`[Spotify] Full Spotify error:`, JSON.stringify(err.body));
+        if (err.status === 403) {
+          const tokens = loadTokens();
+          const storedScopes = tokens && tokens.scope ? tokens.scope : '(none saved)';
+          console.error(`[Spotify] 403 on ${action} — stored token scopes: ${storedScopes}`);
+        }
         socket.emit('spotify:error', { message: `${action} failed${status}: ${err.message}` });
         // Re-poll so any optimistically-toggled UI (shuffle, repeat) snaps back to real state
         setTimeout(() => poll(), 300);
@@ -895,8 +901,11 @@ function init(io) {
         socket.emit('spotify:toast', { message: 'Added to playlist ✓' });
       } catch (err) {
         const status = err.status ? ` (HTTP ${err.status})` : '';
-        console.error(`[Spotify] Add to playlist error${status}:`, err.message, err.body || '');
-        // Show the actual Spotify error — don't hide it behind a generic message
+        const tokens = loadTokens();
+        const storedScopes = tokens && tokens.scope ? tokens.scope : '(none saved)';
+        console.error(`[Spotify] Add to playlist error${status}:`, err.message);
+        console.error(`[Spotify] Stored token scopes: ${storedScopes}`);
+        console.error(`[Spotify] Full Spotify error:`, JSON.stringify(err.body));
         socket.emit('spotify:error', { message: `Add to playlist failed${status}: ${err.message}` });
       }
     });
