@@ -4,6 +4,7 @@ const { Server: SocketIOServer } = require('socket.io');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
+const spotify = require('./spotify');
 
 const app = express();
 const server = http.createServer(app);
@@ -90,6 +91,35 @@ app.get('/vendor/socket.io.js', (req, res) => {
     etag: false,
     lastModified: false,
   });
+});
+
+// Spotify OAuth routes
+app.get('/api/spotify/auth', (req, res) => {
+  try {
+    const redirectUri = `${req.protocol}://${req.get('host')}/api/spotify/callback`;
+    const url = spotify.getAuthUrl(redirectUri);
+    res.redirect(url);
+  } catch (err) {
+    res.status(400).send(`<p>Spotify not configured: ${err.message}</p>`);
+  }
+});
+
+app.get('/api/spotify/callback', async (req, res) => {
+  const { code, error } = req.query;
+  if (error || !code) {
+    return res.send(`<script>window.opener?.postMessage('spotify:error','*');window.close();</script>`);
+  }
+  try {
+    const redirectUri = `${req.protocol}://${req.get('host')}/api/spotify/callback`;
+    await spotify.exchangeCode(code, redirectUri);
+    spotify.startPolling();
+    const status = await spotify.getAuthStatus();
+    io.emit('spotify:auth_status', status);
+    res.send(`<script>window.opener?.postMessage('spotify:connected','*');window.close();</script>`);
+  } catch (err) {
+    console.error('[Spotify] OAuth callback error:', err.message);
+    res.send(`<script>window.opener?.postMessage('spotify:error','*');window.close();</script>`);
+  }
 });
 
 app.get('/api/layout', (req, res) => res.json(layout));
@@ -368,6 +398,8 @@ wss.on('connection', (ws, req) => {
     console.error('Bridge WS error:', err.message);
   });
 });
+
+spotify.init(io);
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log('\nVoiceMeeter Control Server');

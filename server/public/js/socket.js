@@ -132,6 +132,15 @@ function attachSocketHandlers(socket) {
   socket.on('layout:data', layout => _handlers.onLayout?.(layout));
   socket.on('desktop:icon', payload => _handlers.onDesktopIcon?.(payload));
   socket.on('soundboard:devices', payload => _handlers.onSoundboardDevices?.(payload));
+
+  // Spotify events
+  socket.on('spotify:state',          state  => _handlers.onSpotifyState?.(state));
+  socket.on('spotify:auth_status',    status => _handlers.onSpotifyAuthStatus?.(status));
+  socket.on('spotify:search_results', data   => _handlers.onSpotifySearchResults?.(data));
+  socket.on('spotify:playlists',      data   => _handlers.onSpotifyPlaylists?.(data));
+  socket.on('spotify:queue',          data   => _handlers.onSpotifyQueue?.(data));
+  socket.on('spotify:toast',          msg    => _handlers.onSpotifyToast?.(msg));
+  socket.on('spotify:error',          err    => _handlers.onSpotifyError?.(err));
 }
 
 function detachSocketHandlers(socket) {
@@ -203,3 +212,14 @@ function scheduleVisibleHealthCheck(reason) {
     requestSnapshot();
   }, VISIBLE_RECONNECT_DELAY_MS);
 }
+
+// ---------------------------------------------------------------------------
+// Export a stable proxy so other modules (spotify-client.js) can emit/listen
+// without needing to call initSocket themselves.
+// ---------------------------------------------------------------------------
+export const socket = {
+  emit: (...args) => _socket?.emit?.(...args),
+  on:   (...args) => _socket?.on?.(...args),
+  once: (...args) => _socket?.once?.(...args),
+  off:  (...args) => _socket?.off?.(...args),
+};

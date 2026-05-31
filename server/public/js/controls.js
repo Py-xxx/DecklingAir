@@ -1,4 +1,5 @@
 import { desktopAction, soundboardPlay, vmSet, vmMacro } from './socket.js';
+import { renderSpotifyControl } from './spotify-controls.js';
 
 // ── VM parameter catalogue ────────────────────────────────────────────────────
 export const VM_STRIPS = Array.from({ length: 8 }, (_, i) => ({
@@ -643,6 +644,13 @@ export function renderVuMeter(ctrl) {
   metersEl.appendChild(chL);
   metersEl.appendChild(chR);
 
+  // Horizontal mono bar — used in tiny (1×1) mode
+  const barFillEl = document.createElement('div');
+  barFillEl.className = 'vu-bar-fill';
+  const barEl = document.createElement('div');
+  barEl.className = 'vu-bar-h';
+  barEl.appendChild(barFillEl);
+
   const dbEl = document.createElement('div');
   dbEl.className = 'vu-db';
   dbEl.textContent = '-∞';
@@ -650,9 +658,18 @@ export function renderVuMeter(ctrl) {
   card.appendChild(dragHandle());
   card.appendChild(labelEl);
   card.appendChild(metersEl);
+  card.appendChild(barEl);
   card.appendChild(dbEl);
   card.appendChild(editOverlay(ctrl.id));
   card.appendChild(resizeHandle());
+
+  // Switch layout based on rendered card height
+  const ro = new ResizeObserver(entries => {
+    const h = entries[0].contentRect.height;
+    card.classList.toggle('vu-tiny',  h < 100);
+    card.classList.toggle('vu-small', h >= 100 && h < 175);
+  });
+  ro.observe(card);
 
   card._updateState = () => {};
   card._updateLevels = (levels) => {
@@ -665,6 +682,16 @@ export function renderVuMeter(ctrl) {
     updateVuColumn(chR, rv);
     const db = lv > 0 ? 20 * Math.log10(lv) : -Infinity;
     dbEl.textContent = isFinite(db) ? fmtDb(db) + ' dB' : '-∞';
+
+    // Update horizontal bar (used in tiny mode)
+    const peak   = Math.max(lv, rv);
+    const peakDb = peak > 0 ? 20 * Math.log10(peak) : -Infinity;
+    const norm   = Math.min(1, Math.max(0, (peakDb + 60) / 66));
+    const litFrac = norm * NUM_SEGS;
+    barFillEl.style.width      = `${norm * 100}%`;
+    barFillEl.style.background = litFrac >= SEG_RED ? 'var(--danger)'
+                               : litFrac >= SEG_YELLOW ? 'var(--warning)'
+                               : 'var(--success)';
   };
   return card;
 }
@@ -743,11 +770,15 @@ export function renderControl(ctrl, vmState) {
     case 'button':      return renderToggle(ctrl, vmState);
     case 'macro':       return renderMacro(ctrl, vmState);
     case 'desktop_action': return renderDesktopAction(ctrl);
-    case 'soundboard':     return renderSoundboard(ctrl);
-    case 'strip_panel': return renderStripPanel(ctrl, vmState);
-    case 'bus_panel':   return renderBusPanel(ctrl, vmState);
-    case 'vu_meter':    return renderVuMeter(ctrl, vmState);
-    case 'label':       return renderLabel(ctrl);
+    case 'soundboard':        return renderSoundboard(ctrl);
+    case 'strip_panel':       return renderStripPanel(ctrl, vmState);
+    case 'bus_panel':         return renderBusPanel(ctrl, vmState);
+    case 'vu_meter':          return renderVuMeter(ctrl, vmState);
+    case 'label':             return renderLabel(ctrl);
+    case 'spotify_player':
+    case 'spotify_search':
+    case 'spotify_playlists':
+    case 'spotify_queue':     return renderSpotifyControl(ctrl);
     default: {
       const d = document.createElement('div');
       d.className = 'control-card'; d.style.padding = '12px';

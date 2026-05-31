@@ -12,6 +12,7 @@
   <meta name="theme-color" content="#090910">
   <title>VM Control</title>
   <link rel="stylesheet" href="css/style.css">
+  <link rel="stylesheet" href="css/spotify.css">
 </head>
 <body>
   <div id="app">
@@ -133,6 +134,22 @@
             <button class="type-card" data-type="label">
               <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h10M4 18h6"/></svg>
               Label
+            </button>
+            <button class="type-card" data-type="spotify_player">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/><path d="M5 12h4M15 12h4"/></svg>
+              Sp Player
+            </button>
+            <button class="type-card" data-type="spotify_search">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M16.65 16.65L21 21"/></svg>
+              Sp Search
+            </button>
+            <button class="type-card" data-type="spotify_playlists">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+              Sp Playlists
+            </button>
+            <button class="type-card" data-type="spotify_queue">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h10"/><polygon points="19 15 22 18 19 21" fill="currentColor"/></svg>
+              Sp Queue
             </button>
           </div>
         </div>
@@ -281,6 +298,37 @@
             </div>
           </div>
 
+          <!-- Spotify Player config (no extra fields beyond size) -->
+          <div id="cfg-spotify-player" class="cfg-section" style="display:none">
+            <p class="cfg-note">The player card shows the current track, seek bar, and transport controls. Resize to fit your layout.</p>
+          </div>
+
+          <!-- Spotify Search config -->
+          <div id="cfg-spotify-search" class="cfg-section" style="display:none">
+            <p class="cfg-note">Shows a search box. Type to search — results appear instantly with play and queue buttons.</p>
+          </div>
+
+          <!-- Spotify Playlists config -->
+          <div id="cfg-spotify-playlists" class="cfg-section" style="display:none">
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Columns</label>
+                <select id="cfg-spotify-pl-cols" class="form-select">
+                  <option value="2">2</option>
+                  <option value="3" selected>3</option>
+                  <option value="4">4</option>
+                  <option value="5">5</option>
+                </select>
+              </div>
+            </div>
+            <p class="cfg-note">Shows your Spotify playlists as a grid. Tap any playlist to start playing it with smart shuffle.</p>
+          </div>
+
+          <!-- Spotify Queue config -->
+          <div id="cfg-spotify-queue" class="cfg-section" style="display:none">
+            <p class="cfg-note">Shows the upcoming tracks in the playback queue. Includes a refresh button.</p>
+          </div>
+
           <!-- Soundboard config -->
           <div id="cfg-soundboard" class="cfg-section" style="display:none">
             <div class="form-row">
@@ -389,6 +437,42 @@
           </div>
         </section>
         <section class="settings-section">
+          <h3>Spotify</h3>
+          <div id="s-spotify-status" class="s-spotify-status">
+            <span class="s-spotify-status-dot"></span>
+            <span id="s-spotify-status-text">Not connected</span>
+          </div>
+          <div class="form-row" style="margin-top:8px">
+            <div class="form-group fg-grow">
+              <label class="form-label">Client ID</label>
+              <input type="text" id="s-spotify-client-id" class="form-input" placeholder="Spotify app Client ID" autocomplete="off">
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group fg-grow">
+              <label class="form-label">Client Secret</label>
+              <input type="password" id="s-spotify-client-secret" class="form-input" placeholder="Spotify app Client Secret" autocomplete="off">
+            </div>
+          </div>
+          <span class="form-hint">Create an app at <strong>developer.spotify.com</strong>, set the Redirect URI to <code id="s-spotify-redirect-uri">http://&lt;pi-ip&gt;:3002/api/spotify/callback</code></span>
+          <div class="btn-row" style="margin-top:10px">
+            <button class="btn-primary btn-sm" id="s-spotify-connect">Connect Spotify</button>
+            <button class="btn-secondary btn-sm" id="s-spotify-disconnect" style="display:none">Disconnect</button>
+          </div>
+          <div class="form-row" style="margin-top:12px">
+            <div class="form-group fg-grow">
+              <label class="form-label">Auto-play recommendations when queue runs out</label>
+              <label class="toggle-switch"><input type="checkbox" id="s-spotify-autoplay" checked><span class="toggle-slider"></span></label>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group fg-grow">
+              <label class="form-label">Smart shuffle (pre-mix recommendations into playlist)</label>
+              <label class="toggle-switch"><input type="checkbox" id="s-spotify-smart-shuffle"><span class="toggle-slider"></span></label>
+            </div>
+          </div>
+        </section>
+        <section class="settings-section">
           <h3>Mixer</h3>
           <button class="btn-danger-outline btn-sm" id="s-vm-restart">Restart Audio Engine</button>
         </section>
@@ -445,6 +529,21 @@
         .then(registrations => Promise.all(registrations.map(registration => registration.unregister())))
         .catch(() => {});
     }
+
+    // Update the Spotify redirect URI hint with the actual origin
+    window.addEventListener('DOMContentLoaded', () => {
+      const el = document.getElementById('s-spotify-redirect-uri');
+      if (el) el.textContent = `${location.origin}/api/spotify/callback`;
+    });
+
+    // Listen for OAuth popup result
+    window.addEventListener('message', event => {
+      if (event.data === 'spotify:connected') {
+        console.log('[Spotify] OAuth completed successfully');
+      } else if (event.data === 'spotify:error') {
+        console.error('[Spotify] OAuth failed');
+      }
+    });
   </script>
   <script src="/vendor/socket.io.js"></script>
   <script type="module" src="js/app.js"></script>

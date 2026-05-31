@@ -6,7 +6,9 @@ import {
   openPageNameModal,
   openSettings,
   updateSoundboardDeviceList,
+  updateSpotifySettingsStatus,
 } from './editor.js';
+import { updateSpotifyPlaylists, updateSpotifyQueue } from './spotify-controls.js';
 
 const DEFAULT_DEVICE_LAYOUT = {
   name: 'Primary Device',
@@ -54,6 +56,8 @@ const state = {
   desktopIcons: {},
   levels: [],
   bridge: createDeviceRuntime('default'),
+  spotifyState: null,
+  spotifyAuthStatus: null,
   ui: {
     activeDeviceId: null,
     currentPage: 0,
@@ -182,6 +186,30 @@ initSocket({
     applySettings();
     requestDesktopIconsForLayout();
     renderCurrentPage();
+  },
+  onSpotifyState(spotifyState) {
+    state.spotifyState = spotifyState;
+    cardRegistry.forEach(card => card._updateSpotify?.(spotifyState));
+  },
+  onSpotifyAuthStatus(status) {
+    state.spotifyAuthStatus = status;
+    updateSpotifySettingsStatus(status);
+  },
+  onSpotifySearchResults(data) {
+    cardRegistry.forEach(card => card._updateSpotifySearch?.(data));
+  },
+  onSpotifyPlaylists(data) {
+    updateSpotifyPlaylists(data);
+  },
+  onSpotifyQueue(data) {
+    updateSpotifyQueue(data);
+  },
+  onSpotifyToast(msg) {
+    showSpotifyToast(typeof msg === 'string' ? msg : (msg?.message || ''));
+  },
+  onSpotifyError(err) {
+    const message = typeof err === 'string' ? err : (err?.message || 'Spotify error');
+    showSpotifyToast(message, true);
   },
 });
 
@@ -627,6 +655,7 @@ function renderCurrentPage() {
     gridEl.appendChild(card);
     cardRegistry.set(control.id, card);
     if (state.levels.length) card._updateLevels?.(state.levels);
+    if (state.spotifyState) card._updateSpotify?.(state.spotifyState);
   });
 }
 
@@ -793,6 +822,22 @@ function refreshAllCards() {
     });
     if (state.levels.length) card._updateLevels?.(state.levels);
   });
+}
+
+function showSpotifyToast(message, isError = false) {
+  if (!message) return;
+  const toast = document.createElement('div');
+  toast.className = `sp-toast${isError ? ' sp-toast-error' : ''}`;
+  toast.textContent = message;
+  document.body.appendChild(toast);
+  // Trigger enter animation
+  requestAnimationFrame(() => toast.classList.add('sp-toast-visible'));
+  window.setTimeout(() => {
+    toast.classList.remove('sp-toast-visible');
+    toast.addEventListener('transitionend', () => toast.remove(), { once: true });
+    // Fallback removal in case transition doesn't fire
+    window.setTimeout(() => toast.remove(), 500);
+  }, 2500);
 }
 
 function setBridgeStatus(info) {

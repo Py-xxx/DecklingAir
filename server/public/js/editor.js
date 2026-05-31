@@ -1,5 +1,6 @@
 import { VM_STRIPS, VM_BUSES, buildParamOptions } from './controls.js';
 import { vmMacro, requestSoundboardDevices } from './socket.js';
+import { saveSpotifyConfig, disconnectSpotify, setSpotifyAutoplay, setSpotifySmartShuffle } from './spotify-client.js';
 
 const DEFAULT_SIZES = {
   fader: [1, 4],
@@ -12,6 +13,10 @@ const DEFAULT_SIZES = {
   strip_panel: [1, 4],
   bus_panel: [1, 3],
   label: [2, 1],
+  spotify_player:    [4, 2],
+  spotify_search:    [4, 4],
+  spotify_playlists: [4, 4],
+  spotify_queue:     [3, 4],
 };
 
 const VM_ONLY_TYPES = new Set([
@@ -71,6 +76,29 @@ function _repopulateSoundboardSelect(selectId, devices, defaultLabel) {
   }
 }
 
+/**
+ * Called from app.js when Spotify auth status changes so the settings
+ * panel always shows the current state (even if it's already open).
+ */
+export function updateSpotifySettingsStatus(status) {
+  const statusEl = document.getElementById('s-spotify-status');
+  const statusTextEl = document.getElementById('s-spotify-status-text');
+  const connectBtn = document.getElementById('s-spotify-connect');
+  const disconnectBtn = document.getElementById('s-spotify-disconnect');
+
+  if (!statusEl) return; // Settings panel not yet in DOM
+
+  const connected = !!(status?.connected);
+  statusEl.classList.toggle('spotify-status-connected', connected);
+  statusTextEl.textContent = connected
+    ? (status.displayName ? `Connected as ${status.displayName}` : 'Connected')
+    : (status?.configured ? 'Configured — not connected' : 'Not connected');
+
+  if (connectBtn)    connectBtn.style.display    = connected ? 'none'  : '';
+  if (disconnectBtn) disconnectBtn.style.display = connected ? ''      : 'none';
+
+}
+
 export function initEditor(state, callbacks) {
   _state = state;
   _callbacks = callbacks;
@@ -110,6 +138,31 @@ export function initEditor(state, callbacks) {
   document.getElementById('cfg-soundboard-volume').addEventListener('input', () => {
     document.getElementById('cfg-soundboard-volume-display').textContent =
       document.getElementById('cfg-soundboard-volume').value + '%';
+  });
+
+  // Spotify settings handlers
+  document.getElementById('s-spotify-connect').addEventListener('click', () => {
+    const clientId = document.getElementById('s-spotify-client-id').value.trim();
+    const clientSecret = document.getElementById('s-spotify-client-secret').value.trim();
+    if (!clientId || !clientSecret) {
+      window.alert('Please enter a Client ID and Client Secret first.');
+      return;
+    }
+    saveSpotifyConfig(clientId, clientSecret);
+    // Small delay so server can save config before we open the auth URL
+    window.setTimeout(() => {
+      window.open('/api/spotify/auth', 'spotify-auth', 'width=500,height=700,noopener');
+    }, 250);
+  });
+  document.getElementById('s-spotify-disconnect').addEventListener('click', () => {
+    if (!window.confirm('Disconnect Spotify? This will stop playback state updates.')) return;
+    disconnectSpotify();
+  });
+  document.getElementById('s-spotify-autoplay').addEventListener('change', event => {
+    setSpotifyAutoplay(event.target.checked);
+  });
+  document.getElementById('s-spotify-smart-shuffle').addEventListener('change', event => {
+    setSpotifySmartShuffle(event.target.checked);
   });
 
   document.getElementById('settings-close').addEventListener('click', closeSettings);
@@ -250,6 +303,7 @@ export function openSettings() {
   renderDeviceManagementList();
   renderDefaultDeviceDropdown();
   renderPagesList();
+  updateSpotifySettingsStatus(_state.spotifyAuthStatus || null);
   document.getElementById('settings-modal').style.display = 'flex';
 }
 
@@ -353,6 +407,10 @@ function showConfigSection(type) {
     vu_meter: 'cfg-vu',
     strip_panel: 'cfg-strip-panel',
     bus_panel: 'cfg-bus-panel',
+    spotify_player:    'cfg-spotify-player',
+    spotify_search:    'cfg-spotify-search',
+    spotify_playlists: 'cfg-spotify-playlists',
+    spotify_queue:     'cfg-spotify-queue',
   };
 
   const sectionId = sectionMap[type];
@@ -431,6 +489,11 @@ function populateModal(control) {
     document.getElementById('cfg-desktop-target').value = config.target || '';
     document.getElementById('cfg-desktop-args').value = config.args || '';
     updateDesktopActionFields();
+  }
+
+  if (control.type === 'spotify_playlists') {
+    const colsEl = document.getElementById('cfg-spotify-pl-cols');
+    if (colsEl) colsEl.value = String(config.columns || 3);
   }
 }
 
@@ -594,6 +657,14 @@ function buildControlConfig(type) {
     return {
       text: label || 'Label',
     };
+  }
+
+  if (type === 'spotify_player') return { label: label || 'Player' };
+  if (type === 'spotify_search') return { label: label || 'Search' };
+  if (type === 'spotify_queue')  return { label: label || 'Queue' };
+  if (type === 'spotify_playlists') {
+    const columns = Number.parseInt(document.getElementById('cfg-spotify-pl-cols')?.value, 10) || 3;
+    return { label: label || 'Playlists', columns };
   }
 
   return null;
