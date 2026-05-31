@@ -12,6 +12,18 @@
 }
 
 /* ---------------------------------------------------------------------------
+   Spotify cards must fill their grid cell full-width.
+   .control-card has align-items: center which shrinks flex children to
+   content-width — override so inner wrappers stretch edge-to-edge.
+   --------------------------------------------------------------------------- */
+.spotify-player-card,
+.spotify-search-card,
+.spotify-playlists-card,
+.spotify-queue-card {
+  align-items: stretch;
+}
+
+/* ---------------------------------------------------------------------------
    Shared scrollbar styling
    --------------------------------------------------------------------------- */
 .spotify-player-card ::-webkit-scrollbar,
