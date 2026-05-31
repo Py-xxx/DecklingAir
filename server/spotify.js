@@ -292,6 +292,7 @@ async function refreshAccessToken() {
     accessToken: data.access_token,
     refreshToken: data.refresh_token || tokens.refreshToken,
     expiresAt: Date.now() + data.expires_in * 1000,
+    scope: data.scope || tokens.scope || '', // preserve existing scope if refresh doesn't return one
   };
 
   saveTokens(updated);
@@ -778,11 +779,8 @@ function init(io) {
         setTimeout(() => poll(), 800);
       } catch (err) {
         const status = err.status ? ` (HTTP ${err.status})` : '';
-        console.error(`[Spotify] Command error (${action})${status}:`, err.message);
-        const friendlyMsg = err.status === 403
-          ? `${err.message} — your Spotify token may be missing required permissions. Disconnect and reconnect in Settings.`
-          : err.message;
-        socket.emit('spotify:error', { message: friendlyMsg });
+        console.error(`[Spotify] Command error (${action})${status}:`, err.message, err.body || '');
+        socket.emit('spotify:error', { message: `${action} failed${status}: ${err.message}` });
         // Re-poll so any optimistically-toggled UI (shuffle, repeat) snaps back to real state
         setTimeout(() => poll(), 300);
       }
@@ -819,6 +817,7 @@ function init(io) {
       try {
         // Ensure profile is loaded so we can filter by ownership
         if (!_userId) await getUserProfile();
+        console.log(`[Spotify] get_playlists: userId=${_userId}`);
 
         const data = await getPlaylists(50);
         const playlists =
@@ -829,7 +828,9 @@ function init(io) {
                 // when attempting to add tracks.
                 .filter((p) => {
                   const owned = p.owner && p.owner.id === _userId;
-                  return owned || p.collaborative === true;
+                  const allowed = owned || p.collaborative === true;
+                  if (!allowed) console.log(`[Spotify] Excluding playlist "${p.name}" (owner: ${p.owner && p.owner.id})`);
+                  return allowed;
                 })
                 .map((p) => ({
                   id: p.id,
@@ -889,15 +890,14 @@ function init(io) {
     // ----- spotify:add_to_playlist -----
     socket.on('spotify:add_to_playlist', async ({ trackUri, playlistId } = {}) => {
       try {
+        console.log(`[Spotify] add_to_playlist: playlistId=${playlistId} trackUri=${trackUri} userId=${_userId}`);
         await addTracksToPlaylist(playlistId, [trackUri]);
         socket.emit('spotify:toast', { message: 'Added to playlist ✓' });
       } catch (err) {
         const status = err.status ? ` (HTTP ${err.status})` : '';
-        console.error(`[Spotify] Add to playlist error${status}:`, err.message);
-        const friendlyMsg = err.status === 403
-          ? 'Cannot add to this playlist — you may not own it, or your token needs refreshing. Disconnect and reconnect in Settings.'
-          : err.message;
-        socket.emit('spotify:error', { message: friendlyMsg });
+        console.error(`[Spotify] Add to playlist error${status}:`, err.message, err.body || '');
+        // Show the actual Spotify error — don't hide it behind a generic message
+        socket.emit('spotify:error', { message: `Add to playlist failed${status}: ${err.message}` });
       }
     });
 
