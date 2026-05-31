@@ -532,9 +532,11 @@ function renderSpotifyPlayer(ctrl) {
           <div class="sp-track-title"><span></span></div>
           <div class="sp-track-artist"><span></span></div>
         </div>
-        <button class="sp-icon-btn sp-heart-btn" aria-label="Like">${SVG.heart(false)}</button>
-        <button class="sp-icon-btn sp-add-btn"   aria-label="Add to playlist">${SVG.plus()}</button>
-        <button class="sp-icon-btn sp-device-btn" aria-label="Select device">${SVG.speaker()}</button>
+        <div class="sp-action-btns">
+          <button class="sp-icon-btn sp-heart-btn" aria-label="Like">${SVG.heart(false)}</button>
+          <button class="sp-icon-btn sp-add-btn"   aria-label="Add to playlist">${SVG.plus()}</button>
+          <button class="sp-icon-btn sp-device-btn" aria-label="Select device">${SVG.speaker()}</button>
+        </div>
       </div>
 
       <!-- Seek row -->

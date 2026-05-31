@@ -187,6 +187,14 @@
   85%,100% { transform: translateX(var(--sp-scroll-shift, 0px)); }
 }
 
+/* Action button group — heart/add/device as a tight unit on the right */
+.sp-action-btns {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  flex-shrink: 0;
+}
+
 /* Icon buttons */
 .sp-icon-btn {
   background: none;
@@ -206,16 +214,16 @@
 .sp-heart-btn.liked { color: var(--accent, #e05); }
 .sp-heart-btn.liked:hover { color: var(--accent, #e05); opacity: 0.8; }
 
-/* Seek row — never shrinks */
+/* Seek row — full-width scrubber, time sits below */
 .sp-seek-row {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  gap: 2px;
   flex-shrink: 0;
 }
 
 .sp-seek-bar {
-  flex: 1;
+  width: 100%;
   height: 20px;
   display: flex;
   align-items: center;
@@ -260,10 +268,9 @@
   font-size: 10px;
   color: var(--text-3, #888);
   white-space: nowrap;
-  flex-shrink: 0;
-  min-width: 72px;
-  text-align: right;
   font-variant-numeric: tabular-nums;
+  text-align: right;
+  width: 100%;
 }
 
 /* Controls row — never shrinks */
