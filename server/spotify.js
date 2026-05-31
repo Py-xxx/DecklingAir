@@ -53,6 +53,7 @@ let _autoQueueCount = 0;
 let _autoplayEnabled = false;
 let _smartShuffleEnabled = false;
 let _userProfile = null;
+let _userId = null;
 
 // ---------------------------------------------------------------------------
 // Config / token storage
@@ -184,7 +185,13 @@ async function api(method, endpoint, opts = {}) {
 
   let urlStr = SPOTIFY_API + endpoint;
   if (opts.params && Object.keys(opts.params).length > 0) {
-    const qs = new URLSearchParams(opts.params).toString();
+    // Stringify all values — URLSearchParams spec requires strings; passing
+    // numbers works in most environments but some Node builds behave oddly.
+    const stringParams = {};
+    for (const [k, v] of Object.entries(opts.params)) {
+      stringParams[k] = String(v);
+    }
+    const qs = new URLSearchParams(stringParams).toString();
     urlStr += (urlStr.includes('?') ? '&' : '?') + qs;
   }
 
@@ -194,6 +201,8 @@ async function api(method, endpoint, opts = {}) {
   };
 
   const body = opts.body ? JSON.stringify(opts.body) : undefined;
+
+  console.log(`[Spotify] ${method} ${urlStr.replace(SPOTIFY_API, '')}`);
 
   return httpsRequest(method, urlStr, { headers, body });
 }
@@ -425,6 +434,7 @@ async function getRecommendations({ seedTracks = [], seedArtists = [], limit = 5
 async function getUserProfile() {
   if (_userProfile) return _userProfile;
   _userProfile = await api('GET', '/me');
+  _userId = _userProfile.id || null;
   return _userProfile;
 }
 
@@ -767,8 +777,12 @@ function init(io) {
         // Delayed poll to pick up changes
         setTimeout(() => poll(), 800);
       } catch (err) {
-        console.error(`[Spotify] Command error (${action}):`, err.message);
-        socket.emit('spotify:error', { message: err.message });
+        const status = err.status ? ` (HTTP ${err.status})` : '';
+        console.error(`[Spotify] Command error (${action})${status}:`, err.message);
+        const friendlyMsg = err.status === 403
+          ? `${err.message} — your Spotify token may be missing required permissions. Disconnect and reconnect in Settings.`
+          : err.message;
+        socket.emit('spotify:error', { message: friendlyMsg });
         // Re-poll so any optimistically-toggled UI (shuffle, repeat) snaps back to real state
         setTimeout(() => poll(), 300);
       }
@@ -803,18 +817,29 @@ function init(io) {
     // ----- spotify:get_playlists -----
     socket.on('spotify:get_playlists', async () => {
       try {
+        // Ensure profile is loaded so we can filter by ownership
+        if (!_userId) await getUserProfile();
+
         const data = await getPlaylists(50);
         const playlists =
           data && data.items
-            ? data.items.map((p) => ({
-                id: p.id,
-                uri: p.uri,
-                name: p.name,
-                coverUrl:
-                  p.images && p.images.length > 0 ? p.images[0].url : null,
-                total: p.tracks ? p.tracks.total : 0,
-                owner: p.owner ? p.owner.display_name : '',
-              }))
+            ? data.items
+                // Only include playlists the user owns or can collaborate on.
+                // Followed (non-owned, non-collaborative) playlists return 403
+                // when attempting to add tracks.
+                .filter((p) => {
+                  const owned = p.owner && p.owner.id === _userId;
+                  return owned || p.collaborative === true;
+                })
+                .map((p) => ({
+                  id: p.id,
+                  uri: p.uri,
+                  name: p.name,
+                  coverUrl:
+                    p.images && p.images.length > 0 ? p.images[0].url : null,
+                  total: p.tracks ? p.tracks.total : 0,
+                  owner: p.owner ? p.owner.display_name : '',
+                }))
             : [];
         socket.emit('spotify:playlists', { items: playlists });
       } catch (err) {
@@ -867,8 +892,12 @@ function init(io) {
         await addTracksToPlaylist(playlistId, [trackUri]);
         socket.emit('spotify:toast', { message: 'Added to playlist ✓' });
       } catch (err) {
-        console.error('[Spotify] Add to playlist error:', err.message);
-        socket.emit('spotify:error', { message: err.message });
+        const status = err.status ? ` (HTTP ${err.status})` : '';
+        console.error(`[Spotify] Add to playlist error${status}:`, err.message);
+        const friendlyMsg = err.status === 403
+          ? 'Cannot add to this playlist — you may not own it, or your token needs refreshing. Disconnect and reconnect in Settings.'
+          : err.message;
+        socket.emit('spotify:error', { message: friendlyMsg });
       }
     });
 
@@ -891,6 +920,7 @@ function init(io) {
       _lastTrackId = null;
       _autoQueueCount = 0;
       _userProfile = null;
+      _userId = null;
       io.emit('spotify:auth_status', { connected: false, configured: true });
       io.emit('spotify:state', null);
     });

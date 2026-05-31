@@ -482,19 +482,25 @@ function _flashBtn(btn, color = '#1DB954') {
 }
 
 // Marquee scroll for overflowing text elements.
-// Call after setting textContent so the browser has rendered the new width.
-function _applyMarquee(el) {
-  el.style.animation = 'none';
-  el.style.setProperty('--sp-scroll-shift', '0px');
-  // Two rAFs ensure the browser has laid out the new text before measuring
+// containerEl  = the clip div  (has overflow:hidden — its scrollWidth gives true text width)
+// The inner <span> is what gets the transform animation; the div stays stationary
+// and clips the scrolling span correctly.
+function _applyMarquee(containerEl) {
+  const span = containerEl.querySelector('span');
+  if (!span) return;
+  // Reset any running animation first
+  span.style.animation = 'none';
+  span.style.transform  = 'translateX(0)';
+  // Two rAFs ensure the browser has committed the new text layout before measuring
   requestAnimationFrame(() => requestAnimationFrame(() => {
-    const overflow = el.scrollWidth - el.clientWidth;
+    const overflow = containerEl.scrollWidth - containerEl.clientWidth;
     if (overflow > 6) {
       const secs = Math.max(4, overflow / 38); // ~38 px/s feels natural
-      el.style.setProperty('--sp-scroll-shift', `-${overflow}px`);
-      el.style.animation = `sp-marquee-scroll ${secs}s ease-in-out 1.2s infinite alternate`;
+      span.style.setProperty('--sp-scroll-shift', `-${overflow}px`);
+      span.style.animation = `sp-marquee-scroll ${secs}s ease-in-out 1.2s infinite alternate`;
     } else {
-      el.style.animation = '';
+      span.style.animation = '';
+      span.style.removeProperty('--sp-scroll-shift');
     }
   }));
 }
@@ -521,8 +527,8 @@ function renderSpotifyPlayer(ctrl) {
           <div class="sp-no-art">${SVG.spotifyLogo()}</div>
         </div>
         <div class="sp-track-info">
-          <div class="sp-track-title">No playback</div>
-          <div class="sp-track-artist"></div>
+          <div class="sp-track-title"><span></span></div>
+          <div class="sp-track-artist"><span></span></div>
         </div>
         <button class="sp-icon-btn sp-heart-btn" aria-label="Like">${SVG.heart(false)}</button>
         <button class="sp-icon-btn sp-add-btn"   aria-label="Add to playlist">${SVG.plus()}</button>
@@ -775,12 +781,14 @@ function renderSpotifyPlayer(ctrl) {
       noArt.style.display = 'flex';
     }
 
-    if (titleEl.textContent !== (track.title || '')) {
-      titleEl.textContent = track.title || '';
+    const titleSpan  = titleEl.querySelector('span');
+    const artistSpan = artistEl.querySelector('span');
+    if (titleSpan.textContent !== (track.title || '')) {
+      titleSpan.textContent = track.title || '';
       _applyMarquee(titleEl);
     }
-    if (artistEl.textContent !== (track.artist || '')) {
-      artistEl.textContent = track.artist || '';
+    if (artistSpan.textContent !== (track.artist || '')) {
+      artistSpan.textContent = track.artist || '';
       _applyMarquee(artistEl);
     }
 

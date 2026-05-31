@@ -92,7 +92,7 @@
   display: flex;
   flex-direction: column;
   height: 100%;
-  padding: 8px 10px 6px;
+  padding: 8px 12px 6px;
   box-sizing: border-box;
   gap: 4px;
   position: relative;
@@ -159,19 +159,22 @@
   font-size: 13px;
   font-weight: 600;
   color: var(--text, #fff);
+  overflow: hidden;      /* clip container — stays stationary */
   white-space: nowrap;
-  overflow: hidden;
-  display: block;
-  will-change: transform;
-  --sp-scroll-shift: 0px;
 }
 
 .sp-track-artist {
   font-size: 11px;
   color: var(--text-2, #aaa);
+  overflow: hidden;      /* clip container — stays stationary */
   white-space: nowrap;
-  overflow: hidden;
-  display: block;
+}
+
+/* The inner span is the element that actually scrolls */
+.sp-track-title span,
+.sp-track-artist span {
+  display: inline-block; /* required: transforms on inline elements are unreliable */
+  white-space: nowrap;
   will-change: transform;
   --sp-scroll-shift: 0px;
 }
@@ -567,9 +570,13 @@
   display: flex;
   flex-direction: column;
   height: 100%;
-  padding: 8px;
+  padding: 8px 12px;
   box-sizing: border-box;
   gap: 6px;
+  /* Create an inner clip surface that respects the card's border-radius,
+     so the scrolling list never bleeds through the rounded corners. */
+  border-radius: var(--radius, 12px);
+  overflow: hidden;
 }
 
 .sp-queue-list {
