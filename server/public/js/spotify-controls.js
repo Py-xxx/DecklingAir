@@ -481,23 +481,25 @@ function _flashBtn(btn, color = '#1DB954') {
   setTimeout(() => { btn.style.color = prev; }, 800);
 }
 
-// Marquee scroll for overflowing text elements.
-// containerEl  = the clip div  (has overflow:hidden — its scrollWidth gives true text width)
-// The inner <span> is what gets the transform animation; the div stays stationary
-// and clips the scrolling span correctly.
+// Marquee scroll.
+// containerEl = clip div (overflow:hidden, stays fixed).
+// Inner <span> (inline-block) gets the translateX animation so it scrolls
+// inside the clip boundary.
+// We measure span.offsetWidth vs containerEl.offsetWidth — the most reliable
+// approach for inline-block children; scrollWidth is unreliable here.
 function _applyMarquee(containerEl) {
-  const span = containerEl.querySelector('span');
+  const span = containerEl.querySelector(':scope > span');
   if (!span) return;
-  // Reset any running animation first
+  // Hard-cancel any running animation so layout is settled before we measure
   span.style.animation = 'none';
-  span.style.transform  = 'translateX(0)';
-  // Two rAFs ensure the browser has committed the new text layout before measuring
+  span.style.transform = 'translateX(0)';
   requestAnimationFrame(() => requestAnimationFrame(() => {
-    const overflow = containerEl.scrollWidth - containerEl.clientWidth;
+    const overflow = span.offsetWidth - containerEl.offsetWidth;
     if (overflow > 6) {
-      const secs = Math.max(4, overflow / 38); // ~38 px/s feels natural
+      const secs = Math.max(3, overflow / 40);
       span.style.setProperty('--sp-scroll-shift', `-${overflow}px`);
-      span.style.animation = `sp-marquee-scroll ${secs}s ease-in-out 1.2s infinite alternate`;
+      span.style.animation =
+        `sp-marquee-scroll ${secs}s ease-in-out 1.2s infinite alternate`;
     } else {
       span.style.animation = '';
       span.style.removeProperty('--sp-scroll-shift');
@@ -572,6 +574,7 @@ function renderSpotifyPlayer(ctrl) {
   // ---- Element refs ----
   const albumArt    = card.querySelector('.sp-album-art');
   const noArt       = card.querySelector('.sp-no-art');
+  const trackInfoEl = card.querySelector('.sp-track-info');
   const titleEl     = card.querySelector('.sp-track-title');
   const artistEl    = card.querySelector('.sp-track-artist');
   const heartBtn    = card.querySelector('.sp-heart-btn');
@@ -812,6 +815,27 @@ function renderSpotifyPlayer(ctrl) {
       _rafLoop();
     }
   };
+
+  // Re-measure marquee whenever the info container changes width (card resize).
+  // Debounce slightly so we don't spam rAFs during a drag-resize.
+  let _marqueeResizeTimer = null;
+  const marqueeRo = new ResizeObserver(() => {
+    clearTimeout(_marqueeResizeTimer);
+    _marqueeResizeTimer = setTimeout(() => {
+      _applyMarquee(titleEl);
+      _applyMarquee(artistEl);
+    }, 60);
+  });
+  marqueeRo.observe(trackInfoEl);
+
+  // Clean up when card is removed from the DOM
+  const _playerCleanupObs = new MutationObserver(() => {
+    if (!document.contains(card)) {
+      marqueeRo.disconnect();
+      _playerCleanupObs.disconnect();
+    }
+  });
+  _playerCleanupObs.observe(document.body, { childList: true, subtree: true });
 
   return card;
 }

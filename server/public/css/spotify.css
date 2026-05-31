@@ -150,30 +150,32 @@
 .sp-track-info {
   flex: 1;
   min-width: 0;
+  overflow: hidden;      /* hard outer clip — nothing escapes into art or buttons */
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
 
+/* Each line is also its own clip container so offsetWidth is measured correctly */
 .sp-track-title {
   font-size: 13px;
   font-weight: 600;
   color: var(--text, #fff);
-  overflow: hidden;      /* clip container — stays stationary */
+  overflow: hidden;
   white-space: nowrap;
 }
 
 .sp-track-artist {
   font-size: 11px;
   color: var(--text-2, #aaa);
-  overflow: hidden;      /* clip container — stays stationary */
+  overflow: hidden;
   white-space: nowrap;
 }
 
-/* The inner span is the element that actually scrolls */
-.sp-track-title span,
-.sp-track-artist span {
-  display: inline-block; /* required: transforms on inline elements are unreliable */
+/* Inner span scrolls inside the clip container */
+.sp-track-title > span,
+.sp-track-artist > span {
+  display: inline-block; /* gives a measurable offsetWidth for the text width */
   white-space: nowrap;
   will-change: transform;
   --sp-scroll-shift: 0px;
