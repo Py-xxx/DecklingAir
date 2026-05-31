@@ -161,7 +161,9 @@
   color: var(--text, #fff);
   white-space: nowrap;
   overflow: hidden;
-  text-overflow: ellipsis;
+  display: block;
+  will-change: transform;
+  --sp-scroll-shift: 0px;
 }
 
 .sp-track-artist {
@@ -169,7 +171,14 @@
   color: var(--text-2, #aaa);
   white-space: nowrap;
   overflow: hidden;
-  text-overflow: ellipsis;
+  display: block;
+  will-change: transform;
+  --sp-scroll-shift: 0px;
+}
+
+@keyframes sp-marquee-scroll {
+  0%, 15%  { transform: translateX(0); }
+  85%,100% { transform: translateX(var(--sp-scroll-shift, 0px)); }
 }
 
 /* Icon buttons */
@@ -252,6 +261,12 @@
 .sp-controls-row {
   display: flex;
   align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+}
+.sp-main-controls {
+  display: flex;
+  align-items: center;
   gap: 2px;
 }
 
@@ -284,7 +299,7 @@
   opacity: 1;
 }
 
-.sp-controls-spacer { flex: 1; }
+.sp-controls-spacer { display: none; }
 
 .sp-toggle-btn {
   background: none;
@@ -325,11 +340,15 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  background: var(--bg-2, #1e1e1e);
+  background: var(--bg-3, #141420);
   border: 1px solid var(--border, #333);
-  border-radius: 4px;
-  padding: 0 8px;
+  border-radius: 20px;
+  padding: 0 10px;
   flex-shrink: 0;
+  transition: border-color 0.15s;
+}
+.sp-search-input-row:focus-within {
+  border-color: var(--sp-green, #1DB954);
 }
 
 .sp-search-icon { color: var(--text-3, #888); display: flex; align-items: center; }
@@ -352,7 +371,11 @@
   display: flex;
   flex-direction: column;
   gap: 2px;
+  border-top: 1px solid transparent;
+  padding-top: 4px;
+  transition: border-color 0.15s;
 }
+.sp-search-results:not(:empty) { border-top-color: var(--border, #333); }
 
 .sp-search-empty {
   padding: 16px;
@@ -444,6 +467,29 @@
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--text-2, #aaa);
+}
+
+.sp-sort-bar {
+  display: flex;
+  gap: 3px;
+}
+.sp-sort-btn {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  color: var(--text-3, #888);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 7px;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+  white-space: nowrap;
+}
+.sp-sort-btn:hover { color: var(--text, #fff); }
+.sp-sort-btn.active {
+  color: var(--sp-green, #1DB954);
+  border-color: var(--sp-green, #1DB954);
+  background: rgba(29,185,84,0.08);
 }
 
 .sp-playlists-grid {
@@ -570,6 +616,24 @@
   color: var(--text-3, #888);
   flex-shrink: 0;
   font-variant-numeric: tabular-nums;
+}
+
+/* Compact queue (narrow card) — hide art and duration, shrink text */
+.sp-queue-compact .sp-thumb {
+  display: none;
+}
+.sp-queue-compact .sp-queue-row-duration {
+  display: none;
+}
+.sp-queue-compact .sp-queue-row {
+  padding: 3px 2px;
+  gap: 0;
+}
+.sp-queue-compact .sp-queue-row-title {
+  font-size: 11px;
+}
+.sp-queue-compact .sp-queue-row-artist {
+  font-size: 10px;
 }
 
 /* =============================================================================

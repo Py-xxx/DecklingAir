@@ -748,6 +748,8 @@ function init(io) {
       } catch (err) {
         console.error(`[Spotify] Command error (${action}):`, err.message);
         socket.emit('spotify:error', { message: err.message });
+        // Re-poll so any optimistically-toggled UI (shuffle, repeat) snaps back to real state
+        setTimeout(() => poll(), 300);
       }
     });
 

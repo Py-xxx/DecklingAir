@@ -46,6 +46,10 @@ const DEFAULT_SIZES = {
   strip_panel: [1, 4],
   bus_panel: [1, 3],
   label: [2, 1],
+  spotify_player:    [3, 2],
+  spotify_search:    [3, 3],
+  spotify_playlists: [3, 4],
+  spotify_queue:     [2, 3],
 };
 
 const state = {

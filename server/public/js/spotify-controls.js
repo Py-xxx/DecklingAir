@@ -54,10 +54,23 @@ function resizeHandle() {
 function editOverlay(id) {
   const el = document.createElement('div');
   el.className = 'edit-overlay';
-  el.innerHTML = `
-    <button class="edit-btn" data-action="edit"   data-id="${id}">Edit</button>
-    <button class="edit-btn edit-btn--danger" data-action="delete" data-id="${id}">Delete</button>
-  `;
+
+  const editBtn = document.createElement('button');
+  editBtn.type = 'button';
+  editBtn.className = 'edit-overlay-btn';
+  editBtn.dataset.action = 'edit';
+  editBtn.dataset.ctrlId = id;
+  editBtn.textContent = '✎ Edit';
+
+  const delBtn = document.createElement('button');
+  delBtn.type = 'button';
+  delBtn.className = 'edit-overlay-btn danger';
+  delBtn.dataset.action = 'delete';
+  delBtn.dataset.ctrlId = id;
+  delBtn.textContent = '✕ Delete';
+
+  el.appendChild(editBtn);
+  el.appendChild(delBtn);
   return el;
 }
 
@@ -434,6 +447,27 @@ function _flashBtn(btn, color = '#1DB954') {
   setTimeout(() => { btn.style.color = prev; }, 800);
 }
 
+// Marquee scroll for overflowing text elements.
+// Call after setting textContent so the browser has rendered the new width.
+function _applyMarquee(el) {
+  el.style.animation = 'none';
+  el.style.setProperty('--sp-scroll-shift', '0px');
+  // Two rAFs ensure the browser has laid out the new text before measuring
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    const overflow = el.scrollWidth - el.clientWidth;
+    if (overflow > 6) {
+      const secs = Math.max(4, overflow / 38); // ~38 px/s feels natural
+      el.style.setProperty('--sp-scroll-shift', `-${overflow}px`);
+      el.style.animation = `sp-marquee-scroll ${secs}s ease-in-out 1.2s infinite alternate`;
+    } else {
+      el.style.animation = '';
+    }
+  }));
+}
+
+// Recently-played playlist IDs — tracked client-side for the "Recent" sort
+let _recentPlaylistIds = [];
+
 // ---------------------------------------------------------------------------
 // 1. Spotify Player Card
 // ---------------------------------------------------------------------------
@@ -474,11 +508,12 @@ function renderSpotifyPlayer(ctrl) {
 
       <!-- Controls row -->
       <div class="sp-controls-row">
-        <button class="sp-ctrl-btn sp-prev-btn"  aria-label="Previous">${SVG.prev()}</button>
-        <button class="sp-ctrl-btn sp-play-btn"  aria-label="Play/Pause">${SVG.play()}</button>
-        <button class="sp-ctrl-btn sp-next-btn"  aria-label="Next">${SVG.next()}</button>
-        <div class="sp-controls-spacer"></div>
         <button class="sp-toggle-btn sp-shuffle-btn" aria-label="Shuffle">${SVG.shuffle()}</button>
+        <div class="sp-main-controls">
+          <button class="sp-ctrl-btn sp-prev-btn"  aria-label="Previous">${SVG.prev()}</button>
+          <button class="sp-ctrl-btn sp-play-btn"  aria-label="Play/Pause">${SVG.play()}</button>
+          <button class="sp-ctrl-btn sp-next-btn"  aria-label="Next">${SVG.next()}</button>
+        </div>
         <button class="sp-toggle-btn sp-repeat-btn"  aria-label="Repeat">${SVG.repeatContext()}</button>
       </div>
 
@@ -689,8 +724,14 @@ function renderSpotifyPlayer(ctrl) {
       noArt.style.display = 'flex';
     }
 
-    titleEl.textContent  = track.title  || '';
-    artistEl.textContent = track.artist || '';
+    if (titleEl.textContent !== (track.title || '')) {
+      titleEl.textContent = track.title || '';
+      _applyMarquee(titleEl);
+    }
+    if (artistEl.textContent !== (track.artist || '')) {
+      artistEl.textContent = track.artist || '';
+      _applyMarquee(artistEl);
+    }
 
     heartBtn.innerHTML = SVG.heart(_liked);
     _applyRepeat();
@@ -730,7 +771,7 @@ function renderSpotifySearch(ctrl) {
     <div class="sp-search-wrap">
       <div class="sp-search-input-row">
         <span class="sp-search-icon">${SVG.search()}</span>
-        <input class="sp-search-input" type="search" placeholder="Search songs…" autocomplete="off" spellcheck="false">
+        <input class="sp-search-input" type="text" placeholder="Search songs…" autocomplete="off" spellcheck="false">
       </div>
       <div class="sp-search-results"></div>
     </div>
@@ -755,13 +796,22 @@ function renderSpotifySearch(ctrl) {
     }, 350);
   });
 
+  input.addEventListener('keydown', (e) => {
+    if (isEditMode()) { e.preventDefault(); return; }
+    if (e.key === 'Enter') {
+      clearTimeout(_debounce);
+      const q = input.value.trim();
+      if (q) spotifySearch(q);
+    }
+  });
+
   input.addEventListener('pointerdown', (e) => {
     if (isEditMode()) e.preventDefault();
   });
 
   card._updateSpotifySearch = function (data) {
     results.innerHTML = '';
-    const items = (data && data.items) ? data.items : [];
+    const items = (data && data.items) ? data.items.slice(0, 5) : [];
     if (!items.length) {
       results.innerHTML = '<div class="sp-search-empty">No results</div>';
       return;
@@ -824,6 +874,11 @@ function renderSpotifyPlaylists(ctrl) {
     <div class="sp-playlists-wrap">
       <div class="sp-section-header">
         <span class="sp-section-title">Playlists</span>
+        <div class="sp-sort-bar">
+          <button class="sp-sort-btn active" data-sort="added">Added</button>
+          <button class="sp-sort-btn" data-sort="name">A–Z</button>
+          <button class="sp-sort-btn" data-sort="recent">Recent</button>
+        </div>
       </div>
       <div class="sp-playlists-grid" style="--sp-pl-cols: ${columns}"></div>
     </div>
@@ -833,11 +888,33 @@ function renderSpotifyPlaylists(ctrl) {
   card.appendChild(resizeHandle());
   card.appendChild(editOverlay(ctrl.id));
 
-  const grid = card.querySelector('.sp-playlists-grid');
+  const grid    = card.querySelector('.sp-playlists-grid');
+  const sortBar = card.querySelector('.sp-sort-bar');
 
-  function _render(data) {
+  let _allItems = [];
+  let _sortMode = 'added';
+
+  function _sorted() {
+    const items = [..._allItems];
+    if (_sortMode === 'name') {
+      items.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+    } else if (_sortMode === 'recent') {
+      items.sort((a, b) => {
+        const ai = _recentPlaylistIds.indexOf(a.id);
+        const bi = _recentPlaylistIds.indexOf(b.id);
+        if (ai === -1 && bi === -1) return 0;
+        if (ai === -1) return 1;
+        if (bi === -1) return -1;
+        return ai - bi;
+      });
+    }
+    // 'added' keeps original API order
+    return items;
+  }
+
+  function _renderGrid() {
     grid.innerHTML = '';
-    const items = (data && data.items) ? data.items : [];
+    const items = _sorted();
     if (!items.length) {
       grid.innerHTML = '<div class="sp-playlists-empty">No playlists</div>';
       return;
@@ -858,6 +935,7 @@ function renderSpotifyPlaylists(ctrl) {
       item.addEventListener('pointerup', () => {
         item.classList.remove('sp-playlist-item--pressed');
         if (isEditMode()) return;
+        _recentPlaylistIds = [pl.id, ..._recentPlaylistIds.filter(x => x !== pl.id)].slice(0, 100);
         spotifyCmd('playlist_play', { playlistUri: pl.uri, playlistId: pl.id });
       });
       item.addEventListener('pointercancel', () => {
@@ -865,6 +943,20 @@ function renderSpotifyPlaylists(ctrl) {
       });
       grid.appendChild(item);
     });
+  }
+
+  // Sort bar clicks
+  sortBar.addEventListener('click', (e) => {
+    const btn = e.target.closest('.sp-sort-btn');
+    if (!btn) return;
+    _sortMode = btn.dataset.sort;
+    sortBar.querySelectorAll('.sp-sort-btn').forEach(b => b.classList.toggle('active', b === btn));
+    _renderGrid();
+  });
+
+  function _render(data) {
+    _allItems = (data && data.items) ? data.items : [];
+    _renderGrid();
   }
 
   card._updateSpotifyPlaylists = _render;
@@ -953,9 +1045,17 @@ function renderSpotifyQueue(ctrl) {
     getSpotifyQueue().then(_render);
   });
 
+  // Compact mode: hide art + duration when card is narrow
+  const queueRo = new ResizeObserver(entries => {
+    const w = entries[0].contentRect.width;
+    card.classList.toggle('sp-queue-compact', w < 160);
+  });
+  queueRo.observe(card);
+
   const observer = new MutationObserver(() => {
     if (!document.contains(card)) {
       _queueCardUpdaters.delete(_render);
+      queueRo.disconnect();
       observer.disconnect();
     }
   });
