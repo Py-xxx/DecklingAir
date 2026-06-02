@@ -141,6 +141,7 @@ function attachSocketHandlers(socket) {
   socket.on('spotify:queue',          data   => _handlers.onSpotifyQueue?.(data));
   socket.on('spotify:toast',          msg    => _handlers.onSpotifyToast?.(msg));
   socket.on('spotify:error',          err    => _handlers.onSpotifyError?.(err));
+  socket.on('spotify:stats',          data   => _handlers.onSpotifyStats?.(data));
 }
 
 function detachSocketHandlers(socket) {

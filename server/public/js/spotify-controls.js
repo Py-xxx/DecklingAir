@@ -9,10 +9,16 @@ import {
   spotifySearch,
   getSpotifyPlaylists,
   getSpotifyPlaylistTracks,
+  getSpotifyLikedSongs,
+  getSpotifyAudioFeatures,
+  getSpotifyBatchAudioFeatures,
+  getSpotifyStats,
+  saveSessionAsPlaylist,
   getSpotifyQueue,
   getSpotifyDevices,
   addToPlaylist,
 } from './spotify-client.js';
+import { socket } from './socket.js';
 
 // ---------------------------------------------------------------------------
 // Minimal local helpers (no import from controls.js to avoid circular deps)
@@ -240,6 +246,20 @@ const SVG = {
       stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
     <line x1="19" y1="12" x2="5" y2="12"/>
     <polyline points="12 19 5 12 12 5"/>
+  </svg>`,
+
+  likedSongsCover: () => `<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"
+      class="sp-playlist-cover sp-liked-songs-cover" aria-hidden="true">
+    <defs>
+      <linearGradient id="lsg" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%" stop-color="#450af5"/>
+        <stop offset="100%" stop-color="#c4efd9"/>
+      </linearGradient>
+    </defs>
+    <rect width="100" height="100" fill="url(#lsg)"/>
+    <path d="M50 70 L22 44 C16 37 16 27 24 21 C31 15 41 18 50 27
+             C59 18 69 15 76 21 C84 27 84 37 78 44 Z"
+          fill="white" opacity="0.9"/>
   </svg>`,
 };
 
@@ -563,6 +583,9 @@ function renderSpotifyPlayer(ctrl) {
         <button class="sp-toggle-btn sp-repeat-btn"  aria-label="Repeat">${SVG.repeatContext()}</button>
       </div>
 
+      <!-- Audio features row -->
+      <div class="sp-audio-features" style="display:none"></div>
+
       <!-- No-playback overlay -->
       <div class="sp-no-playback">
         ${SVG.spotifyLogo()}
@@ -593,8 +616,9 @@ function renderSpotifyPlayer(ctrl) {
   const nextBtn     = card.querySelector('.sp-next-btn');
   const shuffleBtn  = card.querySelector('.sp-shuffle-btn');
   const repeatBtn   = card.querySelector('.sp-repeat-btn');
-  const noPlayback  = card.querySelector('.sp-no-playback');
-  const playerEl    = card.querySelector('.sp-player');
+  const noPlayback      = card.querySelector('.sp-no-playback');
+  const playerEl        = card.querySelector('.sp-player');
+  const audioFeaturesEl = card.querySelector('.sp-audio-features');
 
   // ---- Live state for RAF ----
   let _rafId      = null;
@@ -760,6 +784,19 @@ function renderSpotifyPlayer(ctrl) {
     repeatBtn.innerHTML = _repeat === 'track' ? SVG.repeatTrack() : SVG.repeatContext();
   }
 
+  // ---- _showFeatures ----
+  function _showFeatures(f) {
+    audioFeaturesEl.innerHTML = '';
+    if (!f || (!f.bpm && !f.key)) { audioFeaturesEl.style.display = 'none'; return; }
+    audioFeaturesEl.style.display = 'flex';
+    const chips = [];
+    if (f.bpm)   chips.push(`<span class="sp-feat-chip sp-feat-bpm">♩ ${f.bpm} BPM</span>`);
+    if (f.key && f.mode) chips.push(`<span class="sp-feat-chip sp-feat-key">${f.key} ${f.mode}</span>`);
+    if (f.energy != null) chips.push(`<span class="sp-feat-chip sp-feat-energy">⚡ ${f.energy}%</span>`);
+    if (f.valence != null) chips.push(`<span class="sp-feat-chip sp-feat-valence">${f.valence >= 60 ? '😄' : f.valence >= 35 ? '😐' : '😔'} ${f.valence}%</span>`);
+    audioFeaturesEl.innerHTML = chips.join('');
+  }
+
   // ---- _updateSpotify ----
   card._updateSpotify = function (state) {
     const hasTrack = !!(state && state.track);
@@ -771,10 +808,17 @@ function renderSpotifyPlayer(ctrl) {
       _stopRaf();
       _liveState = null;
       _currentTrack = null;
+      audioFeaturesEl.style.display = 'none';
       return;
     }
 
     const { track, isPlaying, progress, shuffle, repeat, liked } = state;
+
+    // Hide stale features when track changes
+    if (_currentTrack && _currentTrack.id !== track.id) {
+      _showFeatures(null);
+    }
+
     _currentTrack = track;
     _liked   = !!liked;
     _repeat  = repeat || 'off';
@@ -833,10 +877,17 @@ function renderSpotifyPlayer(ctrl) {
   });
   marqueeRo.observe(trackInfoEl);
 
+  // Audio features socket listener
+  const _onFeatures = (f) => {
+    if (f && _currentTrack && f.trackId === _currentTrack.id) _showFeatures(f);
+  };
+  socket.on('spotify:audio_features', _onFeatures);
+
   // Clean up when card is removed from the DOM
   const _playerCleanupObs = new MutationObserver(() => {
     if (!document.contains(card)) {
       marqueeRo.disconnect();
+      socket.off('spotify:audio_features', _onFeatures);
       _playerCleanupObs.disconnect();
     }
   });
@@ -860,6 +911,7 @@ function renderSpotifySearch(ctrl) {
       <div class="sp-search-input-row">
         <span class="sp-search-icon">${SVG.search()}</span>
         <input class="sp-search-input" type="text" placeholder="Search songs…" autocomplete="off" spellcheck="false">
+        <button class="sp-search-clear" aria-label="Clear search" style="display:none">${SVG.close()}</button>
       </div>
       <div class="sp-search-results"></div>
     </div>
@@ -869,19 +921,55 @@ function renderSpotifySearch(ctrl) {
   card.appendChild(resizeHandle());
   card.appendChild(editOverlay(ctrl.id));
 
-  const input    = card.querySelector('.sp-search-input');
-  const results  = card.querySelector('.sp-search-results');
+  const input      = card.querySelector('.sp-search-input');
+  const clearBtn   = card.querySelector('.sp-search-clear');
+  const results    = card.querySelector('.sp-search-results');
 
   let _debounce = null;
+  let _outsideHandler = null;
+
+  function _deselectAll() {
+    results.querySelectorAll('.sp-row-selected').forEach(r => {
+      r.classList.remove('sp-row-selected');
+      const actions = r.querySelector('.sp-search-row-actions');
+      if (actions) actions.style.display = 'none';
+    });
+    if (_outsideHandler) {
+      document.removeEventListener('pointerdown', _outsideHandler);
+      _outsideHandler = null;
+    }
+  }
+
+  function _selectRow(row) {
+    _deselectAll();
+    row.classList.add('sp-row-selected');
+    const actions = row.querySelector('.sp-search-row-actions');
+    if (actions) actions.style.display = 'flex';
+    _outsideHandler = (e) => {
+      if (!card.contains(e.target)) _deselectAll();
+    };
+    setTimeout(() => document.addEventListener('pointerdown', _outsideHandler), 0);
+  }
+
+  function _updateClearBtn() {
+    clearBtn.style.display = input.value.length > 0 ? 'flex' : 'none';
+  }
+
+  clearBtn.addEventListener('pointerup', () => {
+    input.value = '';
+    results.innerHTML = '';
+    _deselectAll();
+    _updateClearBtn();
+    input.focus();
+  });
 
   input.addEventListener('input', () => {
     if (isEditMode()) return;
+    _updateClearBtn();
     clearTimeout(_debounce);
     const q = input.value.trim();
     if (!q) { results.innerHTML = ''; return; }
-    _debounce = setTimeout(() => {
-      spotifySearch(q);
-    }, 350);
+    _debounce = setTimeout(() => { spotifySearch(q); }, 350);
   });
 
   input.addEventListener('keydown', (e) => {
@@ -891,6 +979,7 @@ function renderSpotifySearch(ctrl) {
       const q = input.value.trim();
       if (q) spotifySearch(q);
     }
+    if (e.key === 'Escape') _deselectAll();
   });
 
   input.addEventListener('pointerdown', (e) => {
@@ -898,6 +987,7 @@ function renderSpotifySearch(ctrl) {
   });
 
   card._updateSpotifySearch = function (data) {
+    _deselectAll();
     results.innerHTML = '';
     const items = (data && data.items) ? data.items.slice(0, 5) : [];
     if (!items.length) {
@@ -908,28 +998,45 @@ function renderSpotifySearch(ctrl) {
       const row = document.createElement('div');
       row.className = 'sp-search-row';
       row.innerHTML = `
-        ${track.albumArt
-          ? `<img src="${track.albumArt}" class="sp-thumb sp-thumb--sm" width="32" height="32" alt="">`
-          : `<div class="sp-thumb sp-thumb--sm sp-thumb--placeholder"></div>`}
-        <div class="sp-search-row-info">
-          <div class="sp-search-row-title">${_esc(track.title)}</div>
-          <div class="sp-search-row-artist">${_esc(track.artist)}</div>
+        <div class="sp-search-row-main">
+          ${track.albumArt
+            ? `<img src="${track.albumArt}" class="sp-thumb sp-thumb--sm" width="32" height="32" alt="">`
+            : `<div class="sp-thumb sp-thumb--sm sp-thumb--placeholder"></div>`}
+          <div class="sp-search-row-info">
+            <div class="sp-search-row-title">${_esc(track.title)}</div>
+            <div class="sp-search-row-artist">${_esc(track.artist)}</div>
+          </div>
         </div>
-        <button class="sp-row-btn sp-row-play-btn"  aria-label="Play now">${SVG.playSmall()}</button>
-        <button class="sp-row-btn sp-row-queue-btn" aria-label="Add to queue">${SVG.queueAdd()}</button>
+        <div class="sp-search-row-actions" style="display:none">
+          <button class="sp-row-action-btn sp-row-action-play" aria-label="Play now">
+            ${SVG.play()}<span>Play</span>
+          </button>
+          <button class="sp-row-action-btn sp-row-action-queue" aria-label="Add to queue">
+            ${SVG.queueAdd()}<span>Queue</span>
+          </button>
+        </div>
       `;
 
-      row.querySelector('.sp-row-play-btn').addEventListener('pointerup', (e) => {
+      // Row click → select (not play)
+      row.addEventListener('pointerup', (e) => {
+        if (isEditMode()) return;
+        if (e.target.closest('.sp-row-action-btn')) return; // handled below
+        _selectRow(row);
+      });
+
+      row.querySelector('.sp-row-action-play').addEventListener('pointerup', (e) => {
         if (isEditMode()) return;
         e.stopPropagation();
         spotifyCmd('play', { uris: [track.uri] });
+        _deselectAll();
       });
 
-      row.querySelector('.sp-row-queue-btn').addEventListener('pointerup', (e) => {
+      row.querySelector('.sp-row-action-queue').addEventListener('pointerup', (e) => {
         if (isEditMode()) return;
         e.stopPropagation();
         spotifyCmd('queue_add', { uri: track.uri });
         _flashBtn(e.currentTarget);
+        _deselectAll();
       });
 
       results.appendChild(row);
@@ -949,9 +1056,22 @@ export function updateSpotifyPlaylists(data) {
   _playlistCardUpdaters.forEach((fn) => fn(data));
 }
 
+// Synthetic Liked Songs "playlist" object — not a real Spotify playlist
+const LIKED_SONGS_PLAYLIST = {
+  id: '__liked_songs__',
+  uri: 'spotify:collection:tracks',
+  name: 'Liked Songs',
+  isLikedSongs: true,
+  coverUrl: null,
+};
+
 function renderSpotifyPlaylists(ctrl) {
   const cfg = ctrl.config || ctrl.cfg || {};
   const columns = cfg.columns || 3;
+  const showSpecialPlaylists = !!cfg.showSpecialPlaylists;
+
+  // Restore persisted sort mode
+  const _savedSort = localStorage.getItem('sp-playlists-sort') || 'added';
 
   const card = document.createElement('div');
   card.className = 'control-card spotify-playlists-card';
@@ -966,9 +1086,9 @@ function renderSpotifyPlaylists(ctrl) {
         <div class="sp-section-header">
           <span class="sp-section-title">Playlists</span>
           <div class="sp-sort-bar">
-            <button class="sp-sort-btn active" data-sort="added">Added</button>
-            <button class="sp-sort-btn" data-sort="name">A–Z</button>
-            <button class="sp-sort-btn" data-sort="recent">Recent</button>
+            <button class="sp-sort-btn${_savedSort === 'added'  ? ' active' : ''}" data-sort="added">Added</button>
+            <button class="sp-sort-btn${_savedSort === 'name'   ? ' active' : ''}" data-sort="name">A–Z</button>
+            <button class="sp-sort-btn${_savedSort === 'recent' ? ' active' : ''}" data-sort="recent">Recent</button>
           </div>
         </div>
         <div class="sp-playlists-grid" style="--sp-pl-cols: ${columns}"></div>
@@ -1002,10 +1122,13 @@ function renderSpotifyPlaylists(ctrl) {
   const detailTracks  = card.querySelector('.sp-pl-detail-tracks');
 
   let _allItems = [];
-  let _sortMode = 'added';
+  let _sortMode = _savedSort;
   let _selectedPlaylist = null;
+  let _currentDetailTracks = [];
+  let _trackFeatures = {}; // trackId → features object
+  let _bpmFilter = 'all';
 
-  // ---- Grid: sorting ----
+  // ---- Grid: build display list (special playlists prepended, then sorted regular ones) ----
   function _sorted() {
     const items = [..._allItems];
     if (_sortMode === 'name') {
@@ -1020,7 +1143,8 @@ function renderSpotifyPlaylists(ctrl) {
         return ai - bi;
       });
     }
-    return items;
+    // Prepend special playlists (Liked Songs) — always at top regardless of sort
+    return showSpecialPlaylists ? [LIKED_SONGS_PLAYLIST, ...items] : items;
   }
 
   // ---- Grid: render ----
@@ -1034,12 +1158,19 @@ function renderSpotifyPlaylists(ctrl) {
     items.forEach((pl) => {
       const item = document.createElement('div');
       item.className = 'sp-playlist-item';
-      item.innerHTML = `
-        ${pl.coverUrl
-          ? `<img src="${pl.coverUrl}" class="sp-playlist-cover" alt="">`
-          : `<div class="sp-playlist-cover sp-thumb--placeholder"></div>`}
-        <div class="sp-playlist-name">${_esc(pl.name)}</div>
-      `;
+      if (pl.isLikedSongs) {
+        item.innerHTML = `
+          ${SVG.likedSongsCover()}
+          <div class="sp-playlist-name">${_esc(pl.name)}</div>
+        `;
+      } else {
+        item.innerHTML = `
+          ${pl.coverUrl
+            ? `<img src="${pl.coverUrl}" class="sp-playlist-cover" alt="">`
+            : `<div class="sp-playlist-cover sp-thumb--placeholder"></div>`}
+          <div class="sp-playlist-name">${_esc(pl.name)}</div>
+        `;
+      }
       item.addEventListener('pointerdown', () => {
         if (isEditMode()) return;
         item.classList.add('sp-playlist-item--pressed');
@@ -1047,7 +1178,9 @@ function renderSpotifyPlaylists(ctrl) {
       item.addEventListener('pointerup', () => {
         item.classList.remove('sp-playlist-item--pressed');
         if (isEditMode()) return;
-        _recentPlaylistIds = [pl.id, ..._recentPlaylistIds.filter(x => x !== pl.id)].slice(0, 100);
+        if (!pl.isLikedSongs) {
+          _recentPlaylistIds = [pl.id, ..._recentPlaylistIds.filter(x => x !== pl.id)].slice(0, 100);
+        }
         _openDetail(pl);
       });
       item.addEventListener('pointercancel', () => item.classList.remove('sp-playlist-item--pressed'));
@@ -1055,16 +1188,85 @@ function renderSpotifyPlaylists(ctrl) {
     });
   }
 
+  // ---- BPM filter helpers ----
+  function _getBpmLabel(bpm) {
+    if (!bpm) return 'other';
+    if (bpm < 90)  return 'slow';
+    if (bpm < 130) return 'mid';
+    return 'fast';
+  }
+
+  function _renderDetailHeader() {
+    // Only show filter row if we have some audio features loaded
+    const hasFeatures = Object.keys(_trackFeatures).length > 0;
+    let filterEl = detailView.querySelector('.sp-pl-bpm-filter');
+    if (!hasFeatures) { if (filterEl) filterEl.remove(); return; }
+    if (!filterEl) {
+      filterEl = document.createElement('div');
+      filterEl.className = 'sp-pl-bpm-filter';
+      // Insert between header and track list
+      detailTracks.parentNode.insertBefore(filterEl, detailTracks);
+    }
+    const filters = [
+      { key: 'all', label: 'All' },
+      { key: 'slow', label: '🐢 Slow (<90)' },
+      { key: 'mid',  label: '🚶 Mid (90–130)' },
+      { key: 'fast', label: '🔥 Fast (>130)' },
+    ];
+    filterEl.innerHTML = filters.map(f =>
+      `<button class="sp-bpm-btn${_bpmFilter === f.key ? ' active' : ''}" data-bpm="${f.key}">${f.label}</button>`
+    ).join('');
+    filterEl.querySelectorAll('.sp-bpm-btn').forEach(btn => {
+      btn.addEventListener('pointerup', () => {
+        _bpmFilter = btn.dataset.bpm;
+        _renderDetailHeader();
+        _renderTracksFiltered();
+      });
+    });
+  }
+
+  function _renderTracksFiltered() {
+    if (_bpmFilter === 'all') {
+      _renderTracks(_currentDetailTracks);
+      return;
+    }
+    const filtered = _currentDetailTracks.filter(t => {
+      const f = _trackFeatures[t.id];
+      return f ? _getBpmLabel(f.bpm) === _bpmFilter : false;
+    });
+    _renderTracks(filtered);
+  }
+
   // ---- Detail: open ----
   function _openDetail(playlist) {
     _selectedPlaylist = playlist;
+    _trackFeatures = {};
+    _bpmFilter = 'all';
     detailName.textContent = playlist.name;
     detailTracks.innerHTML = '<div class="sp-loading">Loading tracks…</div>';
     gridView.style.display = 'none';
     detailView.style.removeProperty('display');
 
-    getSpotifyPlaylistTracks(playlist.id)
-      .then((data) => _renderTracks(data.tracks || []))
+    const loadPromise = playlist.isLikedSongs
+      ? getSpotifyLikedSongs({ limit: 50 }).then((data) => data.tracks || [])
+      : getSpotifyPlaylistTracks(playlist.id).then((data) => data.tracks || []);
+
+    loadPromise
+      .then((tracks) => {
+        _currentDetailTracks = tracks;
+        _renderDetailHeader();
+        _renderTracks(tracks);
+        // Fetch audio features in background
+        const ids = tracks.map(t => t.id).filter(Boolean);
+        if (ids.length) {
+          getSpotifyBatchAudioFeatures(ids).then((data) => {
+            const features = (data && data.features) ? data.features : [];
+            features.forEach((f) => { if (f && f.trackId) _trackFeatures[f.trackId] = f; });
+            _renderDetailHeader(); // re-render filter bar now that features are loaded
+            _renderTracksFiltered();
+          }).catch(() => {});
+        }
+      })
       .catch(() => {
         detailTracks.innerHTML = '<div class="sp-queue-empty">Could not load tracks</div>';
       });
@@ -1073,6 +1275,10 @@ function renderSpotifyPlaylists(ctrl) {
   // ---- Detail: close ----
   function _closeDetail() {
     _selectedPlaylist = null;
+    _currentDetailTracks = [];
+    _trackFeatures = {};
+    _bpmFilter = 'all';
+    detailView.querySelector('.sp-pl-bpm-filter')?.remove();
     detailView.style.display = 'none';
     gridView.style.removeProperty('display');
   }
@@ -1097,7 +1303,7 @@ function renderSpotifyPlaylists(ctrl) {
       `;
       row.addEventListener('pointerup', () => {
         if (isEditMode()) return;
-        // Play the playlist starting from this specific track
+        // Play the playlist/collection starting from this specific track
         spotifyCmd('play', { contextUri: _selectedPlaylist.uri, offsetUri: track.uri });
       });
       detailTracks.appendChild(row);
@@ -1120,6 +1326,7 @@ function renderSpotifyPlaylists(ctrl) {
     const btn = e.target.closest('.sp-sort-btn');
     if (!btn) return;
     _sortMode = btn.dataset.sort;
+    localStorage.setItem('sp-playlists-sort', _sortMode);
     sortBar.querySelectorAll('.sp-sort-btn').forEach(b => b.classList.toggle('active', b === btn));
     _renderGrid();
   });
@@ -1239,6 +1446,203 @@ function renderSpotifyQueue(ctrl) {
 }
 
 // ---------------------------------------------------------------------------
+// 5. Spotify Stats Card
+// ---------------------------------------------------------------------------
+
+let _statsCardUpdaters = new Set();
+
+export function updateSpotifyStats(data) {
+  _statsCardUpdaters.forEach((fn) => fn(data));
+}
+
+function fmtDuration(ms) {
+  if (!ms || ms < 0) return '0m';
+  const totalMin = Math.floor(ms / 60000);
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+function fmtTime(ts) {
+  if (!ts) return '—';
+  return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function renderSpotifyStats(ctrl) {
+  const card = document.createElement('div');
+  card.className = 'control-card spotify-stats-card';
+  card.dataset.id = ctrl.id;
+  applyGridPlacement(card, ctrl);
+
+  // Default playlist name: "Session · 3 Jun 2026"
+  const _defaultName = () =>
+    `Session · ${new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}`;
+
+  card.innerHTML = `
+    <div class="sp-stats-wrap">
+      <div class="sp-section-header">
+        <span class="sp-section-title">Session</span>
+        <span class="sp-stats-since"></span>
+      </div>
+      <div class="sp-stats-grid">
+        <div class="sp-stat-tile">
+          <div class="sp-stat-value sp-stat-tracks">—</div>
+          <div class="sp-stat-label">Tracks</div>
+        </div>
+        <div class="sp-stat-tile">
+          <div class="sp-stat-value sp-stat-time">—</div>
+          <div class="sp-stat-label">Listened</div>
+        </div>
+      </div>
+      <div class="sp-stats-artists">
+        <div class="sp-stats-artists-title">Top Artists</div>
+        <div class="sp-stats-artists-list"></div>
+      </div>
+      <div class="sp-stats-recent">
+        <div class="sp-stats-recent-title">Recently Played</div>
+        <div class="sp-stats-recent-list"></div>
+      </div>
+      <!-- Save as playlist -->
+      <div class="sp-save-session">
+        <button class="sp-save-session-btn">💾 Save as Playlist</button>
+        <div class="sp-save-session-form" style="display:none">
+          <input class="sp-save-session-input" type="text" placeholder="Playlist name…" maxlength="100">
+          <div class="sp-save-session-actions">
+            <button class="sp-save-session-confirm">Save</button>
+            <button class="sp-save-session-cancel">Cancel</button>
+          </div>
+        </div>
+        <div class="sp-save-session-feedback" style="display:none"></div>
+      </div>
+    </div>
+  `;
+
+  card.appendChild(dragHandle());
+  card.appendChild(resizeHandle());
+  card.appendChild(editOverlay(ctrl.id));
+
+  const sinceEl       = card.querySelector('.sp-stats-since');
+  const tracksEl      = card.querySelector('.sp-stat-tracks');
+  const timeEl        = card.querySelector('.sp-stat-time');
+  const artistsList   = card.querySelector('.sp-stats-artists-list');
+  const recentList    = card.querySelector('.sp-stats-recent-list');
+  const saveBtn       = card.querySelector('.sp-save-session-btn');
+  const saveForm      = card.querySelector('.sp-save-session-form');
+  const saveInput     = card.querySelector('.sp-save-session-input');
+  const saveConfirm   = card.querySelector('.sp-save-session-confirm');
+  const saveCancel    = card.querySelector('.sp-save-session-cancel');
+  const saveFeedback  = card.querySelector('.sp-save-session-feedback');
+
+  function _showSaveForm() {
+    saveBtn.style.display = 'none';
+    saveFeedback.style.display = 'none';
+    saveInput.value = _defaultName();
+    saveForm.style.display = 'flex';
+    saveInput.focus();
+    saveInput.select();
+  }
+
+  function _hideSaveForm() {
+    saveForm.style.display = 'none';
+    saveBtn.style.display = '';
+  }
+
+  function _showFeedback(msg, isError = false) {
+    saveFeedback.textContent = msg;
+    saveFeedback.className = 'sp-save-session-feedback' + (isError ? ' sp-save-error' : ' sp-save-success');
+    saveFeedback.style.display = '';
+    // Auto-hide after 4 s
+    clearTimeout(saveFeedback._timer);
+    saveFeedback._timer = setTimeout(() => {
+      saveFeedback.style.display = 'none';
+      saveBtn.style.display = '';
+    }, 4000);
+  }
+
+  saveBtn.addEventListener('pointerup', () => {
+    if (isEditMode()) return;
+    _showSaveForm();
+  });
+
+  saveCancel.addEventListener('pointerup', () => _hideSaveForm());
+
+  saveInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') saveConfirm.click();
+    if (e.key === 'Escape') _hideSaveForm();
+  });
+
+  saveConfirm.addEventListener('pointerup', async () => {
+    if (isEditMode()) return;
+    const name = saveInput.value.trim() || _defaultName();
+    saveConfirm.disabled = true;
+    saveConfirm.textContent = 'Saving…';
+    saveForm.style.display = 'none';
+    saveFeedback.style.display = 'none';
+
+    const result = await saveSessionAsPlaylist(name);
+    saveConfirm.disabled = false;
+    saveConfirm.textContent = 'Save';
+
+    if (result && result.success) {
+      _showFeedback(`✓ "${result.name}" saved — ${result.trackCount} tracks`);
+    } else {
+      _showFeedback(`✗ ${result?.error || 'Unknown error'}`, true);
+    }
+  });
+
+  function _render(data) {
+    if (!data) return;
+    sinceEl.textContent = `since ${fmtTime(data.startTime)}`;
+    tracksEl.textContent = data.tracksCount ?? 0;
+    timeEl.textContent = fmtDuration(data.totalMs);
+
+    artistsList.innerHTML = '';
+    const artists = (data.topArtists || []).slice(0, 5);
+    const maxCount = artists.length ? artists[0].count : 1;
+    artists.forEach(({ name, count }) => {
+      const row = document.createElement('div');
+      row.className = 'sp-artist-row';
+      const pct = Math.round((count / maxCount) * 100);
+      row.innerHTML = `
+        <div class="sp-artist-bar-wrap">
+          <div class="sp-artist-bar" style="width:${pct}%"></div>
+        </div>
+        <span class="sp-artist-name">${_esc(name)}</span>
+        <span class="sp-artist-count">${count}</span>
+      `;
+      artistsList.appendChild(row);
+    });
+    if (!artists.length) artistsList.innerHTML = '<div class="sp-queue-empty">No data yet</div>';
+
+    recentList.innerHTML = '';
+    (data.recentTracks || []).forEach(({ title, artist }) => {
+      const row = document.createElement('div');
+      row.className = 'sp-recent-row';
+      row.innerHTML = `
+        <div class="sp-recent-title">${_esc(title)}</div>
+        <div class="sp-recent-artist">${_esc(artist)}</div>
+      `;
+      recentList.appendChild(row);
+    });
+    if (!data.recentTracks || !data.recentTracks.length) recentList.innerHTML = '<div class="sp-queue-empty">No data yet</div>';
+  }
+
+  _statsCardUpdaters.add(_render);
+
+  const observer = new MutationObserver(() => {
+    if (!document.contains(card)) {
+      _statsCardUpdaters.delete(_render);
+      observer.disconnect();
+    }
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+
+  getSpotifyStats().then(_render);
+
+  return card;
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch export
 // ---------------------------------------------------------------------------
 
@@ -1248,6 +1652,7 @@ export function renderSpotifyControl(ctrl) {
     case 'spotify_search':    return renderSpotifySearch(ctrl);
     case 'spotify_playlists': return renderSpotifyPlaylists(ctrl);
     case 'spotify_queue':     return renderSpotifyQueue(ctrl);
+    case 'spotify_stats':     return renderSpotifyStats(ctrl);
     default:
       console.warn('[spotify-controls] Unknown control type:', ctrl.type);
       return null;

@@ -59,6 +59,63 @@ export function getSpotifyPlaylistTracks(playlistId) {
 }
 
 /**
+ * Request liked songs. Resolves with { tracks } when server responds.
+ * @param {object} [opts]
+ * @param {number} [opts.limit=50]
+ * @param {number} [opts.offset=0]
+ */
+export function getSpotifyLikedSongs(opts = {}) {
+  return new Promise((resolve) => {
+    socket.once('spotify:liked_songs', resolve);
+    socket.emit('spotify:get_liked_songs', opts);
+  });
+}
+
+/**
+ * Request audio features for one track. Resolves with serialized features object.
+ * @param {string} trackId
+ */
+export function getSpotifyAudioFeatures(trackId) {
+  return new Promise((resolve) => {
+    socket.once('spotify:audio_features', resolve);
+    socket.emit('spotify:get_audio_features', { trackId });
+  });
+}
+
+/**
+ * Request audio features for multiple tracks. Resolves with { features: [...] }.
+ * @param {string[]} trackIds
+ */
+export function getSpotifyBatchAudioFeatures(trackIds) {
+  return new Promise((resolve) => {
+    socket.once('spotify:batch_audio_features', resolve);
+    socket.emit('spotify:get_batch_audio_features', { trackIds });
+  });
+}
+
+/**
+ * Request listening session stats. Resolves with stats object.
+ */
+export function getSpotifyStats() {
+  return new Promise((resolve) => {
+    socket.once('spotify:stats', resolve);
+    socket.emit('spotify:get_stats');
+  });
+}
+
+/**
+ * Save the current session's tracks as a new private Spotify playlist.
+ * Resolves with { success, name, playlistId, url, trackCount } or { error }.
+ * @param {string} [name]  Optional playlist name; auto-generated if omitted.
+ */
+export function saveSessionAsPlaylist(name) {
+  return new Promise((resolve) => {
+    socket.once('spotify:session_playlist_saved', resolve);
+    socket.emit('spotify:save_session_playlist', { name });
+  });
+}
+
+/**
  * Request playback queue. Resolves with { items } when server responds.
  */
 export function getSpotifyQueue() {

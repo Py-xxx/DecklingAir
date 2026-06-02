@@ -8,7 +8,7 @@ import {
   updateSoundboardDeviceList,
   updateSpotifySettingsStatus,
 } from './editor.js';
-import { updateSpotifyPlaylists, updateSpotifyQueue } from './spotify-controls.js';
+import { updateSpotifyPlaylists, updateSpotifyQueue, updateSpotifyStats } from './spotify-controls.js';
 
 const DEFAULT_DEVICE_LAYOUT = {
   name: 'Primary Device',
@@ -207,6 +207,9 @@ initSocket({
   },
   onSpotifyQueue(data) {
     updateSpotifyQueue(data);
+  },
+  onSpotifyStats(data) {
+    updateSpotifyStats(data);
   },
   onSpotifyToast(msg) {
     showSpotifyToast(typeof msg === 'string' ? msg : (msg?.message || ''));

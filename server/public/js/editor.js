@@ -17,6 +17,7 @@ const DEFAULT_SIZES = {
   spotify_search:    [3, 3],
   spotify_playlists: [3, 4],
   spotify_queue:     [2, 3],
+  spotify_stats:     [2, 4],
 };
 
 const VM_ONLY_TYPES = new Set([
@@ -416,6 +417,7 @@ function showConfigSection(type) {
     spotify_search:    'cfg-spotify-search',
     spotify_playlists: 'cfg-spotify-playlists',
     spotify_queue:     'cfg-spotify-queue',
+    spotify_stats:     'cfg-spotify-stats',
   };
 
   const sectionId = sectionMap[type];
@@ -499,6 +501,8 @@ function populateModal(control) {
   if (control.type === 'spotify_playlists') {
     const colsEl = document.getElementById('cfg-spotify-pl-cols');
     if (colsEl) colsEl.value = String(config.columns || 3);
+    const specialEl = document.getElementById('cfg-spotify-pl-special');
+    if (specialEl) specialEl.checked = !!config.showSpecialPlaylists;
   }
 }
 
@@ -667,9 +671,11 @@ function buildControlConfig(type) {
   if (type === 'spotify_player') return { label: label || 'Player' };
   if (type === 'spotify_search') return { label: label || 'Search' };
   if (type === 'spotify_queue')  return { label: label || 'Queue' };
+  if (type === 'spotify_stats')  return { label: label || 'Session Stats' };
   if (type === 'spotify_playlists') {
     const columns = Number.parseInt(document.getElementById('cfg-spotify-pl-cols')?.value, 10) || 3;
-    return { label: label || 'Playlists', columns };
+    const showSpecialPlaylists = document.getElementById('cfg-spotify-pl-special')?.checked ?? false;
+    return { label: label || 'Playlists', columns, showSpecialPlaylists };
   }
 
   return null;

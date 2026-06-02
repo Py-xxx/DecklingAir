@@ -151,6 +151,10 @@
               <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h10"/><polygon points="19 15 22 18 19 21" fill="currentColor"/></svg>
               Sp Queue
             </button>
+            <button class="type-card" data-type="spotify_stats">
+              <span class="type-card-icon">📊</span>
+              <span class="type-card-label">Spotify Stats</span>
+            </button>
           </div>
         </div>
 
@@ -321,12 +325,26 @@
                 </select>
               </div>
             </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label" style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:normal">
+                  <input type="checkbox" id="cfg-spotify-pl-special">
+                  Show Liked Songs
+                </label>
+                <span class="form-hint">Adds a "Liked Songs" entry at the top of the grid.</span>
+              </div>
+            </div>
             <p class="cfg-note">Shows your Spotify playlists as a grid. Tap any playlist to start playing it with smart shuffle.</p>
           </div>
 
           <!-- Spotify Queue config -->
           <div id="cfg-spotify-queue" class="cfg-section" style="display:none">
             <p class="cfg-note">Shows the upcoming tracks in the playback queue. Includes a refresh button.</p>
+          </div>
+
+          <!-- Spotify Stats config -->
+          <div id="cfg-spotify-stats" class="cfg-section" style="display:none">
+            <p class="cfg-note">Shows live session stats: tracks played, listening time, top artists, and recently played tracks. Updates automatically as songs change.</p>
           </div>
 
           <!-- Soundboard config -->

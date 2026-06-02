@@ -57,6 +57,10 @@ let _autoplayEnabled = false;
 let _smartShuffleEnabled = false;
 let _userProfile = null;
 let _userId = null;
+let _sessionStats = {
+  startTime: Date.now(),
+  tracksPlayed: [], // { id, title, artist, startTime, durationMs }
+};
 
 // ---------------------------------------------------------------------------
 // Config / token storage
@@ -400,6 +404,44 @@ async function getPlaylistTracks(playlistId, limit = 100) {
   });
 }
 
+// In-memory cache so we don't re-fetch features for the same track
+const _audioFeaturesCache = new Map();
+
+async function getAudioFeatures(trackId) {
+  if (_audioFeaturesCache.has(trackId)) return _audioFeaturesCache.get(trackId);
+  const data = await api('GET', `/audio-features/${trackId}`);
+  if (data && data.tempo != null) _audioFeaturesCache.set(trackId, data);
+  return data;
+}
+
+async function getBatchAudioFeatures(trackIds) {
+  if (!trackIds || !trackIds.length) return [];
+  const toFetch = trackIds.filter(id => !_audioFeaturesCache.has(id));
+  if (toFetch.length) {
+    try {
+      const ids = toFetch.slice(0, 100).join(',');
+      const data = await api('GET', '/audio-features', { params: { ids } });
+      const features = (data && data.audio_features) ? data.audio_features : [];
+      features.forEach(f => { if (f && f.id) _audioFeaturesCache.set(f.id, f); });
+    } catch (err) {
+      console.error('[Spotify] Batch audio features error:', err.message);
+    }
+  }
+  return trackIds.map(id => _audioFeaturesCache.get(id) || null);
+}
+
+async function getLikedSongTracks(limit = 50, offset = 0) {
+  // Feb 2026: /me/tracks → /me/library/items?type=track
+  // Fall back to the old endpoint if the new one returns an unexpected structure
+  try {
+    const data = await api('GET', '/me/library/items', { params: { type: 'track', limit, offset } });
+    if (data && data.items) return data;
+  } catch {
+    // new endpoint failed — try legacy
+  }
+  return api('GET', '/me/tracks', { params: { limit, offset } });
+}
+
 async function getDevices() {
   return api('GET', '/me/player/devices');
 }
@@ -434,6 +476,12 @@ async function unlikeTrack(trackUri) {
 async function addTracksToPlaylist(playlistId, uris) {
   // Feb 2026: POST /playlists/{id}/tracks → POST /playlists/{id}/items
   return api('POST', `/playlists/${playlistId}/items`, { body: { uris } });
+}
+
+async function createPlaylist(userId, name, description = '') {
+  return api('POST', `/users/${userId}/playlists`, {
+    body: { name, description, public: false },
+  });
 }
 
 async function getRecommendations({ seedTracks = [], seedArtists = [], limit = 5 } = {}) {
@@ -605,6 +653,49 @@ async function emitQueue() {
 }
 
 // ---------------------------------------------------------------------------
+// Audio features serialization
+// ---------------------------------------------------------------------------
+
+const PITCH_CLASSES = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B'];
+
+function _serializeFeatures(f) {
+  if (!f) return null;
+  return {
+    trackId: f.id,
+    bpm: Math.round(f.tempo || 0),
+    key: f.key != null && f.key >= 0 ? PITCH_CLASSES[f.key] : null,
+    mode: f.mode === 1 ? 'Maj' : f.mode === 0 ? 'Min' : null,
+    energy: f.energy != null ? Math.round(f.energy * 100) : null,
+    danceability: f.danceability != null ? Math.round(f.danceability * 100) : null,
+    valence: f.valence != null ? Math.round(f.valence * 100) : null,
+  };
+}
+
+function buildStats() {
+  const tracks = _sessionStats.tracksPlayed;
+  const totalMs = tracks.reduce((sum, t) => sum + (t.durationMs || 0), 0);
+  const artistCounts = {};
+  tracks.forEach((t) => {
+    if (t.artist) {
+      t.artist.split(', ').forEach((a) => {
+        if (a) artistCounts[a] = (artistCounts[a] || 0) + 1;
+      });
+    }
+  });
+  const topArtists = Object.entries(artistCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([name, count]) => ({ name, count }));
+  return {
+    startTime: _sessionStats.startTime,
+    tracksCount: tracks.length,
+    totalMs,
+    topArtists,
+    recentTracks: tracks.slice(-5).reverse().map(({ id, title, artist }) => ({ id, title, artist })),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Polling
 // ---------------------------------------------------------------------------
 
@@ -621,6 +712,22 @@ async function poll() {
         // Broadcast fresh queue ~1.5 s after track change so Spotify's queue
         // endpoint has time to reflect the new state.
         setTimeout(emitQueue, 1500);
+        // Record to session stats
+        if (state.track) {
+          _sessionStats.tracksPlayed.push({
+            id: state.track.id,
+            uri: state.track.uri,
+            title: state.track.title,
+            artist: state.track.artist,
+            startTime: Date.now(),
+            durationMs: state.track.duration,
+          });
+          if (_io) _io.emit('spotify:stats', buildStats());
+        }
+        // Fetch and broadcast audio features for the new track
+        getAudioFeatures(state.track.id)
+          .then((f) => { if (f && _io) _io.emit('spotify:audio_features', _serializeFeatures(f)); })
+          .catch(() => {});
       }
 
       // Check liked status for new track
@@ -637,6 +744,12 @@ async function poll() {
           maybeQueueRecommendations(state).catch((err) =>
             console.error('[Spotify] Autoplay error:', err.message)
           );
+        }
+        // Emit audio features on first track load too (not just track changes)
+        if (!_lastTrackId) {
+          getAudioFeatures(state.track.id)
+            .then((f) => { if (f && _io) _io.emit('spotify:audio_features', _serializeFeatures(f)); })
+            .catch(() => {});
         }
       } else if (_lastState) {
         state.liked = _lastState.liked;
@@ -927,6 +1040,109 @@ function init(io) {
       } catch (err) {
         console.error('[Spotify] Get playlist tracks error:', err.message);
         socket.emit('spotify:error', { message: err.message });
+      }
+    });
+
+    // ----- spotify:get_liked_songs -----
+    socket.on('spotify:get_liked_songs', async ({ limit = 50, offset = 0 } = {}) => {
+      try {
+        const data = await getLikedSongTracks(limit, offset);
+        const tracks =
+          data && data.items
+            ? data.items
+                // Feb 2026: response field renamed track → item; keep both for safety
+                .map((entry) => entry.item || entry.track)
+                .filter((t) => t && t.id)
+                .map((t) => ({
+                  id: t.id,
+                  uri: t.uri,
+                  title: t.name,
+                  artist: t.artists ? t.artists.map((a) => a.name).join(', ') : '',
+                  duration: t.duration_ms,
+                }))
+            : [];
+        socket.emit('spotify:liked_songs', { tracks });
+      } catch (err) {
+        console.error('[Spotify] Get liked songs error:', err.message);
+        socket.emit('spotify:error', { message: err.message });
+      }
+    });
+
+    // ----- spotify:get_audio_features -----
+    socket.on('spotify:get_audio_features', async ({ trackId } = {}) => {
+      if (!trackId) return;
+      try {
+        const f = await getAudioFeatures(trackId);
+        socket.emit('spotify:audio_features', _serializeFeatures(f));
+      } catch (err) {
+        console.error('[Spotify] Audio features error:', err.message);
+        socket.emit('spotify:audio_features', null);
+      }
+    });
+
+    // ----- spotify:get_batch_audio_features -----
+    socket.on('spotify:get_batch_audio_features', async ({ trackIds } = {}) => {
+      if (!trackIds || !trackIds.length) return;
+      try {
+        const features = await getBatchAudioFeatures(trackIds);
+        socket.emit('spotify:batch_audio_features', {
+          features: features.map((f) => _serializeFeatures(f)),
+        });
+      } catch (err) {
+        console.error('[Spotify] Batch audio features error:', err.message);
+        socket.emit('spotify:batch_audio_features', { features: [] });
+      }
+    });
+
+    // ----- spotify:get_stats -----
+    socket.on('spotify:get_stats', () => {
+      socket.emit('spotify:stats', buildStats());
+    });
+
+    // ----- spotify:save_session_playlist -----
+    socket.on('spotify:save_session_playlist', async ({ name } = {}) => {
+      try {
+        if (!_userId) await getUserProfile();
+
+        const tracks = _sessionStats.tracksPlayed;
+        if (!tracks.length) {
+          socket.emit('spotify:session_playlist_saved', { error: 'No tracks in this session yet.' });
+          return;
+        }
+
+        // Deduplicate URIs while preserving play order
+        const seen = new Set();
+        const uris = [];
+        for (const t of tracks) {
+          if (t.uri && !seen.has(t.uri)) {
+            seen.add(t.uri);
+            uris.push(t.uri);
+          }
+        }
+
+        const playlistName = name && name.trim()
+          ? name.trim()
+          : `Session · ${new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}`;
+
+        const description = `${uris.length} track${uris.length !== 1 ? 's' : ''} · Saved from VoiceMeeter Control Panel`;
+
+        const playlist = await createPlaylist(_userId, playlistName, description);
+
+        // Add in batches of 100 (Spotify limit)
+        for (let i = 0; i < uris.length; i += 100) {
+          await addTracksToPlaylist(playlist.id, uris.slice(i, i + 100));
+        }
+
+        socket.emit('spotify:session_playlist_saved', {
+          success: true,
+          name: playlistName,
+          playlistId: playlist.id,
+          url: `https://open.spotify.com/playlist/${playlist.id}`,
+          trackCount: uris.length,
+        });
+      } catch (err) {
+        console.error('[Spotify] Save session playlist error:', err.message);
+        socket.emit('spotify:session_playlist_saved', { error: err.message });
       }
     });
 
