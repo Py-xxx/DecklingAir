@@ -718,12 +718,13 @@ function renderSpotifyPlayer(ctrl) {
         `Remove "${_currentTrack.title}" from your liked songs?`,
         () => {
           _setHeartState(false);
-          spotifyCmd('unlike', { trackId: _currentTrack.id });
+          // Feb 2026: API now needs the full Spotify URI (spotify:track:...) not the bare ID
+          spotifyCmd('unlike', { trackUri: _currentTrack.uri });
         }
       );
     } else {
       _setHeartState(true);
-      spotifyCmd('like', { trackId: _currentTrack.id });
+      spotifyCmd('like', { trackUri: _currentTrack.uri });
     }
   });
 

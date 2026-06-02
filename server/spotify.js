@@ -25,6 +25,7 @@ const SCOPES = [
   'playlist-modify-private',
   'user-library-read',
   'user-library-modify',
+  'user-follow-read',        // required by GET /me/library/contains (Feb 2026 API)
   'user-read-recently-played',
   'user-top-read',
 ].join(' ');
@@ -33,6 +34,8 @@ const SCOPES = [
 // needs to disconnect and reconnect to get a fresh authorisation.
 const REQUIRED_SCOPES = [
   'user-library-modify',
+  'user-library-read',
+  'user-follow-read',
   'playlist-modify-public',
   'playlist-modify-private',
   'user-read-private',
@@ -387,11 +390,12 @@ async function getPlaylists(limit = 50) {
   return api('GET', '/me/playlists', { params: { limit } });
 }
 
-async function getPlaylistTracks(playlistId, limit = 50) {
-  return api('GET', `/playlists/${playlistId}/tracks`, {
+async function getPlaylistTracks(playlistId, limit = 100) {
+  // Feb 2026: /tracks → /items; response field track → item
+  return api('GET', `/playlists/${playlistId}/items`, {
     params: {
       limit,
-      fields: 'items(track(id,uri,name,duration_ms,artists(id,name),album(name,images)))',
+      fields: 'items(item(id,uri,name,duration_ms,artists(id,name),album(name,images)))',
     },
   });
 }
@@ -400,29 +404,36 @@ async function getDevices() {
   return api('GET', '/me/player/devices');
 }
 
-async function search(query, types = 'track', limit = 20) {
-  return api('GET', '/search', { params: { q: query, type: types, limit: String(limit) } });
+async function search(query, types = 'track', limit = 10) {
+  // Feb 2026: search limit reduced from max 50 to max 10
+  const safeLimit = Math.min(limit, 10);
+  return api('GET', '/search', { params: { q: query, type: types, limit: String(safeLimit) } });
 }
 
 async function getQueue() {
   return api('GET', '/me/player/queue');
 }
 
-async function checkLiked(trackIds) {
-  if (!trackIds || trackIds.length === 0) return [];
-  return api('GET', '/me/tracks/contains', { params: { ids: trackIds.join(',') } });
+async function checkLiked(trackUris) {
+  // Feb 2026: GET /me/tracks/contains → GET /me/library/contains
+  // Now takes Spotify URIs (spotify:track:...) not bare IDs
+  if (!trackUris || trackUris.length === 0) return [];
+  return api('GET', '/me/library/contains', { params: { uris: trackUris.join(',') } });
 }
 
-async function likeTrack(trackId) {
-  return api('PUT', '/me/tracks', { body: { ids: [trackId] } });
+async function likeTrack(trackUri) {
+  // Feb 2026: PUT /me/tracks {ids:[...]} → PUT /me/library?uris=spotify:track:...
+  return api('PUT', '/me/library', { params: { uris: trackUri } });
 }
 
-async function unlikeTrack(trackId) {
-  return api('DELETE', '/me/tracks', { body: { ids: [trackId] } });
+async function unlikeTrack(trackUri) {
+  // Feb 2026: DELETE /me/tracks {ids:[...]} → DELETE /me/library?uris=spotify:track:...
+  return api('DELETE', '/me/library', { params: { uris: trackUri } });
 }
 
 async function addTracksToPlaylist(playlistId, uris) {
-  return api('POST', `/playlists/${playlistId}/tracks`, { body: { uris } });
+  // Feb 2026: POST /playlists/{id}/tracks → POST /playlists/{id}/items
+  return api('POST', `/playlists/${playlistId}/items`, { body: { uris } });
 }
 
 async function getRecommendations({ seedTracks = [], seedArtists = [], limit = 5 } = {}) {
@@ -613,9 +624,10 @@ async function poll() {
       }
 
       // Check liked status for new track
+      // Feb 2026: checkLiked now takes Spotify URIs (spotify:track:...) not bare IDs
       if (!_lastTrackId || _lastTrackId !== state.track.id) {
         try {
-          const liked = await checkLiked([state.track.id]);
+          const liked = await checkLiked([state.track.uri]);
           state.liked = Array.isArray(liked) ? liked[0] : false;
         } catch {
           state.liked = false;
@@ -670,7 +682,8 @@ async function playPlaylistWithSmartShuffle(playlistUri, playlistId) {
     try {
       const tracksData = await getPlaylistTracks(playlistId, 50);
       const items = (tracksData && tracksData.items) ? tracksData.items : [];
-      const tracks = items.map((i) => i.track).filter(Boolean);
+      // Feb 2026: response field renamed track → item
+      const tracks = items.map((i) => i.item || i.track).filter(Boolean);
 
       // Pick 3 random tracks as seeds
       const shuffled = tracks.sort(() => Math.random() - 0.5);
@@ -785,7 +798,8 @@ function init(io) {
             break;
 
           case 'like':
-            await likeTrack(args.trackId);
+            // Feb 2026: now takes URI (spotify:track:...) not bare ID
+            await likeTrack(args.trackUri);
             if (_lastState) {
               _lastState.liked = true;
               _io.emit('spotify:state', _lastState);
@@ -793,7 +807,7 @@ function init(io) {
             break;
 
           case 'unlike':
-            await unlikeTrack(args.trackId);
+            await unlikeTrack(args.trackUri);
             if (_lastState) {
               _lastState.liked = false;
               _io.emit('spotify:state', _lastState);
@@ -832,7 +846,7 @@ function init(io) {
     // ----- spotify:search -----
     socket.on('spotify:search', async ({ query } = {}) => {
       try {
-        const results = await search(query, 'track', 20);
+        const results = await search(query, 'track', 10);
         const tracks =
           results && results.tracks && results.tracks.items
             ? results.tracks.items.map((t) => ({
@@ -898,15 +912,15 @@ function init(io) {
         const tracks =
           data && data.items
             ? data.items
-                .filter((item) => item.track && item.track.id)
-                .map((item) => ({
-                  id: item.track.id,
-                  uri: item.track.uri,
-                  title: item.track.name,
-                  artist: item.track.artists
-                    ? item.track.artists.map((a) => a.name).join(', ')
-                    : '',
-                  duration: item.track.duration_ms,
+                // Feb 2026: response field renamed track → item; fall back for safety
+                .map((entry) => entry.item || entry.track)
+                .filter((t) => t && t.id)
+                .map((t) => ({
+                  id: t.id,
+                  uri: t.uri,
+                  title: t.name,
+                  artist: t.artists ? t.artists.map((a) => a.name).join(', ') : '',
+                  duration: t.duration_ms,
                 }))
             : [];
         socket.emit('spotify:playlist_tracks', { playlistId, tracks });
