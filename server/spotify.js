@@ -409,9 +409,18 @@ const _audioFeaturesCache = new Map();
 
 async function getAudioFeatures(trackId) {
   if (_audioFeaturesCache.has(trackId)) return _audioFeaturesCache.get(trackId);
-  const data = await api('GET', `/audio-features/${trackId}`);
-  if (data && data.tempo != null) _audioFeaturesCache.set(trackId, data);
-  return data;
+  try {
+    const data = await api('GET', `/audio-features/${trackId}`);
+    if (data && data.tempo != null) {
+      _audioFeaturesCache.set(trackId, data);
+      return data;
+    }
+    console.warn('[Spotify] Audio features: unexpected response for', trackId, data);
+    return null;
+  } catch (err) {
+    console.warn('[Spotify] Audio features unavailable for', trackId, '-', err.message);
+    return null;
+  }
 }
 
 async function getBatchAudioFeatures(trackIds) {
@@ -724,10 +733,13 @@ async function poll() {
           });
           if (_io) _io.emit('spotify:stats', buildStats());
         }
-        // Fetch and broadcast audio features for the new track
+        // Fetch and broadcast audio features for the new track (may be unavailable for newer Spotify apps)
         getAudioFeatures(state.track.id)
-          .then((f) => { if (f && _io) _io.emit('spotify:audio_features', _serializeFeatures(f)); })
-          .catch(() => {});
+          .then((f) => {
+            if (f && _io) _io.emit('spotify:audio_features', _serializeFeatures(f));
+            else if (!f) console.log('[Spotify] No audio features returned — endpoint may be unavailable for this app.');
+          })
+          .catch((err) => console.warn('[Spotify] Audio features fetch error:', err.message));
       }
 
       // Check liked status for new track
