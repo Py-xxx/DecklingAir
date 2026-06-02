@@ -37,11 +37,24 @@ export function spotifySearch(query) {
 
 /**
  * Request playlist list. Resolves with { items } when server responds.
+ * @param {object} [opts]
+ * @param {boolean} [opts.ownedOnly=false]  true = only return playlists the user can modify
  */
-export function getSpotifyPlaylists() {
+export function getSpotifyPlaylists(opts = {}) {
   return new Promise((resolve) => {
     socket.once('spotify:playlists', resolve);
-    socket.emit('spotify:get_playlists');
+    socket.emit('spotify:get_playlists', opts);
+  });
+}
+
+/**
+ * Request tracks for a specific playlist. Resolves with { playlistId, tracks }.
+ * @param {string} playlistId
+ */
+export function getSpotifyPlaylistTracks(playlistId) {
+  return new Promise((resolve) => {
+    socket.once('spotify:playlist_tracks', resolve);
+    socket.emit('spotify:get_playlist_tracks', { playlistId });
   });
 }
 

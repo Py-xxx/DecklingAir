@@ -581,6 +581,134 @@
 }
 
 /* =============================================================================
+   3b. PLAYLIST DETAIL VIEW
+   ============================================================================= */
+
+/* Both views fill the wrap area; only one is visible at a time */
+.sp-pl-grid-view,
+.sp-pl-detail-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Detail header: ← | Name | ▶ */
+.sp-pl-detail-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--sp-border);
+  flex-shrink: 0;
+}
+
+.sp-pl-back-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-2, #aaa);
+  display: flex;
+  align-items: center;
+  padding: 4px;
+  border-radius: 4px;
+  flex-shrink: 0;
+  transition: color 0.15s;
+}
+.sp-pl-back-btn:hover { color: var(--text, #fff); }
+
+.sp-pl-detail-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text, #fff);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Small green play circle */
+.sp-pl-detail-play-btn {
+  background: var(--sp-green);
+  border: none;
+  cursor: pointer;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  transition: background 0.15s, transform 0.1s;
+}
+.sp-pl-detail-play-btn:hover  { background: var(--sp-green-hover); }
+.sp-pl-detail-play-btn:active { transform: scale(0.9); }
+.sp-pl-detail-play-btn svg    { width: 16px; height: 16px; }
+
+/* Scrollable track list */
+.sp-pl-detail-tracks {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.1) transparent;
+}
+
+.sp-pl-track-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.1s;
+  flex-shrink: 0;
+}
+.sp-pl-track-row:hover  { background: var(--bg-2, #1e1e1e); }
+.sp-pl-track-row:active { background: rgba(255,255,255,0.06); }
+
+.sp-pl-track-num {
+  width: 18px;
+  text-align: right;
+  font-size: 11px;
+  color: var(--text-3, #888);
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.sp-pl-track-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.sp-pl-track-title {
+  font-size: 12px;
+  color: var(--text, #fff);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sp-pl-track-artist {
+  font-size: 11px;
+  color: var(--text-2, #aaa);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sp-pl-track-dur {
+  font-size: 11px;
+  color: var(--text-3, #888);
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+/* =============================================================================
    4. QUEUE CARD
    ============================================================================= */
 .spotify-queue-card {

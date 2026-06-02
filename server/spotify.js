@@ -564,6 +564,36 @@ async function maybeQueueRecommendations(state) {
 }
 
 // ---------------------------------------------------------------------------
+// Queue broadcast helper
+// ---------------------------------------------------------------------------
+
+// Fetch the current queue from Spotify and broadcast it to all connected clients.
+// Called automatically on track changes and after manual skip/play commands.
+async function emitQueue() {
+  if (!_io) return;
+  try {
+    const data = await getQueue();
+    const items =
+      data && data.queue
+        ? data.queue.slice(0, 30).map((t) => ({
+            id: t.id,
+            uri: t.uri,
+            title: t.name,
+            artist: t.artists ? t.artists.map((a) => a.name).join(', ') : '',
+            albumArt:
+              t.album && t.album.images && t.album.images.length > 0
+                ? t.album.images[0].url
+                : null,
+            duration: t.duration_ms,
+          }))
+        : [];
+    _io.emit('spotify:queue', { items });
+  } catch (err) {
+    console.error('[Spotify] Auto queue emit error:', err.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Polling
 // ---------------------------------------------------------------------------
 
@@ -577,6 +607,9 @@ async function poll() {
 
       if (trackChanged) {
         _autoQueueCount = Math.max(0, _autoQueueCount - 1);
+        // Broadcast fresh queue ~1.5 s after track change so Spotify's queue
+        // endpoint has time to reflect the new state.
+        setTimeout(emitQueue, 1500);
       }
 
       // Check liked status for new track
@@ -705,6 +738,7 @@ function init(io) {
         switch (action) {
           case 'play':
             await play(args);
+            setTimeout(emitQueue, 2000);
             break;
 
           case 'pause':
@@ -718,10 +752,12 @@ function init(io) {
           case 'next':
             await next();
             _autoQueueCount = Math.max(0, _autoQueueCount - 1);
+            setTimeout(emitQueue, 2000);
             break;
 
           case 'prev':
             await prev();
+            setTimeout(emitQueue, 2000);
             break;
 
           case 'seek':
@@ -767,6 +803,7 @@ function init(io) {
           case 'playlist_play':
             _autoQueueCount = 0;
             await playPlaylistWithSmartShuffle(args.playlistUri, args.playlistId);
+            setTimeout(emitQueue, 2000);
             break;
 
           default:
@@ -819,23 +856,22 @@ function init(io) {
     });
 
     // ----- spotify:get_playlists -----
-    socket.on('spotify:get_playlists', async () => {
+    // ownedOnly=true  → filter to playlists the user can modify (for the "add to playlist" picker)
+    // ownedOnly=false → return all playlists (for the playlist browser card)
+    socket.on('spotify:get_playlists', async ({ ownedOnly = false } = {}) => {
       try {
-        // Ensure profile is loaded so we can filter by ownership
         if (!_userId) await getUserProfile();
-        console.log(`[Spotify] get_playlists: userId=${_userId}`);
+        console.log(`[Spotify] get_playlists: userId=${_userId} ownedOnly=${ownedOnly}`);
 
         const data = await getPlaylists(50);
         const playlists =
           data && data.items
             ? data.items
-                // Only include playlists the user owns or can collaborate on.
-                // Followed (non-owned, non-collaborative) playlists return 403
-                // when attempting to add tracks.
                 .filter((p) => {
+                  if (!ownedOnly) return true;
                   const owned = p.owner && p.owner.id === _userId;
                   const allowed = owned || p.collaborative === true;
-                  if (!allowed) console.log(`[Spotify] Excluding playlist "${p.name}" (owner: ${p.owner && p.owner.id})`);
+                  if (!allowed) console.log(`[Spotify] Picker: excluding "${p.name}" (owner: ${p.owner && p.owner.id})`);
                   return allowed;
                 })
                 .map((p) => ({
@@ -851,6 +887,31 @@ function init(io) {
         socket.emit('spotify:playlists', { items: playlists });
       } catch (err) {
         console.error('[Spotify] Get playlists error:', err.message);
+        socket.emit('spotify:error', { message: err.message });
+      }
+    });
+
+    // ----- spotify:get_playlist_tracks -----
+    socket.on('spotify:get_playlist_tracks', async ({ playlistId } = {}) => {
+      try {
+        const data = await getPlaylistTracks(playlistId, 100);
+        const tracks =
+          data && data.items
+            ? data.items
+                .filter((item) => item.track && item.track.id)
+                .map((item) => ({
+                  id: item.track.id,
+                  uri: item.track.uri,
+                  title: item.track.name,
+                  artist: item.track.artists
+                    ? item.track.artists.map((a) => a.name).join(', ')
+                    : '',
+                  duration: item.track.duration_ms,
+                }))
+            : [];
+        socket.emit('spotify:playlist_tracks', { playlistId, tracks });
+      } catch (err) {
+        console.error('[Spotify] Get playlist tracks error:', err.message);
         socket.emit('spotify:error', { message: err.message });
       }
     });

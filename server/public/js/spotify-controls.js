@@ -8,6 +8,7 @@ import {
   spotifyCmd,
   spotifySearch,
   getSpotifyPlaylists,
+  getSpotifyPlaylistTracks,
   getSpotifyQueue,
   getSpotifyDevices,
   addToPlaylist,
@@ -233,6 +234,13 @@ const SVG = {
       xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
     <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
   </svg>`,
+
+  arrowLeft: () => `<svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" stroke-width="2.5" stroke-linecap="round"
+      stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <line x1="19" y1="12" x2="5" y2="12"/>
+    <polyline points="12 19 5 12 12 5"/>
+  </svg>`,
 };
 
 // ---------------------------------------------------------------------------
@@ -320,17 +328,11 @@ function showPlaylistPicker(anchorEl, trackUri) {
     });
   }
 
-  if (_playlists.length) {
-    renderList(_playlists);
-  } else {
-    listEl.innerHTML = '<div class="sp-popover-empty">Loading…</div>';
-    getSpotifyPlaylists().then((data) => {
-      if (data && data.items) {
-        _playlists = data.items;
-        renderList(_playlists);
-      }
-    });
-  }
+  // Always fetch fresh, owned-only list so the picker never shows followed playlists
+  listEl.innerHTML = '<div class="sp-popover-empty">Loading…</div>';
+  getSpotifyPlaylists({ ownedOnly: true }).then((data) => {
+    renderList(data && data.items ? data.items : []);
+  });
 
   _positionPopover(pop, anchorEl);
 
@@ -957,15 +959,30 @@ function renderSpotifyPlaylists(ctrl) {
 
   card.innerHTML = `
     <div class="sp-playlists-wrap">
-      <div class="sp-section-header">
-        <span class="sp-section-title">Playlists</span>
-        <div class="sp-sort-bar">
-          <button class="sp-sort-btn active" data-sort="added">Added</button>
-          <button class="sp-sort-btn" data-sort="name">A–Z</button>
-          <button class="sp-sort-btn" data-sort="recent">Recent</button>
+
+      <!-- Grid view -->
+      <div class="sp-pl-grid-view">
+        <div class="sp-section-header">
+          <span class="sp-section-title">Playlists</span>
+          <div class="sp-sort-bar">
+            <button class="sp-sort-btn active" data-sort="added">Added</button>
+            <button class="sp-sort-btn" data-sort="name">A–Z</button>
+            <button class="sp-sort-btn" data-sort="recent">Recent</button>
+          </div>
         </div>
+        <div class="sp-playlists-grid" style="--sp-pl-cols: ${columns}"></div>
       </div>
-      <div class="sp-playlists-grid" style="--sp-pl-cols: ${columns}"></div>
+
+      <!-- Detail view (hidden until a playlist is clicked) -->
+      <div class="sp-pl-detail-view" style="display:none">
+        <div class="sp-pl-detail-header">
+          <button class="sp-pl-back-btn" aria-label="Back to playlists">${SVG.arrowLeft()}</button>
+          <span class="sp-pl-detail-name"></span>
+          <button class="sp-pl-detail-play-btn" aria-label="Play playlist">${SVG.play()}</button>
+        </div>
+        <div class="sp-pl-detail-tracks"></div>
+      </div>
+
     </div>
   `;
 
@@ -973,12 +990,21 @@ function renderSpotifyPlaylists(ctrl) {
   card.appendChild(resizeHandle());
   card.appendChild(editOverlay(ctrl.id));
 
-  const grid    = card.querySelector('.sp-playlists-grid');
-  const sortBar = card.querySelector('.sp-sort-bar');
+  // ---- Element refs ----
+  const gridView      = card.querySelector('.sp-pl-grid-view');
+  const detailView    = card.querySelector('.sp-pl-detail-view');
+  const grid          = card.querySelector('.sp-playlists-grid');
+  const sortBar       = card.querySelector('.sp-sort-bar');
+  const backBtn       = card.querySelector('.sp-pl-back-btn');
+  const detailName    = card.querySelector('.sp-pl-detail-name');
+  const detailPlayBtn = card.querySelector('.sp-pl-detail-play-btn');
+  const detailTracks  = card.querySelector('.sp-pl-detail-tracks');
 
   let _allItems = [];
   let _sortMode = 'added';
+  let _selectedPlaylist = null;
 
+  // ---- Grid: sorting ----
   function _sorted() {
     const items = [..._allItems];
     if (_sortMode === 'name') {
@@ -993,10 +1019,10 @@ function renderSpotifyPlaylists(ctrl) {
         return ai - bi;
       });
     }
-    // 'added' keeps original API order
     return items;
   }
 
+  // ---- Grid: render ----
   function _renderGrid() {
     grid.innerHTML = '';
     const items = _sorted();
@@ -1021,16 +1047,74 @@ function renderSpotifyPlaylists(ctrl) {
         item.classList.remove('sp-playlist-item--pressed');
         if (isEditMode()) return;
         _recentPlaylistIds = [pl.id, ..._recentPlaylistIds.filter(x => x !== pl.id)].slice(0, 100);
-        spotifyCmd('playlist_play', { playlistUri: pl.uri, playlistId: pl.id });
+        _openDetail(pl);
       });
-      item.addEventListener('pointercancel', () => {
-        item.classList.remove('sp-playlist-item--pressed');
-      });
+      item.addEventListener('pointercancel', () => item.classList.remove('sp-playlist-item--pressed'));
       grid.appendChild(item);
     });
   }
 
-  // Sort bar clicks
+  // ---- Detail: open ----
+  function _openDetail(playlist) {
+    _selectedPlaylist = playlist;
+    detailName.textContent = playlist.name;
+    detailTracks.innerHTML = '<div class="sp-loading">Loading tracks…</div>';
+    gridView.style.display = 'none';
+    detailView.style.removeProperty('display');
+
+    getSpotifyPlaylistTracks(playlist.id)
+      .then((data) => _renderTracks(data.tracks || []))
+      .catch(() => {
+        detailTracks.innerHTML = '<div class="sp-queue-empty">Could not load tracks</div>';
+      });
+  }
+
+  // ---- Detail: close ----
+  function _closeDetail() {
+    _selectedPlaylist = null;
+    detailView.style.display = 'none';
+    gridView.style.removeProperty('display');
+  }
+
+  // ---- Detail: render track list ----
+  function _renderTracks(tracks) {
+    detailTracks.innerHTML = '';
+    if (!tracks.length) {
+      detailTracks.innerHTML = '<div class="sp-queue-empty">No tracks</div>';
+      return;
+    }
+    tracks.forEach((track, i) => {
+      const row = document.createElement('div');
+      row.className = 'sp-pl-track-row';
+      row.innerHTML = `
+        <span class="sp-pl-track-num">${i + 1}</span>
+        <div class="sp-pl-track-info">
+          <div class="sp-pl-track-title">${_esc(track.title)}</div>
+          <div class="sp-pl-track-artist">${_esc(track.artist)}</div>
+        </div>
+        <span class="sp-pl-track-dur">${fmtMs(track.duration)}</span>
+      `;
+      row.addEventListener('pointerup', () => {
+        if (isEditMode()) return;
+        // Play the playlist starting from this specific track
+        spotifyCmd('play', { contextUri: _selectedPlaylist.uri, offsetUri: track.uri });
+      });
+      detailTracks.appendChild(row);
+    });
+  }
+
+  // ---- Event listeners ----
+  backBtn.addEventListener('pointerup', () => {
+    if (isEditMode()) return;
+    _closeDetail();
+  });
+
+  detailPlayBtn.addEventListener('pointerup', () => {
+    if (isEditMode()) return;
+    if (!_selectedPlaylist) return;
+    spotifyCmd('play', { contextUri: _selectedPlaylist.uri });
+  });
+
   sortBar.addEventListener('click', (e) => {
     const btn = e.target.closest('.sp-sort-btn');
     if (!btn) return;
@@ -1039,9 +1123,10 @@ function renderSpotifyPlaylists(ctrl) {
     _renderGrid();
   });
 
+  // ---- Data ----
   function _render(data) {
     _allItems = (data && data.items) ? data.items : [];
-    _renderGrid();
+    if (!_selectedPlaylist) _renderGrid();
   }
 
   card._updateSpotifyPlaylists = _render;
@@ -1055,6 +1140,7 @@ function renderSpotifyPlaylists(ctrl) {
   });
   observer.observe(document.body, { childList: true, subtree: true });
 
+  // Fetch all playlists (unfiltered) for the browser; share with the picker cache
   getSpotifyPlaylists().then((data) => {
     if (data && data.items) {
       _playlists = data.items;
