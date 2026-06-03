@@ -296,13 +296,28 @@ _active_streams: list = []
 _active_streams_lock = threading.Lock()
 
 def _find_device_index(device: str):
-    """Return the output device index whose name contains `device` (case-insensitive)."""
+    """Return the output device index matching `device` (exact first, then substring)."""
+    if not device:
+        return None
     try:
-        for i, d in enumerate(sd.query_devices()):
-            if d.get('max_output_channels', 0) > 0 and device.lower() in d['name'].lower():
+        devices = sd.query_devices()
+        device_lower = device.lower()
+        # Pass 1: exact name match
+        for i, d in enumerate(devices):
+            if d.get('max_output_channels', 0) > 0 and d['name'].lower() == device_lower:
+                log.debug("Soundboard device exact match: [%d] %s", i, d['name'])
                 return i
-    except Exception:
-        pass
+        # Pass 2: substring match (device name contains the search string)
+        for i, d in enumerate(devices):
+            if d.get('max_output_channels', 0) > 0 and device_lower in d['name'].lower():
+                log.debug("Soundboard device substring match: [%d] %s", i, d['name'])
+                return i
+        log.warning("Soundboard: no output device matching %r — available devices:", device)
+        for i, d in enumerate(devices):
+            if d.get('max_output_channels', 0) > 0:
+                log.warning("  [%d] %s", i, d['name'])
+    except Exception as e:
+        log.error("Soundboard: error querying devices: %s", e)
     return None
 
 def play_sound(file_path: str, device=None, volume: float = 1.0):
@@ -526,10 +541,11 @@ async def receive_loop(ws):
             file_path = msg.get("file", "")
             device    = msg.get("device") or None
             volume    = float(msg.get("volume", 1.0))
+            log.info("Soundboard: received play — file=%r  device=%r  volume=%s", file_path, device, volume)
             if file_path:
                 try:
                     play_sound(file_path, device, volume)
-                    log.info("Soundboard: playing %s via %s", file_path, device or "default")
+                    log.info("Soundboard: playback started — file=%r via device=%r", file_path, device or "OS default")
                     await ws.send(json.dumps({"type": "soundboardPlaying", "file": file_path}))
                 except Exception as e:
                     log.error("Soundboard playback failed: %s", e)
@@ -615,6 +631,17 @@ def main():
         # Don't exit — VM might start later; keep trying
 
     log.info("VoiceMeeter login code: %d (0=ok, 1=launched, <0=error)", result)
+
+    # Log available audio output devices so device names are visible in logs
+    if _sounddevice_available:
+        try:
+            log.info("Available audio output devices:")
+            for i, d in enumerate(sd.query_devices()):
+                if d.get('max_output_channels', 0) > 0:
+                    log.info("  [%d] %s", i, d['name'])
+        except Exception as e:
+            log.warning("Could not query audio devices: %s", e)
+
     update_tray_status("Connecting...")
 
     # Start async networking thread
