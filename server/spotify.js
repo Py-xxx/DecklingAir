@@ -524,40 +524,46 @@ async function queueSearchContinuation(uris) {
   const trackIds = uris.map(u => u.split(':').pop()).filter(Boolean);
   if (!trackIds.length) return;
 
+  // Give Spotify a moment to register the play before we start queuing
+  await new Promise(r => setTimeout(r, 1500));
+
   // 1. Try recommendations (deprecated for newer apps but worth trying)
   try {
     const recs = await getRecommendations({ seedTracks: trackIds.slice(0, 5), limit: 25 });
     const tracks = recs?.tracks || [];
     if (tracks.length > 0) {
       for (const t of tracks) {
-        try { await addToQueue(t.uri); } catch {}
-        await new Promise(r => setTimeout(r, 80));
+        try { await addToQueue(t.uri); } catch (e) { console.warn('[Spotify] Queue add failed:', e.message); }
+        await new Promise(r => setTimeout(r, 100));
       }
       console.log(`[Spotify] Search continuation: queued ${tracks.length} recommendations`);
       return;
     }
   } catch (e) {
-    console.warn('[Spotify] Recommendations unavailable, falling back to artist top tracks:', e.message);
+    console.warn('[Spotify] Recommendations unavailable, trying artist top tracks:', e.message);
   }
 
   // 2. Fallback: look up the track → get the primary artist → queue their top tracks
   try {
     const track = await api('GET', `/tracks/${trackIds[0]}`);
     const artistId = track?.artists?.[0]?.id;
-    if (!artistId) return;
+    if (!artistId) { console.warn('[Spotify] No artist ID found for track'); return; }
 
-    const result = await api('GET', `/artists/${artistId}/top-tracks`, { params: { market: 'from_token' } });
+    // market parameter omitted — Spotify uses the user's market automatically
+    const result = await api('GET', `/artists/${artistId}/top-tracks`);
     const tracks = (result?.tracks || [])
-      .filter(t => !uris.includes(t.uri))   // don't re-queue the track already playing
+      .filter(t => !uris.includes(t.uri))
       .slice(0, 20);
 
+    if (!tracks.length) { console.warn('[Spotify] Artist top tracks returned no results'); return; }
+
     for (const t of tracks) {
-      try { await addToQueue(t.uri); } catch {}
-      await new Promise(r => setTimeout(r, 80));
+      try { await addToQueue(t.uri); } catch (e) { console.warn('[Spotify] Queue add failed:', e.message); }
+      await new Promise(r => setTimeout(r, 100));
     }
     console.log(`[Spotify] Search continuation: queued ${tracks.length} artist top tracks`);
   } catch (e) {
-    console.warn('[Spotify] Search continuation fallback failed:', e.message);
+    console.warn('[Spotify] Search continuation failed:', e.message);
   }
 }
 
@@ -1295,7 +1301,9 @@ function init(io) {
             // Playing a single track directly (no playlist context) — queue continuations
             // so playback doesn't stop when the track ends, just like Spotify's own client.
             if (args.uris?.length && !args.contextUri) {
-              queueSearchContinuation(args.uris).catch(() => {});
+              queueSearchContinuation(args.uris).catch(e =>
+                console.error('[Spotify] queueSearchContinuation error:', e.message)
+              );
             }
             setTimeout(emitQueue, 2000);
             break;
