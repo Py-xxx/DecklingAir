@@ -232,6 +232,12 @@ io.on('connection', (socket) => {
     });
   });
 
+  socket.on('soundboard:stop', ({ deviceId } = {}) => {
+    const targetId = sanitizeDeviceId(deviceId);
+    if (!targetId) return;
+    sendToDevice(targetId, { type: 'soundboardStop' });
+  });
+
   socket.on('soundboard:devices_request', ({ deviceId } = {}) => {
     const targetId = sanitizeDeviceId(deviceId);
     if (!targetId) return;
@@ -324,6 +330,11 @@ wss.on('connection', (ws, req) => {
           deviceId: currentDeviceId,
           devices: Array.isArray(msg.devices) ? msg.devices : [],
         });
+        break;
+
+      case 'soundboardPlaying':
+        if (!currentDeviceId) return;
+        io.emit('soundboard:playing', { deviceId: currentDeviceId, file: msg.file });
         break;
 
       case 'desktopIcon':

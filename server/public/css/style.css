@@ -546,10 +546,28 @@ body.edit-mode .control-card .drag-handle { display: flex; }
   min-height: 64px; padding: 12px 10px;
   align-items: center; justify-content: center; gap: 7px;
   text-align: center; cursor: pointer;
-  transition: filter var(--t), transform var(--t);
+  transition: filter var(--t), transform var(--t), border-color var(--t), background var(--t);
+  position: relative; overflow: hidden;
 }
 .soundboard-card:active { transform: scale(0.95); filter: brightness(1.35); }
-.soundboard-card.playing { filter: brightness(1.4); }
+.soundboard-card.playing {
+  filter: brightness(1.4);
+  border-color: rgba(var(--sb-r,34), var(--sb-g,197), var(--sb-b,94), 0.7) !important;
+  background: rgba(var(--sb-r,34), var(--sb-g,197), var(--sb-b,94), 0.28) !important;
+}
+/* Ripple pulse animation while playing */
+.soundboard-card.playing::after {
+  content: '';
+  position: absolute; inset: 0;
+  border-radius: inherit;
+  background: rgba(var(--sb-r,34), var(--sb-g,197), var(--sb-b,94), 0.15);
+  animation: sb-pulse 1.4s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes sb-pulse {
+  0%, 100% { opacity: 0.6; transform: scale(1); }
+  50%       { opacity: 0;   transform: scale(1.05); }
+}
 .soundboard-icon {
   width: 28px; height: 28px;
   display: flex; align-items: center; justify-content: center;

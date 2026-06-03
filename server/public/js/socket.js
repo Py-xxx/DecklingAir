@@ -38,6 +38,11 @@ export function soundboardPlay(file, device, volume = 1.0, deviceId = currentDev
   _socket?.emit('soundboard:play', { deviceId, file, device: device || null, volume });
 }
 
+export function soundboardStop(deviceId = currentDeviceId()) {
+  if (!deviceId) return;
+  _socket?.emit('soundboard:stop', { deviceId });
+}
+
 export function requestSoundboardDevices(deviceId = currentDeviceId()) {
   if (!deviceId) return;
   _socket?.emit('soundboard:devices_request', { deviceId });

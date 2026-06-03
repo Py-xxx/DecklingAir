@@ -1,4 +1,4 @@
-import { desktopAction, soundboardPlay, vmSet, vmMacro } from './socket.js';
+import { desktopAction, soundboardPlay, soundboardStop, vmSet, vmMacro, socket } from './socket.js';
 import { renderSpotifyControl } from './spotify-controls.js';
 
 // ── VM parameter catalogue ────────────────────────────────────────────────────
@@ -777,15 +777,24 @@ export function renderSoundboard(ctrl) {
   const r = parseInt(color.slice(1, 3), 16);
   const g = parseInt(color.slice(3, 5), 16);
   const b = parseInt(color.slice(5, 7), 16);
+  card.style.setProperty('--sb-r', r);
+  card.style.setProperty('--sb-g', g);
+  card.style.setProperty('--sb-b', b);
   card.style.background  = `rgba(${r},${g},${b},0.15)`;
   card.style.borderColor = `rgba(${r},${g},${b},0.3)`;
 
   const iconWrap = document.createElement('div');
   iconWrap.className = 'soundboard-icon';
-  iconWrap.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"
+
+  const PLAY_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"
       stroke-linecap="round" stroke-linejoin="round">
     <polygon points="5 3 19 12 5 21 5 3" fill="currentColor" opacity=".85"/>
   </svg>`;
+  const STOP_SVG = `<svg viewBox="0 0 24 24" fill="currentColor">
+    <rect x="5" y="5" width="14" height="14" rx="2"/>
+  </svg>`;
+
+  iconWrap.innerHTML = PLAY_SVG;
 
   const labelEl = document.createElement('div');
   labelEl.className = 'soundboard-label';
@@ -797,14 +806,43 @@ export function renderSoundboard(ctrl) {
   card.appendChild(editOverlay(ctrl.id));
   card.appendChild(resizeHandle());
 
+  let _playing = false;
+  let _playTimeout = null;
+
+  function _setPlaying(on) {
+    _playing = on;
+    card.classList.toggle('playing', on);
+    iconWrap.innerHTML = on ? STOP_SVG : PLAY_SVG;
+  }
+
+  // Confirmed playing event from bridge
+  const _onPlaying = ({ file }) => {
+    if (file === cfg.file) {
+      clearTimeout(_playTimeout);
+      _setPlaying(true);
+      // Auto-clear after a generous timeout in case bridge never sends stop
+      _playTimeout = setTimeout(() => _setPlaying(false), 30000);
+    }
+  };
+  socket.on('soundboard:playing', _onPlaying);
+
   card.addEventListener('pointerdown', e => {
     if (isEditMode()) return;
     if (e.target.closest('.edit-overlay, .drag-handle, .resize-handle')) return;
-    soundboardPlay(cfg.file, cfg.device || _soundboardDevice || null, cfg.volume ?? 1.0);
-    card.classList.add('playing');
+    e.preventDefault();
+    if (_playing) {
+      // Tap again while playing → stop
+      soundboardStop();
+      clearTimeout(_playTimeout);
+      _setPlaying(false);
+    } else {
+      soundboardPlay(cfg.file, cfg.device || _soundboardDevice || null, cfg.volume ?? 1.0);
+      // Optimistic state — confirmed by soundboard:playing event
+      clearTimeout(_playTimeout);
+      _playTimeout = setTimeout(() => _setPlaying(false), 30000);
+      _setPlaying(true);
+    }
   });
-  card.addEventListener('pointerup',     () => window.setTimeout(() => card.classList.remove('playing'), 260));
-  card.addEventListener('pointercancel', () => card.classList.remove('playing'));
 
   card._updateState = () => {};
   return card;

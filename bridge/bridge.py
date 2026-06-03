@@ -284,28 +284,79 @@ def get_output_devices():
         return []
 
 
+# Track active soundboard streams so we can stop them
+_active_streams: list = []
+_active_streams_lock = threading.Lock()
+
+def _find_device_index(device: str):
+    """Return the output device index whose name contains `device` (case-insensitive)."""
+    try:
+        for i, d in enumerate(sd.query_devices()):
+            if d.get('max_output_channels', 0) > 0 and device.lower() in d['name'].lower():
+                return i
+    except Exception:
+        pass
+    return None
+
 def play_sound(file_path: str, device=None, volume: float = 1.0):
-    """Play an audio file through the specified output device (by name substring)."""
+    """Play an audio file in a background thread using its own OutputStream.
+    Supports multiple simultaneous sounds; each gets its own stream."""
     if not _sounddevice_available:
         raise RuntimeError("sounddevice/soundfile not installed – run: pip install sounddevice soundfile")
     if not os.path.isfile(file_path):
         raise FileNotFoundError(f"Sound file not found: {file_path}")
 
+    # Read file synchronously (fast, just memory copy) before spawning thread
     data, samplerate = sf.read(file_path, dtype='float32', always_2d=True)
     if volume != 1.0:
         data = data * max(0.0, min(2.0, float(volume)))
 
-    device_idx = None
-    if device:
+    device_idx = _find_device_index(device) if device else None
+
+    def _run():
+        stream = sd.OutputStream(
+            samplerate=samplerate,
+            channels=data.shape[1],
+            dtype='float32',
+            device=device_idx,
+        )
+        with _active_streams_lock:
+            _active_streams.append(stream)
         try:
-            for i, d in enumerate(sd.query_devices()):
-                if d.get('max_output_channels', 0) > 0 and device.lower() in d['name'].lower():
-                    device_idx = i
-                    break
+            stream.start()
+            chunk = 1024
+            offset = 0
+            while offset < len(data):
+                block = data[offset:offset + chunk]
+                stream.write(block)
+                offset += chunk
+        finally:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+            with _active_streams_lock:
+                try:
+                    _active_streams.remove(stream)
+                except ValueError:
+                    pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def stop_all_sounds():
+    """Stop all currently playing soundboard streams."""
+    with _active_streams_lock:
+        streams = list(_active_streams)
+    for stream in streams:
+        try:
+            stream.abort()
+            stream.close()
         except Exception:
             pass
-
-    sd.play(data, samplerate, device=device_idx, blocking=False)
+    with _active_streams_lock:
+        _active_streams.clear()
 
 
 def resolve_desktop_icon(target: str):
@@ -463,12 +514,17 @@ async def receive_loop(ws):
                 try:
                     play_sound(file_path, device, volume)
                     log.info("Soundboard: playing %s via %s", file_path, device or "default")
+                    await ws.send(json.dumps({"type": "soundboardPlaying", "file": file_path}))
                 except Exception as e:
                     log.error("Soundboard playback failed: %s", e)
                     await ws.send(json.dumps({
                         "type": "error",
                         "message": f"Soundboard playback failed: {e}",
                     }))
+
+        elif msg_type == "soundboardStop":
+            stop_all_sounds()
+            log.info("Soundboard: stopped all sounds")
 
         elif msg_type == "soundboardDevicesRequest":
             await ws.send(json.dumps({

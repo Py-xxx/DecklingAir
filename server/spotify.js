@@ -516,54 +516,45 @@ async function addToQueue(uri) {
 }
 
 /**
- * After playing a single track from search, queue continuation tracks so
- * playback doesn't stop when the track ends.
- * Strategy: try Spotify recommendations first; fall back to the artist's top tracks.
+ * Play a single search track with continuation tracks bundled in the same
+ * play() call as a mini-playlist, so Spotify has full context and keeps
+ * playing when the track ends — no queue manipulation needed.
  */
-async function queueSearchContinuation(uris) {
-  const trackIds = uris.map(u => u.split(':').pop()).filter(Boolean);
-  if (!trackIds.length) return;
+async function playWithContinuation(uri) {
+  const trackId = uri.split(':').pop();
+  let continuationUris = [];
 
-  // Give Spotify a moment to register the play before we start queuing
-  await new Promise(r => setTimeout(r, 1500));
-
-  // 1. Try recommendations (deprecated for newer apps but worth trying)
+  // 1. Try recommendations
   try {
-    const recs = await getRecommendations({ seedTracks: trackIds.slice(0, 5), limit: 25 });
-    const tracks = recs?.tracks || [];
-    if (tracks.length > 0) {
-      for (const t of tracks) {
-        try { await addToQueue(t.uri); } catch (e) { console.warn('[Spotify] Queue add failed:', e.message); }
-        await new Promise(r => setTimeout(r, 100));
-      }
-      console.log(`[Spotify] Search continuation: queued ${tracks.length} recommendations`);
-      return;
-    }
+    const recs = await getRecommendations({ seedTracks: [trackId], limit: 24 });
+    continuationUris = (recs?.tracks || []).map(t => t.uri).filter(u => u !== uri);
+    if (continuationUris.length) console.log(`[Spotify] Continuation: ${continuationUris.length} recommendations`);
   } catch (e) {
-    console.warn('[Spotify] Recommendations unavailable, trying artist top tracks:', e.message);
+    console.warn('[Spotify] Recommendations unavailable:', e.message);
   }
 
-  // 2. Fallback: look up the track → get the primary artist → queue their top tracks
-  try {
-    const track = await api('GET', `/tracks/${trackIds[0]}`);
-    const artistId = track?.artists?.[0]?.id;
-    if (!artistId) { console.warn('[Spotify] No artist ID found for track'); return; }
-
-    // market parameter omitted — Spotify uses the user's market automatically
-    const result = await api('GET', `/artists/${artistId}/top-tracks`);
-    const tracks = (result?.tracks || [])
-      .filter(t => !uris.includes(t.uri))
-      .slice(0, 20);
-
-    if (!tracks.length) { console.warn('[Spotify] Artist top tracks returned no results'); return; }
-
-    for (const t of tracks) {
-      try { await addToQueue(t.uri); } catch (e) { console.warn('[Spotify] Queue add failed:', e.message); }
-      await new Promise(r => setTimeout(r, 100));
+  // 2. Fall back to artist top tracks
+  if (!continuationUris.length) {
+    try {
+      const track  = await api('GET', `/tracks/${trackId}`);
+      const artist = track?.artists?.[0]?.id;
+      if (artist) {
+        const res = await api('GET', `/artists/${artist}/top-tracks`);
+        continuationUris = (res?.tracks || []).map(t => t.uri).filter(u => u !== uri).slice(0, 19);
+        if (continuationUris.length) console.log(`[Spotify] Continuation: ${continuationUris.length} artist top tracks`);
+      }
+    } catch (e) {
+      console.warn('[Spotify] Artist top tracks unavailable:', e.message);
     }
-    console.log(`[Spotify] Search continuation: queued ${tracks.length} artist top tracks`);
-  } catch (e) {
-    console.warn('[Spotify] Search continuation failed:', e.message);
+  }
+
+  // Play selected track first; if we have continuation tracks bundle them in
+  // the same call so Spotify treats it as a playlist context
+  if (continuationUris.length) {
+    await play({ uris: [uri, ...continuationUris] });
+  } else {
+    console.warn('[Spotify] No continuation tracks found — playing single track');
+    await play({ uris: [uri] });
   }
 }
 
@@ -1297,13 +1288,12 @@ function init(io) {
       try {
         switch (action) {
           case 'play':
-            await play(args);
-            // Playing a single track directly (no playlist context) — queue continuations
-            // so playback doesn't stop when the track ends, just like Spotify's own client.
-            if (args.uris?.length && !args.contextUri) {
-              queueSearchContinuation(args.uris).catch(e =>
-                console.error('[Spotify] queueSearchContinuation error:', e.message)
-              );
+            // Single track from search — bundle continuation tracks so playback
+            // doesn't stop (no queue manipulation, one clean play() call)
+            if (args.uris?.length === 1 && !args.contextUri) {
+              await playWithContinuation(args.uris[0]);
+            } else {
+              await play(args);
             }
             setTimeout(emitQueue, 2000);
             break;
