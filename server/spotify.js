@@ -515,6 +515,52 @@ async function addToQueue(uri) {
   return api('POST', '/me/player/queue', { params: { uri } });
 }
 
+/**
+ * After playing a single track from search, queue continuation tracks so
+ * playback doesn't stop when the track ends.
+ * Strategy: try Spotify recommendations first; fall back to the artist's top tracks.
+ */
+async function queueSearchContinuation(uris) {
+  const trackIds = uris.map(u => u.split(':').pop()).filter(Boolean);
+  if (!trackIds.length) return;
+
+  // 1. Try recommendations (deprecated for newer apps but worth trying)
+  try {
+    const recs = await getRecommendations({ seedTracks: trackIds.slice(0, 5), limit: 25 });
+    const tracks = recs?.tracks || [];
+    if (tracks.length > 0) {
+      for (const t of tracks) {
+        try { await addToQueue(t.uri); } catch {}
+        await new Promise(r => setTimeout(r, 80));
+      }
+      console.log(`[Spotify] Search continuation: queued ${tracks.length} recommendations`);
+      return;
+    }
+  } catch (e) {
+    console.warn('[Spotify] Recommendations unavailable, falling back to artist top tracks:', e.message);
+  }
+
+  // 2. Fallback: look up the track → get the primary artist → queue their top tracks
+  try {
+    const track = await api('GET', `/tracks/${trackIds[0]}`);
+    const artistId = track?.artists?.[0]?.id;
+    if (!artistId) return;
+
+    const result = await api('GET', `/artists/${artistId}/top-tracks`, { params: { market: 'from_token' } });
+    const tracks = (result?.tracks || [])
+      .filter(t => !uris.includes(t.uri))   // don't re-queue the track already playing
+      .slice(0, 20);
+
+    for (const t of tracks) {
+      try { await addToQueue(t.uri); } catch {}
+      await new Promise(r => setTimeout(r, 80));
+    }
+    console.log(`[Spotify] Search continuation: queued ${tracks.length} artist top tracks`);
+  } catch (e) {
+    console.warn('[Spotify] Search continuation fallback failed:', e.message);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Library API wrappers
 // ---------------------------------------------------------------------------
@@ -1246,6 +1292,11 @@ function init(io) {
         switch (action) {
           case 'play':
             await play(args);
+            // Playing a single track directly (no playlist context) — queue continuations
+            // so playback doesn't stop when the track ends, just like Spotify's own client.
+            if (args.uris?.length && !args.contextUri) {
+              queueSearchContinuation(args.uris).catch(() => {});
+            }
             setTimeout(emitQueue, 2000);
             break;
 

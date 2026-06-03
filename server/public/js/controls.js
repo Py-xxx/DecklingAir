@@ -107,7 +107,9 @@ export function createFaderWidget({ min = -60, max = 12, step = 0.1, value = 0, 
   widget.className = 'fader-widget';
   widget.style.touchAction = 'none';
 
-  // VU column (left)
+  let isHorizontal = false;
+
+  // VU meter
   let vuCol = null;
   if (showVu) {
     vuCol = document.createElement('div');
@@ -150,7 +152,6 @@ export function createFaderWidget({ min = -60, max = 12, step = 0.1, value = 0, 
 
   // Unity position: (0 - min)/(max - min) = 60/72 ≈ 83.33%
   const unityPct = ((0 - min) / (max - min)) * 100;
-  unity.style.bottom = unityPct.toFixed(2) + '%';
 
   let current = parseFloat(value);
   let dragging = false;
@@ -161,16 +162,39 @@ export function createFaderWidget({ min = -60, max = 12, step = 0.1, value = 0, 
     return Math.round(raw / step) * step;
   }
 
+  function updateUnityPos() {
+    if (isHorizontal) {
+      unity.style.bottom = '';
+      unity.style.left   = unityPct.toFixed(2) + '%';
+    } else {
+      unity.style.left   = '';
+      unity.style.bottom = unityPct.toFixed(2) + '%';
+    }
+  }
+
   function updateDisplay(v) {
     const pct = norm(v) * 100;
-    fill.style.height  = pct.toFixed(2) + '%';
-    thumb.style.bottom = `calc(${pct.toFixed(2)}% - 8px)`;
+    if (isHorizontal) {
+      fill.style.height  = '';
+      fill.style.width   = pct.toFixed(2) + '%';
+      thumb.style.bottom = '';
+      thumb.style.left   = `calc(${pct.toFixed(2)}% - 8px)`;
+    } else {
+      fill.style.width   = '';
+      fill.style.height  = pct.toFixed(2) + '%';
+      thumb.style.left   = '';
+      thumb.style.bottom = `calc(${pct.toFixed(2)}% - 8px)`;
+    }
   }
+
+  updateUnityPos();
   updateDisplay(current);
 
   function posFromEvent(e) {
     const rect = track.getBoundingClientRect();
-    const n = 1 - (e.clientY - rect.top) / rect.height;
+    const n = isHorizontal
+      ? (e.clientX - rect.left) / rect.width
+      : 1 - (e.clientY - rect.top) / rect.height;
     return fromNorm(Math.max(0, Math.min(1, n)));
   }
 
@@ -201,6 +225,15 @@ export function createFaderWidget({ min = -60, max = 12, step = 0.1, value = 0, 
   });
 
   widget.setValue = v => { current = parseFloat(v); updateDisplay(current); };
+
+  // Switch between vertical and horizontal layouts
+  widget.setOrientation = (h) => {
+    if (isHorizontal === h) return;
+    isHorizontal = h;
+    widget.classList.toggle('fw-h', h);
+    updateUnityPos();
+    updateDisplay(current);
+  };
 
   function paintVu(linear) {
     if (!vuCol) return;
@@ -333,6 +366,21 @@ export function renderFader(ctrl, vmState) {
       widget.setLevels(levels[base] ?? 0, levels[base + 1] ?? levels[base] ?? 0);
     }
   };
+
+  // Auto-switch between vertical and horizontal based on card aspect ratio
+  let _faderIsH = false;
+  const _faderRO = new ResizeObserver(entries => {
+    const { width, height } = entries[0].contentRect;
+    if (width === 0 || height === 0) return;
+    const shouldBeH = width > height;
+    if (shouldBeH !== _faderIsH) {
+      _faderIsH = shouldBeH;
+      card.classList.toggle('fader-card-h', _faderIsH);
+      widget.setOrientation(_faderIsH);
+    }
+  });
+  _faderRO.observe(card);
+
   return card;
 }
 

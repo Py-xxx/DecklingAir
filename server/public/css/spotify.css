@@ -1836,6 +1836,46 @@
 }
 
 /* ---------- FILTER TAB ---------- */
+.sp-ins-filter-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.07);
+  margin-bottom: 2px;
+}
+.sp-ins-preset-btn {
+  padding: 4px 10px;
+  border-radius: 20px;
+  border: 1px solid rgba(255,255,255,0.18);
+  background: rgba(255,255,255,0.05);
+  color: var(--text-2, #ccc);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+  white-space: nowrap;
+}
+.sp-ins-preset-btn:hover {
+  background: rgba(255,255,255,0.12);
+  border-color: rgba(255,255,255,0.3);
+  color: #fff;
+}
+.sp-ins-preset-btn.active {
+  background: rgba(29,185,84,0.2);
+  border-color: #1db954;
+  color: #1db954;
+}
+.sp-ins-preset-reset {
+  margin-left: auto;
+  border-color: rgba(255,255,255,0.1);
+  color: var(--text-3, #888);
+}
+.sp-ins-preset-reset:hover {
+  color: #fff;
+  border-color: rgba(255,255,255,0.3);
+}
+
 .sp-ins-filter-form {
   display: flex;
   flex-direction: column;

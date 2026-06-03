@@ -1768,6 +1768,15 @@ export function renderSpotifyInsights(ctrl) {
 
         <!-- FILTER -->
         <div class="sp-ins-panel" data-panel="filter" style="display:none">
+          <div class="sp-ins-filter-presets">
+            <button class="sp-ins-preset-btn" data-preset="hype">Hype</button>
+            <button class="sp-ins-preset-btn" data-preset="workout">Workout</button>
+            <button class="sp-ins-preset-btn" data-preset="goodvibes">Good Vibes</button>
+            <button class="sp-ins-preset-btn" data-preset="focus">Focus</button>
+            <button class="sp-ins-preset-btn" data-preset="chill">Chill</button>
+            <button class="sp-ins-preset-btn" data-preset="sad">Sad</button>
+            <button class="sp-ins-preset-btn sp-ins-preset-reset" data-preset="reset">Reset</button>
+          </div>
           <div class="sp-ins-filter-form">
             <div class="sp-ins-filter-row">
               <label class="sp-ins-filter-label">Energy <span class="sp-ins-energy-val">0–100%</span></label>
@@ -1795,6 +1804,7 @@ export function renderSpotifyInsights(ctrl) {
               <span class="sp-ins-filter-count">— tracks match</span>
               <button class="sp-ins-action-btn sp-ins-filter-play-btn" disabled>Queue tracks</button>
             </div>
+          </div>
           </div>
         </div>
 
@@ -2067,6 +2077,40 @@ export function renderSpotifyInsights(ctrl) {
   }
   [energyMin, energyMax, moodMin, moodMax, bpmMin, bpmMax].forEach(el => {
     el.addEventListener('input', () => { _updateFilterLabels(); _requestFilterCount(); });
+  });
+
+  // ---- Presets ----
+  const PRESETS = {
+    hype:      { eMin: 80, eMax: 100, mMin: 60,  mMax: 100, bMin: 120, bMax: 200 },
+    workout:   { eMin: 70, eMax: 100, mMin: 0,   mMax: 100, bMin: 120, bMax: 180 },
+    goodvibes: { eMin: 40, eMax: 80,  mMin: 60,  mMax: 100, bMin: 0,   bMax: 300 },
+    focus:     { eMin: 20, eMax: 55,  mMin: 0,   mMax: 100, bMin: 60,  bMax: 130 },
+    chill:     { eMin: 0,  eMax: 40,  mMin: 0,   mMax: 100, bMin: 0,   bMax: 110 },
+    sad:       { eMin: 0,  eMax: 40,  mMin: 0,   mMax: 40,  bMin: 0,   bMax: 300 },
+    reset:     { eMin: 0,  eMax: 100, mMin: 0,   mMax: 100, bMin: 0,   bMax: 300 },
+  };
+  function _applyPreset(key) {
+    const p = PRESETS[key];
+    if (!p) return;
+    energyMin.value = p.eMin; energyMax.value = p.eMax;
+    moodMin.value   = p.mMin; moodMax.value   = p.mMax;
+    bpmMin.value    = p.bMin; bpmMax.value    = p.bMax;
+    // Mark active preset (skip for reset)
+    card.querySelectorAll('.sp-ins-preset-btn').forEach(b => b.classList.remove('active'));
+    if (key !== 'reset') card.querySelector(`[data-preset="${key}"]`)?.classList.add('active');
+    _updateFilterLabels();
+    _requestFilterCount();
+  }
+  card.querySelector('.sp-ins-filter-presets').addEventListener('click', (e) => {
+    const btn = e.target.closest('.sp-ins-preset-btn');
+    if (!btn || isEditMode()) return;
+    _applyPreset(btn.dataset.preset);
+  });
+  // Clear active preset when sliders are moved manually
+  [energyMin, energyMax, moodMin, moodMax, bpmMin, bpmMax].forEach(el => {
+    el.addEventListener('input', () => {
+      card.querySelectorAll('.sp-ins-preset-btn').forEach(b => b.classList.remove('active'));
+    });
   });
 
   const _onFilterCount = ({ total }) => {
