@@ -43,6 +43,8 @@ const REQUIRED_SCOPES = [
 
 const CONFIG_FILE = path.join(__dirname, 'data', 'spotify-config.json');
 const TOKENS_FILE = path.join(__dirname, 'data', 'spotify-tokens.json');
+const HISTORY_FILE   = path.join(__dirname, 'data', 'listening-history.ndjson');
+const VIBE_NAMES_FILE = path.join(__dirname, 'data', 'vibe-names.json');
 
 // ---------------------------------------------------------------------------
 // Module state
@@ -61,6 +63,8 @@ let _sessionStats = {
   startTime: Date.now(),
   tracksPlayed: [], // { id, title, artist, startTime, durationMs }
 };
+let _history   = [];   // all-time log entries, loaded from file on start
+let _vibeNames = {};   // { vibeKey: 'Custom Name' }
 
 // ---------------------------------------------------------------------------
 // Config / token storage
@@ -112,6 +116,42 @@ function deleteTokens() {
   } catch {
     // ignore
   }
+}
+
+function loadHistory() {
+  try {
+    if (!fs.existsSync(HISTORY_FILE)) return;
+    const lines = fs.readFileSync(HISTORY_FILE, 'utf8').split('\n');
+    _history = lines
+      .map(l => { try { return l.trim() ? JSON.parse(l) : null; } catch { return null; } })
+      .filter(Boolean);
+    console.log(`[Spotify] Loaded ${_history.length} history entries`);
+  } catch (err) {
+    console.error('[Spotify] Failed to load history:', err.message);
+    _history = [];
+  }
+}
+
+function loadVibeNames() {
+  try {
+    if (fs.existsSync(VIBE_NAMES_FILE))
+      _vibeNames = JSON.parse(fs.readFileSync(VIBE_NAMES_FILE, 'utf8'));
+  } catch { _vibeNames = {}; }
+}
+
+function saveVibeNames() {
+  try {
+    fs.mkdirSync(path.dirname(VIBE_NAMES_FILE), { recursive: true });
+    fs.writeFileSync(VIBE_NAMES_FILE, JSON.stringify(_vibeNames, null, 2));
+  } catch (err) { console.error('[Spotify] Failed to save vibe names:', err.message); }
+}
+
+function appendHistory(entry) {
+  try {
+    fs.mkdirSync(path.dirname(HISTORY_FILE), { recursive: true });
+    fs.appendFileSync(HISTORY_FILE, JSON.stringify(entry) + '\n');
+    _history.push(entry);
+  } catch (err) { console.error('[Spotify] Failed to append history:', err.message); }
 }
 
 // ---------------------------------------------------------------------------
@@ -680,6 +720,199 @@ function _serializeFeatures(f) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Vibe engine
+// ---------------------------------------------------------------------------
+
+const VIBE_DEFAULTS = {
+  hype:        'Hype',
+  intense:     'Intense',
+  drive:       'Drive',
+  good_vibes:  'Good Vibes',
+  flow:        'Flow',
+  grind:       'Grind',
+  chill:       'Chill',
+  ease:        'Ease',
+  melancholy:  'Melancholy',
+  t_morning:   'Morning',
+  t_midday:    'Midday',
+  t_afternoon: 'Afternoon',
+  t_evening:   'Evening',
+  t_night:     'Night',
+  t_latenight: 'Late Night',
+};
+
+function getVibeKey(e) {
+  if (e.energy == null || e.valence == null) {
+    const h = e.h || 0;
+    if (h >= 6  && h < 10) return 't_morning';
+    if (h >= 10 && h < 14) return 't_midday';
+    if (h >= 14 && h < 18) return 't_afternoon';
+    if (h >= 18 && h < 22) return 't_evening';
+    if (h >= 22 || h < 2)  return 't_night';
+    return 't_latenight';
+  }
+  const en = e.energy, va = e.valence;
+  if (en >= 70 && va >= 60) return 'hype';
+  if (en >= 70 && va < 40)  return 'intense';
+  if (en >= 70)              return 'drive';
+  if (en >= 40 && va >= 60) return 'good_vibes';
+  if (en >= 40 && va < 40)  return 'grind';
+  if (en >= 40)              return 'flow';
+  if (va >= 60)              return 'chill';
+  if (va < 40)               return 'melancholy';
+  return 'ease';
+}
+
+function getVibeName(key) {
+  return _vibeNames[key] || VIBE_DEFAULTS[key] || key;
+}
+
+// ---------------------------------------------------------------------------
+// Analysis functions
+// ---------------------------------------------------------------------------
+
+function computeProfile() {
+  if (!_history.length) return { ready: false, total: 0 };
+  const artistCount = {};
+  const hourCount   = new Array(24).fill(0);
+  const featEntries = _history.filter(e => e.energy != null);
+
+  for (const e of _history) {
+    if (e.artist) artistCount[e.artist] = (artistCount[e.artist] || 0) + 1;
+    if (e.h != null) hourCount[e.h]++;
+  }
+  const topArtists = Object.entries(artistCount)
+    .sort((a, b) => b[1] - a[1]).slice(0, 8)
+    .map(([name, count]) => ({ name, count }));
+
+  const peakHour = hourCount.indexOf(Math.max(...hourCount));
+  let avgFeatures = null;
+  if (featEntries.length) {
+    const s = { energy: 0, valence: 0, dance: 0, acoustic: 0, inst: 0, bpm: 0, bpmCount: 0 };
+    for (const e of featEntries) {
+      s.energy += e.energy; s.valence += e.valence;
+      s.dance   += (e.dance   || 0);
+      s.acoustic+= (e.acoustic|| 0);
+      s.inst    += (e.inst    || 0);
+      if (e.bpm) { s.bpm += e.bpm; s.bpmCount++; }
+    }
+    const n = featEntries.length;
+    avgFeatures = {
+      energy:   Math.round(s.energy   / n),
+      valence:  Math.round(s.valence  / n),
+      dance:    Math.round(s.dance    / n),
+      acoustic: Math.round(s.acoustic / n),
+      inst:     Math.round(s.inst     / n),
+      bpm:      s.bpmCount ? Math.round(s.bpm / s.bpmCount) : null,
+    };
+  }
+  const daysLogging = _history.length
+    ? Math.max(1, Math.ceil((Date.now() - _history[0].ts) / 86400000))
+    : 0;
+  return {
+    ready: true, total: _history.length,
+    unique: new Set(_history.map(e => e.id)).size,
+    daysLogging, topArtists, peakHour, hourCount,
+    avgFeatures, featCoverage: featEntries.length,
+  };
+}
+
+function computePatterns() {
+  // grid[block 0-5][dow 0-6]   block = Math.floor(hour/4)
+  const grid = Array.from({ length: 6 }, () => new Array(7).fill(0));
+  for (const e of _history) {
+    if (e.h != null && e.dow != null)
+      grid[Math.floor(e.h / 4)][e.dow]++;
+  }
+  const max = Math.max(1, ...grid.flat());
+  return {
+    grid, max, total: _history.length,
+    blockNames: ['Late Night (0–4)', 'Early AM (4–8)', 'Morning (8–12)',
+                 'Afternoon (12–16)', 'Evening (16–20)', 'Night (20–24)'],
+    dayNames: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'],
+  };
+}
+
+function computeVibes() {
+  const MIN = 20;
+  if (_history.length < MIN) return { ready: false, needed: MIN, current: _history.length };
+  const clusters = {};
+  for (const e of _history) {
+    const k = getVibeKey(e);
+    if (!clusters[k]) clusters[k] = [];
+    clusters[k].push(e);
+  }
+  const hasFeatures = _history.some(e => e.energy != null);
+  const result = Object.entries(clusters)
+    .filter(([, arr]) => arr.length >= 3)
+    .map(([key, arr]) => {
+      const unique = [...new Map(arr.map(e => [e.id, e])).values()];
+      const fe = arr.filter(e => e.energy != null);
+      const avgE   = fe.length ? Math.round(fe.reduce((s,e)=>s+e.energy,  0)/fe.length) : null;
+      const avgV   = fe.length ? Math.round(fe.reduce((s,e)=>s+e.valence, 0)/fe.length) : null;
+      const bpmArr = fe.filter(e=>e.bpm);
+      const avgBpm = bpmArr.length ? Math.round(bpmArr.reduce((s,e)=>s+e.bpm,0)/bpmArr.length) : null;
+      return {
+        key, name: getVibeName(key),
+        plays: arr.length, count: unique.length,
+        avgEnergy: avgE, avgValence: avgV, avgBpm,
+        tracks: unique.slice(0, 50).map(e => ({ id: e.id, uri: e.uri, title: e.title, artist: e.artist })),
+      };
+    })
+    .sort((a, b) => b.plays - a.plays);
+  return { ready: true, hasFeatures, clusters: result };
+}
+
+function computeRightNow() {
+  const now  = new Date();
+  const h    = now.getHours();
+  const dow  = now.getDay();
+  const DAYS = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+  const timeLabel = h === 0 ? '12 AM' : h < 12 ? `${h} AM` : h === 12 ? '12 PM' : `${h-12} PM`;
+
+  const exact = _history.filter(e => Math.abs((e.h||0)-h) <= 1 && e.dow === dow);
+  const block = Math.floor(h / 4);
+  const broad = _history.filter(e => Math.floor((e.h||0)/4) === block);
+  const set   = exact.length >= 5 ? exact : broad.length >= 5 ? broad : null;
+
+  if (!set) return { ready: false, dayName: DAYS[dow], timeLabel };
+
+  const vibeCounts = {};
+  for (const e of set) { const k = getVibeKey(e); vibeCounts[k] = (vibeCounts[k]||0)+1; }
+  const topKey = Object.entries(vibeCounts).sort((a,b)=>b[1]-a[1])[0][0];
+
+  const trackCounts = {}; const trackMeta = {};
+  for (const e of set) {
+    trackCounts[e.id] = (trackCounts[e.id]||0)+1;
+    if (!trackMeta[e.id]) trackMeta[e.id] = { id: e.id, uri: e.uri, title: e.title, artist: e.artist };
+  }
+  const topTracks = Object.entries(trackCounts)
+    .sort((a,b)=>b[1]-a[1]).slice(0,25)
+    .map(([id]) => trackMeta[id]);
+
+  return {
+    ready: true, dayName: DAYS[dow], timeLabel,
+    sampleSize: set.length, broad: exact.length < 5,
+    vibeKey: topKey, vibeName: getVibeName(topKey), topTracks,
+  };
+}
+
+function computeFilter({ minEnergy=0, maxEnergy=100, minValence=0, maxValence=100, minBpm=0, maxBpm=300 } = {}) {
+  const unique = new Map();
+  for (const e of _history) {
+    if (unique.has(e.id)) continue;
+    if (e.energy != null) {
+      if (e.energy < minEnergy || e.energy > maxEnergy) continue;
+      if (e.valence < minValence || e.valence > maxValence) continue;
+      if (e.bpm && (e.bpm < minBpm || e.bpm > maxBpm)) continue;
+    }
+    unique.set(e.id, { id: e.id, uri: e.uri, title: e.title, artist: e.artist,
+                       energy: e.energy, valence: e.valence, bpm: e.bpm });
+  }
+  return { tracks: [...unique.values()], total: unique.size };
+}
+
 function buildStats() {
   const tracks = _sessionStats.tracksPlayed;
   const artistCounts = {};
@@ -731,28 +964,45 @@ async function poll() {
         // Broadcast fresh queue ~1.5 s after track change so Spotify's queue
         // endpoint has time to reflect the new state.
         setTimeout(emitQueue, 1500);
-        // Record to session stats (skip if same track as last entry to avoid duplicates)
+        // Record to session stats (deduplication) and persistent history
         if (state.track) {
           const last = _sessionStats.tracksPlayed[_sessionStats.tracksPlayed.length - 1];
           if (!last || last.id !== state.track.id) {
             _sessionStats.tracksPlayed.push({
-              id: state.track.id,
-              uri: state.track.uri,
-              title: state.track.title,
-              artist: state.track.artist,
-              startTime: Date.now(),
-              durationMs: state.track.duration,
+              id: state.track.id, uri: state.track.uri,
+              title: state.track.title, artist: state.track.artist,
+              startTime: Date.now(), durationMs: state.track.duration,
             });
           }
           if (_io) _io.emit('spotify:stats', buildStats());
+
+          // Build history entry — features fetched and merged then appended
+          const histEntry = {
+            ts: Date.now(),
+            h:  new Date().getHours(),
+            dow: new Date().getDay(),
+            id: state.track.id, uri: state.track.uri,
+            title: state.track.title, artist: state.track.artist,
+            album: state.track.album || '',
+            dur: state.track.duration,
+          };
+          getAudioFeatures(state.track.id)
+            .then((f) => {
+              if (f) {
+                histEntry.bpm      = Math.round(f.tempo || 0);
+                histEntry.energy   = Math.round((f.energy   || 0) * 100);
+                histEntry.valence  = Math.round((f.valence  || 0) * 100);
+                histEntry.dance    = Math.round((f.danceability || 0) * 100);
+                histEntry.acoustic = Math.round((f.acousticness  || 0) * 100);
+                histEntry.inst     = Math.round((f.instrumentalness || 0) * 100);
+                histEntry.key      = f.key != null && f.key >= 0 ? PITCH_CLASSES[f.key] : null;
+                histEntry.mode     = f.mode === 1 ? 'Maj' : f.mode === 0 ? 'Min' : null;
+                if (_io) _io.emit('spotify:audio_features', _serializeFeatures(f));
+              }
+              appendHistory(histEntry);
+            })
+            .catch(() => { appendHistory(histEntry); });
         }
-        // Fetch and broadcast audio features for the new track (may be unavailable for newer Spotify apps)
-        getAudioFeatures(state.track.id)
-          .then((f) => {
-            if (f && _io) _io.emit('spotify:audio_features', _serializeFeatures(f));
-            else if (!f) console.log('[Spotify] No audio features returned — endpoint may be unavailable for this app.');
-          })
-          .catch((err) => console.warn('[Spotify] Audio features fetch error:', err.message));
       }
 
       // Check liked status for new track
@@ -862,6 +1112,9 @@ async function playPlaylistWithSmartShuffle(playlistUri, playlistId) {
 
 function init(io) {
   _io = io;
+
+  loadHistory();
+  loadVibeNames();
 
   // Start polling if already authed
   if (isAuthed()) {
@@ -1175,6 +1428,83 @@ function init(io) {
         console.error('[Spotify] Save session playlist error:', err.message);
         socket.emit('spotify:session_playlist_saved', { error: err.message });
       }
+    });
+
+    // ----- spotify:get_insights -----
+    socket.on('spotify:get_insights', () => {
+      socket.emit('spotify:insights', {
+        profile:  computeProfile(),
+        patterns: computePatterns(),
+        vibes:    computeVibes(),
+        rightNow: computeRightNow(),
+        total:    _history.length,
+      });
+    });
+
+    // ----- spotify:rename_vibe -----
+    socket.on('spotify:rename_vibe', ({ key, name } = {}) => {
+      if (!key || !name) return;
+      _vibeNames[key] = name.trim();
+      saveVibeNames();
+      _io.emit('spotify:vibe_renamed', { key, name: name.trim() });
+    });
+
+    // ----- spotify:play_vibe -----
+    socket.on('spotify:play_vibe', async ({ key } = {}) => {
+      try {
+        const vibes = computeVibes();
+        if (!vibes.ready) return;
+        const cluster = vibes.clusters.find(c => c.key === key);
+        if (!cluster) return;
+        const tracks = [...cluster.tracks].sort(() => Math.random() - 0.5).slice(0, 25);
+        let queued = 0;
+        for (const t of tracks) {
+          try { await addToQueue(t.uri); queued++; await new Promise(r => setTimeout(r, 120)); }
+          catch { /* skip unplayable */ }
+        }
+        socket.emit('spotify:insights_action', { ok: true, msg: `Queued ${queued} tracks from "${cluster.name}"` });
+      } catch (err) {
+        socket.emit('spotify:insights_action', { ok: false, msg: err.message });
+      }
+    });
+
+    // ----- spotify:play_now -----  (Right Now tab)
+    socket.on('spotify:play_now', async () => {
+      try {
+        const rn = computeRightNow();
+        if (!rn.ready) return;
+        const tracks = [...rn.topTracks].sort(() => Math.random() - 0.5).slice(0, 25);
+        let queued = 0;
+        for (const t of tracks) {
+          try { await addToQueue(t.uri); queued++; await new Promise(r => setTimeout(r, 120)); }
+          catch { /* skip */ }
+        }
+        socket.emit('spotify:insights_action', { ok: true, msg: `Queued ${queued} tracks for right now` });
+      } catch (err) {
+        socket.emit('spotify:insights_action', { ok: false, msg: err.message });
+      }
+    });
+
+    // ----- spotify:play_filter -----
+    socket.on('spotify:play_filter', async (params = {}) => {
+      try {
+        const { tracks } = computeFilter(params);
+        const shuffled = [...tracks].sort(() => Math.random() - 0.5).slice(0, 25);
+        let queued = 0;
+        for (const t of shuffled) {
+          try { await addToQueue(t.uri); queued++; await new Promise(r => setTimeout(r, 120)); }
+          catch { /* skip */ }
+        }
+        socket.emit('spotify:insights_action', { ok: true, msg: `Queued ${queued} filtered tracks` });
+      } catch (err) {
+        socket.emit('spotify:insights_action', { ok: false, msg: err.message });
+      }
+    });
+
+    // ----- spotify:get_filter_count -----
+    socket.on('spotify:get_filter_count', (params = {}) => {
+      const { total } = computeFilter(params);
+      socket.emit('spotify:filter_count', { total });
     });
 
     // ----- spotify:get_devices -----

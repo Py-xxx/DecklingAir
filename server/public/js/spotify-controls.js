@@ -18,6 +18,12 @@ import {
   getSpotifyQueue,
   getSpotifyDevices,
   addToPlaylist,
+  getSpotifyInsights,
+  renameVibe,
+  playVibe,
+  playNow,
+  playFilter,
+  getFilterCount,
 } from './spotify-client.js';
 import { socket } from './socket.js';
 
@@ -1685,6 +1691,408 @@ function renderSpotifyStats(ctrl) {
 }
 
 // ---------------------------------------------------------------------------
+// 6. Spotify Insights Card
+// ---------------------------------------------------------------------------
+
+export function renderSpotifyInsights(ctrl) {
+  const card = document.createElement('div');
+  card.className = 'control-card spotify-insights-card';
+  card.dataset.id = ctrl.id;
+  applyGridPlacement(card, ctrl);
+
+  card.innerHTML = `
+    <div class="sp-ins-wrap">
+      <div class="sp-ins-tab-bar">
+        <button class="sp-ins-tab active" data-tab="profile">Profile</button>
+        <button class="sp-ins-tab" data-tab="patterns">Patterns</button>
+        <button class="sp-ins-tab" data-tab="vibes">Vibes</button>
+        <button class="sp-ins-tab" data-tab="rightnow">Right Now</button>
+        <button class="sp-ins-tab" data-tab="filter">Filter</button>
+      </div>
+      <div class="sp-ins-content">
+
+        <!-- PROFILE -->
+        <div class="sp-ins-panel" data-panel="profile">
+          <div class="sp-ins-stats-row">
+            <div class="sp-ins-stat"><span class="sp-ins-stat-val sp-ins-total">—</span><span class="sp-ins-stat-lbl">Plays</span></div>
+            <div class="sp-ins-stat"><span class="sp-ins-stat-val sp-ins-unique">—</span><span class="sp-ins-stat-lbl">Unique</span></div>
+            <div class="sp-ins-stat"><span class="sp-ins-stat-val sp-ins-days">—</span><span class="sp-ins-stat-lbl">Days</span></div>
+            <div class="sp-ins-stat"><span class="sp-ins-stat-val sp-ins-peak">—</span><span class="sp-ins-stat-lbl">Peak hour</span></div>
+          </div>
+          <div class="sp-ins-features-section" style="display:none">
+            <div class="sp-ins-sub-title">Audio Profile <span class="sp-ins-feat-avg-bpm"></span></div>
+            <div class="sp-ins-feat-bars"></div>
+          </div>
+          <div class="sp-ins-sub-title sp-ins-artists-title">Top Artists</div>
+          <div class="sp-ins-artists-list"></div>
+        </div>
+
+        <!-- PATTERNS -->
+        <div class="sp-ins-panel" data-panel="patterns" style="display:none">
+          <div class="sp-ins-sub-title">When you listen most</div>
+          <div class="sp-ins-heatmap-wrap">
+            <div class="sp-ins-heatmap"></div>
+          </div>
+          <div class="sp-ins-heatmap-legend">
+            <span>Less</span>
+            <span class="sp-ins-legend-boxes"></span>
+            <span>More</span>
+          </div>
+        </div>
+
+        <!-- VIBES -->
+        <div class="sp-ins-panel" data-panel="vibes" style="display:none">
+          <div class="sp-ins-vibes-empty" style="display:none">
+            <div class="sp-ins-empty-icon">✨</div>
+            <div class="sp-ins-empty-msg">Keep listening to build your vibe profile</div>
+            <div class="sp-ins-empty-sub sp-ins-vibe-progress"></div>
+          </div>
+          <div class="sp-ins-vibes-list"></div>
+        </div>
+
+        <!-- RIGHT NOW -->
+        <div class="sp-ins-panel" data-panel="rightnow" style="display:none">
+          <div class="sp-ins-rn-empty" style="display:none">
+            <div class="sp-ins-empty-icon">▶</div>
+            <div class="sp-ins-empty-msg">Keep listening to enable Right Now</div>
+            <div class="sp-ins-empty-sub">Not enough data for your current time yet</div>
+          </div>
+          <div class="sp-ins-rn-content" style="display:none">
+            <div class="sp-ins-rn-time"></div>
+            <div class="sp-ins-rn-vibe-label">You usually listen to</div>
+            <div class="sp-ins-rn-vibe-name"></div>
+            <div class="sp-ins-rn-sample"></div>
+            <button class="sp-ins-action-btn sp-ins-rn-play-btn">▶ Queue this vibe</button>
+          </div>
+        </div>
+
+        <!-- FILTER -->
+        <div class="sp-ins-panel" data-panel="filter" style="display:none">
+          <div class="sp-ins-filter-form">
+            <div class="sp-ins-filter-row">
+              <label class="sp-ins-filter-label">Energy <span class="sp-ins-energy-val">0–100%</span></label>
+              <div class="sp-ins-range-wrap">
+                <input type="range" class="sp-ins-range" id="ins-energy-min" min="0" max="100" value="0">
+                <input type="range" class="sp-ins-range" id="ins-energy-max" min="0" max="100" value="100">
+              </div>
+            </div>
+            <div class="sp-ins-filter-row">
+              <label class="sp-ins-filter-label">Mood <span class="sp-ins-mood-val">Sad → Happy (0–100%)</span></label>
+              <div class="sp-ins-range-wrap">
+                <input type="range" class="sp-ins-range" id="ins-mood-min" min="0" max="100" value="0">
+                <input type="range" class="sp-ins-range" id="ins-mood-max" min="0" max="100" value="100">
+              </div>
+            </div>
+            <div class="sp-ins-filter-row">
+              <label class="sp-ins-filter-label">BPM</label>
+              <div class="sp-ins-bpm-row">
+                <input type="number" class="sp-ins-bpm-input" id="ins-bpm-min" min="0" max="300" value="0" placeholder="Min">
+                <span class="sp-ins-bpm-sep">–</span>
+                <input type="number" class="sp-ins-bpm-input" id="ins-bpm-max" min="0" max="300" value="300" placeholder="Max">
+              </div>
+            </div>
+            <div class="sp-ins-filter-footer">
+              <span class="sp-ins-filter-count">— tracks match</span>
+              <button class="sp-ins-action-btn sp-ins-filter-play-btn" disabled>Queue tracks</button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+      <div class="sp-ins-action-feedback" style="display:none"></div>
+    </div>
+  `;
+
+  card.appendChild(dragHandle());
+  card.appendChild(resizeHandle());
+  card.appendChild(editOverlay(ctrl.id));
+
+  // ---- Tab switching ----
+  const tabBar     = card.querySelector('.sp-ins-tab-bar');
+  const panels     = card.querySelectorAll('.sp-ins-panel');
+  const feedback   = card.querySelector('.sp-ins-action-feedback');
+
+  tabBar.addEventListener('click', (e) => {
+    const btn = e.target.closest('.sp-ins-tab');
+    if (!btn) return;
+    tabBar.querySelectorAll('.sp-ins-tab').forEach(t => t.classList.remove('active'));
+    btn.classList.add('active');
+    panels.forEach(p => p.style.display = p.dataset.panel === btn.dataset.tab ? '' : 'none');
+  });
+
+  // ---- Feedback helper ----
+  function _showFeedback(msg, ok = true) {
+    feedback.textContent = msg;
+    feedback.className = 'sp-ins-action-feedback ' + (ok ? 'sp-ins-fb-ok' : 'sp-ins-fb-err');
+    feedback.style.display = '';
+    clearTimeout(feedback._t);
+    feedback._t = setTimeout(() => { feedback.style.display = 'none'; }, 4000);
+  }
+
+  // ---- Listen for action results ----
+  const _onAction = (data) => _showFeedback(data.msg, data.ok);
+  const _onVibeRenamed = ({ key, name }) => {
+    card.querySelectorAll(`.sp-ins-vibe-row[data-key="${key}"] .sp-ins-vibe-name-text`).forEach(el => {
+      el.textContent = name;
+    });
+  };
+  socket.on('spotify:insights_action', _onAction);
+  socket.on('spotify:vibe_renamed', _onVibeRenamed);
+
+  // ---- Render helpers ----
+  const HOUR_LABELS = ['12am','1am','2am','3am','4am','5am','6am','7am','8am','9am','10am','11am',
+                       '12pm','1pm','2pm','3pm','4pm','5pm','6pm','7pm','8pm','9pm','10pm','11pm'];
+
+  function _renderProfile(p) {
+    if (!p.ready) return;
+    card.querySelector('.sp-ins-total').textContent  = p.total;
+    card.querySelector('.sp-ins-unique').textContent = p.unique;
+    card.querySelector('.sp-ins-days').textContent   = p.daysLogging;
+    card.querySelector('.sp-ins-peak').textContent   = HOUR_LABELS[p.peakHour] || '—';
+
+    if (p.avgFeatures) {
+      const sec = card.querySelector('.sp-ins-features-section');
+      sec.style.display = '';
+      if (p.avgFeatures.bpm) card.querySelector('.sp-ins-feat-avg-bpm').textContent = `· avg ${p.avgFeatures.bpm} BPM`;
+      const barsEl = card.querySelector('.sp-ins-feat-bars');
+      barsEl.innerHTML = '';
+      const feats = [
+        { label: 'Energy',      val: p.avgFeatures.energy   },
+        { label: 'Mood',        val: p.avgFeatures.valence  },
+        { label: 'Danceability',val: p.avgFeatures.dance    },
+        { label: 'Acoustic',    val: p.avgFeatures.acoustic },
+        { label: 'Instrumental',val: p.avgFeatures.inst     },
+      ];
+      feats.forEach(({ label, val }) => {
+        const row = document.createElement('div');
+        row.className = 'sp-ins-feat-row';
+        row.innerHTML = `
+          <span class="sp-ins-feat-lbl">${label}</span>
+          <div class="sp-ins-feat-bar-wrap"><div class="sp-ins-feat-bar" style="width:${val}%"></div></div>
+          <span class="sp-ins-feat-num">${val}%</span>
+        `;
+        barsEl.appendChild(row);
+      });
+    }
+
+    const artistsList = card.querySelector('.sp-ins-artists-list');
+    artistsList.innerHTML = '';
+    const maxC = p.topArtists.length ? p.topArtists[0].count : 1;
+    p.topArtists.forEach(({ name, count }) => {
+      const row = document.createElement('div');
+      row.className = 'sp-ins-artist-row';
+      const pct = Math.round((count / maxC) * 100);
+      row.innerHTML = `
+        <span class="sp-ins-artist-name">${_esc(name)}</span>
+        <div class="sp-ins-artist-bar-wrap"><div class="sp-ins-artist-bar" style="width:${pct}%"></div></div>
+        <span class="sp-ins-artist-count">${count}</span>
+      `;
+      artistsList.appendChild(row);
+    });
+  }
+
+  function _renderPatterns(p) {
+    const heatmap = card.querySelector('.sp-ins-heatmap');
+    heatmap.innerHTML = '';
+    // Header row: day names
+    const header = document.createElement('div');
+    header.className = 'sp-ins-hm-header';
+    header.innerHTML = `<div class="sp-ins-hm-row-label"></div>` +
+      p.dayNames.map(d => `<div class="sp-ins-hm-day">${d}</div>`).join('');
+    heatmap.appendChild(header);
+    // Data rows
+    p.blockNames.forEach((blockName, bi) => {
+      const row = document.createElement('div');
+      row.className = 'sp-ins-hm-row';
+      const shortLabel = blockName.split(' ')[0]; // first word only
+      let html = `<div class="sp-ins-hm-row-label">${shortLabel}</div>`;
+      p.dayNames.forEach((_, di) => {
+        const count = p.grid[bi][di];
+        const intensity = Math.round((count / p.max) * 100);
+        const alpha = count === 0 ? 0.05 : 0.1 + (intensity / 100) * 0.85;
+        html += `<div class="sp-ins-hm-cell" title="${p.blockNames[bi]} · ${p.dayNames[di]}: ${count} plays"
+                      style="background:rgba(29,185,84,${alpha.toFixed(2)})"></div>`;
+      });
+      row.innerHTML = html;
+      heatmap.appendChild(row);
+    });
+    // Legend
+    const legend = card.querySelector('.sp-ins-legend-boxes');
+    legend.innerHTML = [0.05, 0.2, 0.4, 0.65, 0.9].map(a =>
+      `<span class="sp-ins-legend-box" style="background:rgba(29,185,84,${a})"></span>`
+    ).join('');
+  }
+
+  function _renderVibes(v) {
+    const emptyEl = card.querySelector('.sp-ins-vibes-empty');
+    const listEl  = card.querySelector('.sp-ins-vibes-list');
+    if (!v.ready) {
+      emptyEl.style.display = '';
+      listEl.style.display  = 'none';
+      card.querySelector('.sp-ins-vibe-progress').textContent =
+        `${v.current} / ${v.needed} plays logged`;
+      return;
+    }
+    emptyEl.style.display = 'none';
+    listEl.style.display  = '';
+    listEl.innerHTML = '';
+    v.clusters.forEach(cl => {
+      const row = document.createElement('div');
+      row.className = 'sp-ins-vibe-row';
+      row.dataset.key = cl.key;
+      const chips = [];
+      if (cl.avgEnergy  != null) chips.push(`<span class="sp-feat-chip sp-feat-energy">⚡ ${cl.avgEnergy}%</span>`);
+      if (cl.avgValence != null) chips.push(`<span class="sp-feat-chip sp-feat-valence">${cl.avgValence >= 60 ? '😄' : cl.avgValence >= 35 ? '😐' : '😔'} ${cl.avgValence}%</span>`);
+      if (cl.avgBpm     != null) chips.push(`<span class="sp-feat-chip sp-feat-bpm">♩ ${cl.avgBpm}</span>`);
+      row.innerHTML = `
+        <div class="sp-ins-vibe-top">
+          <span class="sp-ins-vibe-name-wrap">
+            <span class="sp-ins-vibe-name-text">${_esc(cl.name)}</span>
+            <button class="sp-ins-vibe-rename-btn" title="Rename">✎</button>
+          </span>
+          <span class="sp-ins-vibe-meta">${cl.plays} plays · ${cl.count} tracks</span>
+          <button class="sp-ins-action-btn sp-ins-vibe-queue-btn">Queue</button>
+        </div>
+        <div class="sp-ins-vibe-chips">${chips.join('')}</div>
+      `;
+      // Rename
+      row.querySelector('.sp-ins-vibe-rename-btn').addEventListener('pointerup', () => {
+        if (isEditMode()) return;
+        const nameEl = row.querySelector('.sp-ins-vibe-name-text');
+        const current = nameEl.textContent;
+        const input = document.createElement('input');
+        input.className = 'sp-ins-vibe-rename-input';
+        input.value = current;
+        nameEl.replaceWith(input);
+        input.focus(); input.select();
+        const commit = () => {
+          const val = input.value.trim() || current;
+          const newText = document.createElement('span');
+          newText.className = 'sp-ins-vibe-name-text';
+          newText.textContent = val;
+          input.replaceWith(newText);
+          if (val !== current) renameVibe(cl.key, val);
+        };
+        input.addEventListener('blur', commit);
+        input.addEventListener('keydown', e => {
+          if (e.key === 'Enter') { e.preventDefault(); commit(); }
+          if (e.key === 'Escape') { input.value = current; commit(); }
+        });
+      });
+      // Queue
+      row.querySelector('.sp-ins-vibe-queue-btn').addEventListener('pointerup', () => {
+        if (isEditMode()) return;
+        playVibe(cl.key);
+        _showFeedback(`Queuing "${cl.name}"…`);
+      });
+      listEl.appendChild(row);
+    });
+  }
+
+  function _renderRightNow(rn) {
+    const emptyEl   = card.querySelector('.sp-ins-rn-empty');
+    const contentEl = card.querySelector('.sp-ins-rn-content');
+    if (!rn.ready) {
+      emptyEl.style.display   = '';
+      contentEl.style.display = 'none';
+      return;
+    }
+    emptyEl.style.display   = 'none';
+    contentEl.style.display = '';
+    card.querySelector('.sp-ins-rn-time').textContent =
+      `${rn.dayName} · ${rn.timeLabel}`;
+    card.querySelector('.sp-ins-rn-vibe-name').textContent = rn.vibeName;
+    card.querySelector('.sp-ins-rn-sample').textContent =
+      `Based on ${rn.sampleSize} plays${rn.broad ? ' (similar time)' : ' at this time'}`;
+  }
+
+  card.querySelector('.sp-ins-rn-play-btn').addEventListener('pointerup', () => {
+    if (isEditMode()) return;
+    playNow();
+    _showFeedback('Queuing your Right Now vibe…');
+  });
+
+  // ---- Filter tab ----
+  const energyMin  = card.querySelector('#ins-energy-min');
+  const energyMax  = card.querySelector('#ins-energy-max');
+  const moodMin    = card.querySelector('#ins-mood-min');
+  const moodMax    = card.querySelector('#ins-mood-max');
+  const bpmMin     = card.querySelector('#ins-bpm-min');
+  const bpmMax     = card.querySelector('#ins-bpm-max');
+  const countEl    = card.querySelector('.sp-ins-filter-count');
+  const filterBtn  = card.querySelector('.sp-ins-filter-play-btn');
+  const energyVal  = card.querySelector('.sp-ins-energy-val');
+  const moodVal    = card.querySelector('.sp-ins-mood-val');
+
+  let _filterDebounce = null;
+  function _getFilterParams() {
+    return {
+      minEnergy: Math.min(+energyMin.value, +energyMax.value),
+      maxEnergy: Math.max(+energyMin.value, +energyMax.value),
+      minValence: Math.min(+moodMin.value, +moodMax.value),
+      maxValence: Math.max(+moodMin.value, +moodMax.value),
+      minBpm: Math.min(+bpmMin.value || 0, +bpmMax.value || 300),
+      maxBpm: Math.max(+bpmMin.value || 0, +bpmMax.value || 300),
+    };
+  }
+  function _updateFilterLabels() {
+    const eMin = Math.min(+energyMin.value, +energyMax.value);
+    const eMax = Math.max(+energyMin.value, +energyMax.value);
+    const mMin = Math.min(+moodMin.value,   +moodMax.value);
+    const mMax = Math.max(+moodMin.value,   +moodMax.value);
+    energyVal.textContent = eMin === 0 && eMax === 100 ? 'any' : `${eMin}–${eMax}%`;
+    moodVal.textContent   = mMin === 0 && mMax === 100 ? 'any' : `${mMin}–${mMax}%`;
+  }
+  function _requestFilterCount() {
+    clearTimeout(_filterDebounce);
+    _filterDebounce = setTimeout(() => {
+      getFilterCount(_getFilterParams());
+    }, 300);
+  }
+  [energyMin, energyMax, moodMin, moodMax, bpmMin, bpmMax].forEach(el => {
+    el.addEventListener('input', () => { _updateFilterLabels(); _requestFilterCount(); });
+  });
+
+  const _onFilterCount = ({ total }) => {
+    countEl.textContent = `${total} track${total !== 1 ? 's' : ''} match`;
+    filterBtn.disabled = total === 0;
+  };
+  socket.on('spotify:filter_count', _onFilterCount);
+
+  filterBtn.addEventListener('pointerup', () => {
+    if (isEditMode()) return;
+    playFilter(_getFilterParams());
+    _showFeedback('Queuing filtered tracks…');
+  });
+
+  // ---- Main data load ----
+  function _loadAll(data) {
+    if (!data) return;
+    _renderProfile(data.profile  || {});
+    _renderPatterns(data.patterns || { grid: [], max: 1, blockNames: [], dayNames: [], total: 0 });
+    _renderVibes(data.vibes      || { ready: false, needed: 20, current: 0 });
+    _renderRightNow(data.rightNow|| {});
+    // Init filter count
+    _requestFilterCount();
+  }
+
+  // Cleanup
+  const _cleanObs = new MutationObserver(() => {
+    if (!document.contains(card)) {
+      socket.off('spotify:insights_action', _onAction);
+      socket.off('spotify:vibe_renamed',    _onVibeRenamed);
+      socket.off('spotify:filter_count',    _onFilterCount);
+      _cleanObs.disconnect();
+    }
+  });
+  _cleanObs.observe(document.body, { childList: true, subtree: true });
+
+  getSpotifyInsights().then(_loadAll);
+
+  return card;
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch export
 // ---------------------------------------------------------------------------
 
@@ -1695,6 +2103,7 @@ export function renderSpotifyControl(ctrl) {
     case 'spotify_playlists': return renderSpotifyPlaylists(ctrl);
     case 'spotify_queue':     return renderSpotifyQueue(ctrl);
     case 'spotify_stats':     return renderSpotifyStats(ctrl);
+    case 'spotify_insights':  return renderSpotifyInsights(ctrl);
     default:
       console.warn('[spotify-controls] Unknown control type:', ctrl.type);
       return null;

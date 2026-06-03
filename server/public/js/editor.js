@@ -18,6 +18,7 @@ const DEFAULT_SIZES = {
   spotify_playlists: [3, 4],
   spotify_queue:     [2, 3],
   spotify_stats:     [2, 4],
+  spotify_insights:  [4, 5],
 };
 
 const VM_ONLY_TYPES = new Set([
@@ -418,6 +419,7 @@ function showConfigSection(type) {
     spotify_playlists: 'cfg-spotify-playlists',
     spotify_queue:     'cfg-spotify-queue',
     spotify_stats:     'cfg-spotify-stats',
+    spotify_insights:  'cfg-spotify-insights',
   };
 
   const sectionId = sectionMap[type];
@@ -672,6 +674,7 @@ function buildControlConfig(type) {
   if (type === 'spotify_search') return { label: label || 'Search' };
   if (type === 'spotify_queue')  return { label: label || 'Queue' };
   if (type === 'spotify_stats')  return { label: label || 'Session Stats' };
+  if (type === 'spotify_insights') return { label: label || 'Music Intelligence' };
   if (type === 'spotify_playlists') {
     const columns = Number.parseInt(document.getElementById('cfg-spotify-pl-cols')?.value, 10) || 3;
     const showSpecialPlaylists = document.getElementById('cfg-spotify-pl-special')?.checked ?? false;

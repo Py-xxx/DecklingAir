@@ -115,6 +115,41 @@ export function resetSpotifySession() {
   socket.emit('spotify:reset_session');
 }
 
+/**
+ * Request full insights data (profile, patterns, vibes, rightNow).
+ */
+export function getSpotifyInsights() {
+  return new Promise((resolve) => {
+    socket.once('spotify:insights', resolve);
+    socket.emit('spotify:get_insights');
+  });
+}
+
+/** Rename a vibe cluster. */
+export function renameVibe(key, name) {
+  socket.emit('spotify:rename_vibe', { key, name });
+}
+
+/** Queue all tracks in a vibe cluster (shuffled). */
+export function playVibe(key) {
+  socket.emit('spotify:play_vibe', { key });
+}
+
+/** Queue tracks matching the Right Now suggestion. */
+export function playNow() {
+  socket.emit('spotify:play_now');
+}
+
+/** Queue tracks matching filter params. */
+export function playFilter(params) {
+  socket.emit('spotify:play_filter', params);
+}
+
+/** Get a count of tracks matching filter params (no queuing). */
+export function getFilterCount(params) {
+  socket.emit('spotify:get_filter_count', params);
+}
+
 export function saveSessionAsPlaylist(name) {
   return new Promise((resolve) => {
     socket.once('spotify:session_playlist_saved', resolve);
