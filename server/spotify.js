@@ -833,7 +833,10 @@ const VIBE_DEFAULTS = {
 
 function getVibeKey(e) {
   if (e.energy == null || e.valence == null) {
-    const h = e.h || 0;
+    // No audio features — only fall back to time-of-day for entries we logged ourselves.
+    // Seeded entries (from Spotify API) must not use timestamp data for vibe assignment.
+    if (e.h == null || e.seeded) return null;
+    const h = e.h;
     if (h >= 6  && h < 10) return 't_morning';
     if (h >= 10 && h < 14) return 't_midday';
     if (h >= 14 && h < 18) return 't_afternoon';
@@ -936,6 +939,7 @@ function computeVibes() {
   const clusters = {};
   for (const e of all) {
     const k = getVibeKey(e);
+    if (!k) continue; // seeded entry with no audio features and no timestamp — skip
     if (!clusters[k]) clusters[k] = [];
     clusters[k].push(e);
   }
