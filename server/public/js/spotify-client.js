@@ -108,6 +108,13 @@ export function getSpotifyStats() {
  * Resolves with { success, name, playlistId, url, trackCount } or { error }.
  * @param {string} [name]  Optional playlist name; auto-generated if omitted.
  */
+/**
+ * Reset the current session stats (clears all tracked tracks and resets the clock).
+ */
+export function resetSpotifySession() {
+  socket.emit('spotify:reset_session');
+}
+
 export function saveSessionAsPlaylist(name) {
   return new Promise((resolve) => {
     socket.once('spotify:session_playlist_saved', resolve);

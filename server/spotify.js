@@ -682,7 +682,6 @@ function _serializeFeatures(f) {
 
 function buildStats() {
   const tracks = _sessionStats.tracksPlayed;
-  const totalMs = tracks.reduce((sum, t) => sum + (t.durationMs || 0), 0);
   const artistCounts = {};
   tracks.forEach((t) => {
     if (t.artist) {
@@ -695,12 +694,23 @@ function buildStats() {
     .sort((a, b) => b[1] - a[1])
     .slice(0, 5)
     .map(([name, count]) => ({ name, count }));
+
+  // Build recent tracks deduplicated by ID (don't show same track twice)
+  const seenIds = new Set();
+  const recentTracks = [];
+  for (let i = tracks.length - 1; i >= 0 && recentTracks.length < 5; i--) {
+    const t = tracks[i];
+    if (!seenIds.has(t.id)) {
+      seenIds.add(t.id);
+      recentTracks.push({ id: t.id, title: t.title, artist: t.artist });
+    }
+  }
+
   return {
     startTime: _sessionStats.startTime,
     tracksCount: tracks.length,
-    totalMs,
     topArtists,
-    recentTracks: tracks.slice(-5).reverse().map(({ id, title, artist }) => ({ id, title, artist })),
+    recentTracks,
   };
 }
 
@@ -721,16 +731,19 @@ async function poll() {
         // Broadcast fresh queue ~1.5 s after track change so Spotify's queue
         // endpoint has time to reflect the new state.
         setTimeout(emitQueue, 1500);
-        // Record to session stats
+        // Record to session stats (skip if same track as last entry to avoid duplicates)
         if (state.track) {
-          _sessionStats.tracksPlayed.push({
-            id: state.track.id,
-            uri: state.track.uri,
-            title: state.track.title,
-            artist: state.track.artist,
-            startTime: Date.now(),
-            durationMs: state.track.duration,
-          });
+          const last = _sessionStats.tracksPlayed[_sessionStats.tracksPlayed.length - 1];
+          if (!last || last.id !== state.track.id) {
+            _sessionStats.tracksPlayed.push({
+              id: state.track.id,
+              uri: state.track.uri,
+              title: state.track.title,
+              artist: state.track.artist,
+              startTime: Date.now(),
+              durationMs: state.track.duration,
+            });
+          }
           if (_io) _io.emit('spotify:stats', buildStats());
         }
         // Fetch and broadcast audio features for the new track (may be unavailable for newer Spotify apps)
@@ -1109,6 +1122,12 @@ function init(io) {
     // ----- spotify:get_stats -----
     socket.on('spotify:get_stats', () => {
       socket.emit('spotify:stats', buildStats());
+    });
+
+    // ----- spotify:reset_session -----
+    socket.on('spotify:reset_session', () => {
+      _sessionStats = { startTime: Date.now(), tracksPlayed: [] };
+      _io.emit('spotify:stats', buildStats());
     });
 
     // ----- spotify:save_session_playlist -----

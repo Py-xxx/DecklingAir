@@ -13,6 +13,7 @@ import {
   getSpotifyAudioFeatures,
   getSpotifyBatchAudioFeatures,
   getSpotifyStats,
+  resetSpotifySession,
   saveSessionAsPlaylist,
   getSpotifyQueue,
   getSpotifyDevices,
@@ -814,9 +815,11 @@ function renderSpotifyPlayer(ctrl) {
 
     const { track, isPlaying, progress, shuffle, repeat, liked } = state;
 
-    // Hide stale features when track changes
-    if (_currentTrack && _currentTrack.id !== track.id) {
+    // When track changes (or first load): clear stale features and request fresh ones
+    if (!_currentTrack || _currentTrack.id !== track.id) {
       _showFeatures(null);
+      // Request features; the persistent socket.on listener below will handle the response
+      socket.emit('spotify:get_audio_features', { trackId: track.id });
     }
 
     _currentTrack = track;
@@ -1483,6 +1486,7 @@ function renderSpotifyStats(ctrl) {
       <div class="sp-section-header">
         <span class="sp-section-title">Session</span>
         <span class="sp-stats-since"></span>
+        <button class="sp-stats-reset-btn" aria-label="Reset session" title="Reset session">↺</button>
       </div>
       <div class="sp-stats-grid">
         <div class="sp-stat-tile">
@@ -1521,6 +1525,7 @@ function renderSpotifyStats(ctrl) {
   card.appendChild(resizeHandle());
   card.appendChild(editOverlay(ctrl.id));
 
+  const resetBtn      = card.querySelector('.sp-stats-reset-btn');
   const sinceEl       = card.querySelector('.sp-stats-since');
   const tracksEl      = card.querySelector('.sp-stat-tracks');
   const timeEl        = card.querySelector('.sp-stat-time');
@@ -1532,6 +1537,41 @@ function renderSpotifyStats(ctrl) {
   const saveConfirm   = card.querySelector('.sp-save-session-confirm');
   const saveCancel    = card.querySelector('.sp-save-session-cancel');
   const saveFeedback  = card.querySelector('.sp-save-session-feedback');
+
+  // ---- Actual play-time timer (counts only while Spotify is playing) ----
+  let _listenedMs = 0;   // accumulated ms while playing
+  let _playStart  = null; // Date.now() when playback last started, null when paused
+
+  function _getLiveMs() {
+    return _listenedMs + (_playStart !== null ? Date.now() - _playStart : 0);
+  }
+
+  const _onStateForTimer = (state) => {
+    const playing = !!(state && state.isPlaying);
+    if (playing && _playStart === null) {
+      _playStart = Date.now();
+    } else if (!playing && _playStart !== null) {
+      _listenedMs += Date.now() - _playStart;
+      _playStart = null;
+    }
+    // Always keep the tile up to date immediately on state change
+    timeEl.textContent = fmtDuration(_getLiveMs());
+  };
+  socket.on('spotify:state', _onStateForTimer);
+
+  // Tick every second so the displayed time advances while playing
+  const _timerInterval = setInterval(() => {
+    if (_playStart !== null) timeEl.textContent = fmtDuration(_getLiveMs());
+  }, 1000);
+
+  resetBtn.addEventListener('pointerup', () => {
+    if (isEditMode()) return;
+    // Reset client-side timer too
+    _listenedMs = 0;
+    _playStart = null;
+    timeEl.textContent = fmtDuration(0);
+    resetSpotifySession();
+  });
 
   function _showSaveForm() {
     saveBtn.style.display = 'none';
@@ -1594,7 +1634,7 @@ function renderSpotifyStats(ctrl) {
     if (!data) return;
     sinceEl.textContent = `since ${fmtTime(data.startTime)}`;
     tracksEl.textContent = data.tracksCount ?? 0;
-    timeEl.textContent = fmtDuration(data.totalMs);
+    // timeEl is owned by the play-timer above — don't overwrite it here
 
     artistsList.innerHTML = '';
     const artists = (data.topArtists || []).slice(0, 5);
@@ -1632,6 +1672,8 @@ function renderSpotifyStats(ctrl) {
   const observer = new MutationObserver(() => {
     if (!document.contains(card)) {
       _statsCardUpdaters.delete(_render);
+      socket.off('spotify:state', _onStateForTimer);
+      clearInterval(_timerInterval);
       observer.disconnect();
     }
   });
