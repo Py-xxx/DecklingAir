@@ -1847,8 +1847,24 @@ export function renderSpotifyInsights(ctrl) {
     if (!p.ready) return;
     card.querySelector('.sp-ins-total').textContent  = p.total;
     card.querySelector('.sp-ins-unique').textContent = p.unique;
-    card.querySelector('.sp-ins-days').textContent   = p.daysLogging;
+    // daysLogging is only meaningful once we have our own logged data
+    card.querySelector('.sp-ins-days').textContent   = p.daysLogging || '—';
     card.querySelector('.sp-ins-peak').textContent   = HOUR_LABELS[p.peakHour] || '—';
+
+    // Show data source note if we're combining Spotify's data with our own
+    const seededCount = p.total - (p.ownTotal || 0);
+    let sourceNote = card.querySelector('.sp-ins-source-note');
+    if (!sourceNote) {
+      sourceNote = document.createElement('div');
+      sourceNote.className = 'sp-ins-source-note';
+      card.querySelector('.sp-ins-stats-row').after(sourceNote);
+    }
+    if (seededCount > 0) {
+      sourceNote.textContent = `Includes ${seededCount} tracks from your Spotify history`;
+      sourceNote.style.display = '';
+    } else {
+      sourceNote.style.display = 'none';
+    }
 
     if (p.avgFeatures) {
       const sec = card.querySelector('.sp-ins-features-section');
@@ -1930,7 +1946,7 @@ export function renderSpotifyInsights(ctrl) {
       emptyEl.style.display = '';
       listEl.style.display  = 'none';
       card.querySelector('.sp-ins-vibe-progress').textContent =
-        `${v.current} / ${v.needed} plays logged`;
+        `${v.current} / ${v.needed} tracks needed`;
       return;
     }
     emptyEl.style.display = 'none';

@@ -1544,6 +1544,14 @@
   color: var(--text-3, #888);
 }
 
+.sp-ins-source-note {
+  font-size: 10px;
+  color: var(--text-3, #888);
+  text-align: center;
+  padding: 2px 0 4px;
+  opacity: 0.75;
+}
+
 .sp-ins-features-section {
   display: flex;
   flex-direction: column;

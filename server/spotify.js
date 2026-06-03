@@ -63,8 +63,10 @@ let _sessionStats = {
   startTime: Date.now(),
   tracksPlayed: [], // { id, title, artist, startTime, durationMs }
 };
-let _history   = [];   // all-time log entries, loaded from file on start
-let _vibeNames = {};   // { vibeKey: 'Custom Name' }
+let _history        = [];   // all-time log entries, loaded from file on start
+let _seededHistory  = [];   // in-memory only: entries seeded from Spotify API
+let _seedTimestamp  = 0;    // when _seededHistory was last populated
+let _vibeNames      = {};   // { vibeKey: 'Custom Name' }
 
 // ---------------------------------------------------------------------------
 // Config / token storage
@@ -152,6 +154,93 @@ function appendHistory(entry) {
     fs.appendFileSync(HISTORY_FILE, JSON.stringify(entry) + '\n');
     _history.push(entry);
   } catch (err) { console.error('[Spotify] Failed to append history:', err.message); }
+}
+
+/**
+ * Merge our own logged history with Spotify-seeded entries.
+ * Seeded entries without timestamps (top-tracks) are only included once
+ * per unique track ID that isn't already covered by _history.
+ */
+function combinedHistory() {
+  const ownIds = new Set(_history.map(e => e.id));
+  const seen   = new Set();
+  const extra  = [];
+  for (const e of _seededHistory) {
+    if (e.ts) {
+      // Recently-played: real play event — include as-is (already deduped vs _history at seed time)
+      extra.push(e);
+    } else {
+      // Top-tracks (no timestamp): only include if track not already in our own log
+      if (ownIds.has(e.id) || seen.has(e.id)) continue;
+      seen.add(e.id);
+      extra.push(e);
+    }
+  }
+  return [..._history, ...extra];
+}
+
+/**
+ * Fetch recently-played and top-tracks from Spotify to seed _seededHistory.
+ * Called once on startup (after auth) and lazily refreshed every hour.
+ */
+async function seedFromSpotify() {
+  if (!isAuthed()) return;
+  try {
+    console.log('[Spotify] Seeding history from Spotify API…');
+    const seeds = [];
+
+    // 1. Recently played — has real played_at timestamps
+    try {
+      const rp = await api('GET', '/me/player/recently-played', { params: { limit: 50 } });
+      for (const item of (rp?.items || [])) {
+        const t = item.track;
+        if (!t?.id) continue;
+        const ts = new Date(item.played_at).getTime();
+        // Skip if we already logged this exact play ourselves (within 2 min)
+        const dupe = _history.some(h => h.id === t.id && Math.abs((h.ts || 0) - ts) < 120000);
+        if (dupe) continue;
+        const d = new Date(ts);
+        seeds.push({
+          id: t.id, uri: t.uri,
+          title: t.name,
+          artist: t.artists?.map(a => a.name).join(', ') || '',
+          album: t.album?.name || '',
+          ts, h: d.getHours(), dow: d.getDay(),
+          seeded: true, source: 'recently_played',
+        });
+      }
+      console.log(`[Spotify] Seed: ${seeds.length} recently-played entries`);
+    } catch (e) { console.warn('[Spotify] recently-played seed failed:', e.message); }
+
+    // 2. Top tracks (long + medium term) — no timestamps, not for time-based analysis
+    const ownIds      = new Set(_history.map(e => e.id));
+    const seededTopIds = new Set();
+    for (const range of ['long_term', 'medium_term']) {
+      try {
+        const tt = await api('GET', '/me/top/tracks', { params: { time_range: range, limit: 50 } });
+        let added = 0;
+        for (const t of (tt?.items || [])) {
+          if (!t?.id || ownIds.has(t.id) || seededTopIds.has(t.id)) continue;
+          seededTopIds.add(t.id);
+          seeds.push({
+            id: t.id, uri: t.uri,
+            title: t.name,
+            artist: t.artists?.map(a => a.name).join(', ') || '',
+            album: t.album?.name || '',
+            seeded: true, source: range,
+          });
+          added++;
+        }
+        console.log(`[Spotify] Seed: ${added} top-tracks (${range})`);
+      } catch (e) { console.warn(`[Spotify] top-tracks ${range} seed failed:`, e.message); }
+    }
+
+    _seededHistory = seeds;
+    _seedTimestamp = Date.now();
+    console.log(`[Spotify] Seed complete — ${_seededHistory.length} total seeded entries`);
+  } catch (err) {
+    console.error('[Spotify] seedFromSpotify error:', err.message);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -773,12 +862,13 @@ function getVibeName(key) {
 // ---------------------------------------------------------------------------
 
 function computeProfile() {
-  if (!_history.length) return { ready: false, total: 0 };
+  const all = combinedHistory();
+  if (!all.length) return { ready: false, total: 0 };
   const artistCount = {};
   const hourCount   = new Array(24).fill(0);
-  const featEntries = _history.filter(e => e.energy != null);
+  const featEntries = all.filter(e => e.energy != null);
 
-  for (const e of _history) {
+  for (const e of all) {
     if (e.artist) artistCount[e.artist] = (artistCount[e.artist] || 0) + 1;
     if (e.h != null) hourCount[e.h]++;
   }
@@ -807,27 +897,32 @@ function computeProfile() {
       bpm:      s.bpmCount ? Math.round(s.bpm / s.bpmCount) : null,
     };
   }
+  // daysLogging only counts from first *real* logged entry (not seeded)
   const daysLogging = _history.length
     ? Math.max(1, Math.ceil((Date.now() - _history[0].ts) / 86400000))
     : 0;
   return {
-    ready: true, total: _history.length,
-    unique: new Set(_history.map(e => e.id)).size,
+    ready: true, total: all.length,
+    ownTotal: _history.length,
+    unique: new Set(all.map(e => e.id)).size,
     daysLogging, topArtists, peakHour, hourCount,
     avgFeatures, featCoverage: featEntries.length,
   };
 }
 
 function computePatterns() {
+  // Only use entries that have real timestamps (our log + recently-played seeds)
+  // Excludes top-tracks seeds which have no timestamp
+  const timed = combinedHistory().filter(e => e.ts != null);
   // grid[block 0-5][dow 0-6]   block = Math.floor(hour/4)
   const grid = Array.from({ length: 6 }, () => new Array(7).fill(0));
-  for (const e of _history) {
+  for (const e of timed) {
     if (e.h != null && e.dow != null)
       grid[Math.floor(e.h / 4)][e.dow]++;
   }
   const max = Math.max(1, ...grid.flat());
   return {
-    grid, max, total: _history.length,
+    grid, max, total: timed.length,
     blockNames: ['Late Night (0–4)', 'Early AM (4–8)', 'Morning (8–12)',
                  'Afternoon (12–16)', 'Evening (16–20)', 'Night (20–24)'],
     dayNames: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'],
@@ -836,14 +931,15 @@ function computePatterns() {
 
 function computeVibes() {
   const MIN = 20;
-  if (_history.length < MIN) return { ready: false, needed: MIN, current: _history.length };
+  const all = combinedHistory();
+  if (all.length < MIN) return { ready: false, needed: MIN, current: all.length };
   const clusters = {};
-  for (const e of _history) {
+  for (const e of all) {
     const k = getVibeKey(e);
     if (!clusters[k]) clusters[k] = [];
     clusters[k].push(e);
   }
-  const hasFeatures = _history.some(e => e.energy != null);
+  const hasFeatures = all.some(e => e.energy != null);
   const result = Object.entries(clusters)
     .filter(([, arr]) => arr.length >= 3)
     .map(([key, arr]) => {
@@ -871,9 +967,11 @@ function computeRightNow() {
   const DAYS = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
   const timeLabel = h === 0 ? '12 AM' : h < 12 ? `${h} AM` : h === 12 ? '12 PM' : `${h-12} PM`;
 
-  const exact = _history.filter(e => Math.abs((e.h||0)-h) <= 1 && e.dow === dow);
+  // Only use entries with real timestamps for time-pattern matching
+  const timed = combinedHistory().filter(e => e.ts != null);
+  const exact = timed.filter(e => Math.abs((e.h||0)-h) <= 1 && e.dow === dow);
   const block = Math.floor(h / 4);
-  const broad = _history.filter(e => Math.floor((e.h||0)/4) === block);
+  const broad = timed.filter(e => Math.floor((e.h||0)/4) === block);
   const set   = exact.length >= 5 ? exact : broad.length >= 5 ? broad : null;
 
   if (!set) return { ready: false, dayName: DAYS[dow], timeLabel };
@@ -900,7 +998,7 @@ function computeRightNow() {
 
 function computeFilter({ minEnergy=0, maxEnergy=100, minValence=0, maxValence=100, minBpm=0, maxBpm=300 } = {}) {
   const unique = new Map();
-  for (const e of _history) {
+  for (const e of combinedHistory()) {
     if (unique.has(e.id)) continue;
     if (e.energy != null) {
       if (e.energy < minEnergy || e.energy > maxEnergy) continue;
@@ -1048,6 +1146,8 @@ function startPolling() {
   if (_pollTimer) return;
   poll(); // immediate first poll
   _pollTimer = setInterval(poll, POLL_INTERVAL);
+  // Seed history from Spotify in the background (non-blocking)
+  if (_seedTimestamp === 0) seedFromSpotify().catch(() => {});
 }
 
 function stopPolling() {
@@ -1431,13 +1531,18 @@ function init(io) {
     });
 
     // ----- spotify:get_insights -----
-    socket.on('spotify:get_insights', () => {
+    socket.on('spotify:get_insights', async () => {
+      // Re-seed from Spotify if never seeded or stale (> 1 hour)
+      if (Date.now() - _seedTimestamp > 3600000) {
+        await seedFromSpotify();
+      }
       socket.emit('spotify:insights', {
         profile:  computeProfile(),
         patterns: computePatterns(),
         vibes:    computeVibes(),
         rightNow: computeRightNow(),
-        total:    _history.length,
+        total:    combinedHistory().length,
+        ownTotal: _history.length,
       });
     });
 
