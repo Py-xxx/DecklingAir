@@ -936,6 +936,115 @@ function renderSpotifySearch(ctrl) {
 
   let _debounce = null;
   let _outsideHandler = null;
+  let _lastQuery = '';
+
+  // ---- Recent search history (localStorage) ----
+  const RECENT_KEY = 'sp-recent-searches';
+  const MAX_RECENT = 15;
+
+  function _loadRecent() {
+    try { return JSON.parse(localStorage.getItem(RECENT_KEY) || '[]'); } catch { return []; }
+  }
+  function _saveRecent(list) {
+    localStorage.setItem(RECENT_KEY, JSON.stringify(list.slice(0, MAX_RECENT)));
+  }
+  function _addToRecent(query, tracks) {
+    if (!query || !tracks.length) return;
+    const list = _loadRecent().filter(e => e.query.toLowerCase() !== query.toLowerCase());
+    list.unshift({ query, tracks });
+    _saveRecent(list);
+  }
+
+  function _renderTrackRows(tracks) {
+    results.innerHTML = '';
+    if (!tracks.length) {
+      results.innerHTML = '<div class="sp-search-empty">No results</div>';
+      return;
+    }
+    tracks.forEach((track) => {
+      const row = document.createElement('div');
+      row.className = 'sp-search-row';
+      row.innerHTML = `
+        <div class="sp-search-row-main">
+          ${track.albumArt
+            ? `<img src="${track.albumArt}" class="sp-thumb sp-thumb--sm" width="32" height="32" alt="">`
+            : `<div class="sp-thumb sp-thumb--sm sp-thumb--placeholder"></div>`}
+          <div class="sp-search-row-info">
+            <div class="sp-search-row-title">${_esc(track.title)}</div>
+            <div class="sp-search-row-artist">${_esc(track.artist)}</div>
+          </div>
+        </div>
+        <div class="sp-search-row-actions" style="display:none">
+          <button class="sp-row-action-btn sp-row-action-play" aria-label="Play now">
+            ${SVG.play()}<span>Play</span>
+          </button>
+          <button class="sp-row-action-btn sp-row-action-queue" aria-label="Add to queue">
+            ${SVG.queueAdd()}<span>Queue</span>
+          </button>
+        </div>
+      `;
+      row.addEventListener('pointerup', (e) => {
+        if (isEditMode()) return;
+        if (e.target.closest('.sp-row-action-btn')) return;
+        _selectRow(row);
+      });
+      row.querySelector('.sp-row-action-play').addEventListener('pointerup', (e) => {
+        if (isEditMode()) return;
+        e.stopPropagation();
+        spotifyCmd('play', { uris: [track.uri] });
+        _deselectAll();
+      });
+      row.querySelector('.sp-row-action-queue').addEventListener('pointerup', (e) => {
+        if (isEditMode()) return;
+        e.stopPropagation();
+        spotifyCmd('queue_add', { uri: track.uri });
+        _flashBtn(e.currentTarget);
+        _deselectAll();
+      });
+      results.appendChild(row);
+    });
+  }
+
+  function _showRecentSearches() {
+    const list = _loadRecent();
+    results.innerHTML = '';
+    if (!list.length) return;
+
+    const header = document.createElement('div');
+    header.className = 'sp-recent-header';
+    header.innerHTML = `<span class="sp-recent-label">Recent</span>
+      <button class="sp-recent-clear-all">Clear all</button>`;
+    header.querySelector('.sp-recent-clear-all').addEventListener('pointerup', (e) => {
+      e.stopPropagation();
+      localStorage.removeItem(RECENT_KEY);
+      results.innerHTML = '';
+    });
+    results.appendChild(header);
+
+    list.forEach(({ query, tracks }) => {
+      const row = document.createElement('div');
+      row.className = 'sp-recent-query-row';
+      row.innerHTML = `
+        <svg class="sp-recent-icon" width="13" height="13" viewBox="0 0 24 24" fill="none"
+            stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <circle cx="12" cy="12" r="10"/>
+          <polyline points="12 6 12 12 16 14"/>
+        </svg>
+        <span class="sp-recent-query-text">${_esc(query)}</span>
+      `;
+      row.addEventListener('pointerup', () => {
+        if (isEditMode()) return;
+        input.value = query;
+        _lastQuery = query;
+        _updateClearBtn();
+        _renderTrackRows(tracks);
+        // Also refresh results in background
+        clearTimeout(_debounce);
+        spotifySearch(query);
+      });
+      results.appendChild(row);
+    });
+  }
 
   function _deselectAll() {
     results.querySelectorAll('.sp-row-selected').forEach(r => {
@@ -966,10 +1075,15 @@ function renderSpotifySearch(ctrl) {
 
   clearBtn.addEventListener('pointerup', () => {
     input.value = '';
-    results.innerHTML = '';
+    _lastQuery = '';
     _deselectAll();
     _updateClearBtn();
+    _showRecentSearches();
     input.focus();
+  });
+
+  input.addEventListener('focus', () => {
+    if (!isEditMode() && !input.value.trim()) _showRecentSearches();
   });
 
   input.addEventListener('input', () => {
@@ -977,8 +1091,8 @@ function renderSpotifySearch(ctrl) {
     _updateClearBtn();
     clearTimeout(_debounce);
     const q = input.value.trim();
-    if (!q) { results.innerHTML = ''; return; }
-    _debounce = setTimeout(() => { spotifySearch(q); }, 350);
+    if (!q) { _showRecentSearches(); return; }
+    _debounce = setTimeout(() => { _lastQuery = q; spotifySearch(q); }, 350);
   });
 
   input.addEventListener('keydown', (e) => {
@@ -986,7 +1100,7 @@ function renderSpotifySearch(ctrl) {
     if (e.key === 'Enter') {
       clearTimeout(_debounce);
       const q = input.value.trim();
-      if (q) spotifySearch(q);
+      if (q) { _lastQuery = q; spotifySearch(q); }
     }
     if (e.key === 'Escape') _deselectAll();
   });
@@ -997,59 +1111,12 @@ function renderSpotifySearch(ctrl) {
 
   card._updateSpotifySearch = function (data) {
     _deselectAll();
-    results.innerHTML = '';
     const items = (data && data.items) ? data.items.slice(0, 5) : [];
-    if (!items.length) {
-      results.innerHTML = '<div class="sp-search-empty">No results</div>';
-      return;
+    _renderTrackRows(items);
+    // Save to recent history
+    if (_lastQuery && items.length) {
+      _addToRecent(_lastQuery, items);
     }
-    items.forEach((track) => {
-      const row = document.createElement('div');
-      row.className = 'sp-search-row';
-      row.innerHTML = `
-        <div class="sp-search-row-main">
-          ${track.albumArt
-            ? `<img src="${track.albumArt}" class="sp-thumb sp-thumb--sm" width="32" height="32" alt="">`
-            : `<div class="sp-thumb sp-thumb--sm sp-thumb--placeholder"></div>`}
-          <div class="sp-search-row-info">
-            <div class="sp-search-row-title">${_esc(track.title)}</div>
-            <div class="sp-search-row-artist">${_esc(track.artist)}</div>
-          </div>
-        </div>
-        <div class="sp-search-row-actions" style="display:none">
-          <button class="sp-row-action-btn sp-row-action-play" aria-label="Play now">
-            ${SVG.play()}<span>Play</span>
-          </button>
-          <button class="sp-row-action-btn sp-row-action-queue" aria-label="Add to queue">
-            ${SVG.queueAdd()}<span>Queue</span>
-          </button>
-        </div>
-      `;
-
-      // Row click → select (not play)
-      row.addEventListener('pointerup', (e) => {
-        if (isEditMode()) return;
-        if (e.target.closest('.sp-row-action-btn')) return; // handled below
-        _selectRow(row);
-      });
-
-      row.querySelector('.sp-row-action-play').addEventListener('pointerup', (e) => {
-        if (isEditMode()) return;
-        e.stopPropagation();
-        spotifyCmd('play', { uris: [track.uri] });
-        _deselectAll();
-      });
-
-      row.querySelector('.sp-row-action-queue').addEventListener('pointerup', (e) => {
-        if (isEditMode()) return;
-        e.stopPropagation();
-        spotifyCmd('queue_add', { uri: track.uri });
-        _flashBtn(e.currentTarget);
-        _deselectAll();
-      });
-
-      results.appendChild(row);
-    });
   };
 
   return card;
@@ -1169,14 +1236,16 @@ function renderSpotifyPlaylists(ctrl) {
       item.className = 'sp-playlist-item';
       if (pl.isLikedSongs) {
         item.innerHTML = `
-          ${SVG.likedSongsCover()}
+          <div class="sp-playlist-cover-wrap">${SVG.likedSongsCover()}</div>
           <div class="sp-playlist-name">${_esc(pl.name)}</div>
         `;
       } else {
         item.innerHTML = `
-          ${pl.coverUrl
-            ? `<img src="${pl.coverUrl}" class="sp-playlist-cover" alt="">`
-            : `<div class="sp-playlist-cover sp-thumb--placeholder"></div>`}
+          <div class="sp-playlist-cover-wrap">
+            ${pl.coverUrl
+              ? `<img src="${pl.coverUrl}" class="sp-playlist-cover" alt="">`
+              : `<div class="sp-playlist-cover sp-thumb--placeholder"></div>`}
+          </div>
           <div class="sp-playlist-name">${_esc(pl.name)}</div>
         `;
       }

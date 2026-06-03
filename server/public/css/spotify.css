@@ -414,6 +414,55 @@
   font-size: 12px;
 }
 
+/* Recent searches */
+.sp-recent-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 10px 6px;
+}
+.sp-recent-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-3, #888);
+}
+.sp-recent-clear-all {
+  font-size: 10px;
+  color: var(--text-3, #888);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 3px;
+  transition: color 0.15s;
+}
+.sp-recent-clear-all:hover { color: var(--text-1, #fff); }
+
+.sp-recent-query-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.sp-recent-query-row:hover { background: var(--bg-2, #1e1e1e); }
+.sp-recent-icon {
+  color: var(--text-3, #888);
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+.sp-recent-query-text {
+  font-size: 13px;
+  color: var(--text-2, #ccc);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* Row is a column flex: main line (art+info) on top, action buttons below */
 .sp-search-row {
   display: flex;
@@ -550,25 +599,30 @@
 .sp-playlist-item.playing { outline-color: var(--sp-green); }
 .sp-playlist-item.playing .sp-playlist-name { color: var(--sp-green); }
 
-.sp-playlist-cover {
+/* Wrapper owns the square — prevents intrinsic image size from affecting layout */
+.sp-playlist-cover-wrap {
   width: 100%;
   aspect-ratio: 1 / 1;
-  object-fit: cover;
   border-radius: 4px;
-  display: block;
+  overflow: hidden;
   background: var(--bg-3, #181828);
-  /* Prevent the browser from rendering images at their intrinsic size
-     before CSS applies — height is always driven by aspect-ratio. */
-  height: auto;
-  min-height: 0;
+  flex-shrink: 0;
+  display: block;
 }
 
-/* Liked Songs synthetic cover — SVG fills the same square as every other tile */
+/* img / placeholder div inside the wrapper just fill it completely */
+.sp-playlist-cover {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  border-radius: 0;
+}
+
+/* Liked Songs SVG inside the wrapper */
 .sp-liked-songs-cover {
   width: 100%;
-  height: auto;
-  aspect-ratio: 1 / 1;
-  border-radius: 4px;
+  height: 100%;
   display: block;
 }
 
