@@ -26,12 +26,19 @@ from voicemeeter import VoiceMeeterRemote
 
 try:
     import sounddevice as sd
-    import soundfile as sf
     _sounddevice_available = True
 except ImportError:
     sd = None
-    sf = None
     _sounddevice_available = False
+
+try:
+    import miniaudio
+    import numpy as np
+    _miniaudio_available = True
+except ImportError:
+    miniaudio = None
+    np = None
+    _miniaudio_available = False
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -300,14 +307,23 @@ def _find_device_index(device: str):
 
 def play_sound(file_path: str, device=None, volume: float = 1.0):
     """Play an audio file in a background thread using its own OutputStream.
-    Supports multiple simultaneous sounds; each gets its own stream."""
+    Supports MP3/WAV/FLAC/OGG via miniaudio. Multiple simultaneous sounds allowed."""
     if not _sounddevice_available:
-        raise RuntimeError("sounddevice/soundfile not installed – run: pip install sounddevice soundfile")
+        raise RuntimeError("sounddevice not installed – run: pip install sounddevice")
+    if not _miniaudio_available:
+        raise RuntimeError("miniaudio/numpy not installed – run: pip install miniaudio numpy")
     if not os.path.isfile(file_path):
         raise FileNotFoundError(f"Sound file not found: {file_path}")
 
-    # Read file synchronously (fast, just memory copy) before spawning thread
-    data, samplerate = sf.read(file_path, dtype='float32', always_2d=True)
+    # Decode audio file (supports MP3, WAV, FLAC, OGG, etc.)
+    decoded = miniaudio.decode_file(file_path, output_format=miniaudio.SampleFormat.FLOAT32)
+    samplerate = decoded.sample_rate
+    data = np.frombuffer(decoded.samples, dtype=np.float32).copy()
+    if decoded.nchannels > 1:
+        data = data.reshape(-1, decoded.nchannels)
+    else:
+        data = data.reshape(-1, 1)
+
     if volume != 1.0:
         data = data * max(0.0, min(2.0, float(volume)))
 
@@ -422,7 +438,7 @@ async def run_bridge():
                         "voiceMeeter": True,
                         "desktopActions": True,
                         "desktopIcons": True,
-                        "soundboard": _sounddevice_available,
+                        "soundboard": _sounddevice_available and _miniaudio_available,
                     },
                 }))
                 log.info("VoiceMeeter type=%d version=%s", vm_type, vm_ver)
