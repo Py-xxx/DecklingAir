@@ -930,130 +930,129 @@ function renderSpotifySearch(ctrl) {
   card.appendChild(resizeHandle());
   card.appendChild(editOverlay(ctrl.id));
 
-  const input      = card.querySelector('.sp-search-input');
-  const clearBtn   = card.querySelector('.sp-search-clear');
-  const results    = card.querySelector('.sp-search-results');
+  const input    = card.querySelector('.sp-search-input');
+  const clearBtn = card.querySelector('.sp-search-clear');
+  const results  = card.querySelector('.sp-search-results');
 
-  let _debounce = null;
+  let _debounce       = null;
   let _outsideHandler = null;
-  let _lastQuery = '';
+  let _lastQuery      = '';
+  let _showingRecents = false;
 
-  // ---- Recent search history (localStorage) ----
-  const RECENT_KEY = 'sp-recent-searches';
+  // ── Recent tracks (played/queued from search) ────────────────────────────
+  const RECENT_KEY = 'sp-recent-tracks';
   const MAX_RECENT = 15;
 
-  function _loadRecent() {
+  function _loadRecentTracks() {
     try { return JSON.parse(localStorage.getItem(RECENT_KEY) || '[]'); } catch { return []; }
   }
-  function _saveRecent(list) {
+  function _saveRecentTracks(list) {
     localStorage.setItem(RECENT_KEY, JSON.stringify(list.slice(0, MAX_RECENT)));
   }
-  function _addToRecent(query, tracks) {
-    if (!query || !tracks.length) return;
-    const list = _loadRecent().filter(e => e.query.toLowerCase() !== query.toLowerCase());
-    list.unshift({ query, tracks });
-    _saveRecent(list);
+  function _addRecentTrack(track) {
+    const list = _loadRecentTracks().filter(t => t.id !== track.id);
+    list.unshift({ id: track.id, uri: track.uri, title: track.title,
+                   artist: track.artist, albumArt: track.albumArt || '' });
+    _saveRecentTracks(list);
   }
 
+  // ── Row builder ──────────────────────────────────────────────────────────
+  function _buildRow(track) {
+    const row = document.createElement('div');
+    row.className = 'sp-search-row';
+    row.innerHTML = `
+      <div class="sp-search-row-main">
+        ${track.albumArt
+          ? `<img src="${track.albumArt}" class="sp-thumb sp-thumb--sm" width="32" height="32" alt="">`
+          : `<div class="sp-thumb sp-thumb--sm sp-thumb--placeholder"></div>`}
+        <div class="sp-search-row-info">
+          <div class="sp-search-row-title">${_esc(track.title)}</div>
+          <div class="sp-search-row-artist">${_esc(track.artist)}</div>
+        </div>
+      </div>
+      <div class="sp-search-row-actions" style="display:none">
+        <button class="sp-row-action-btn sp-row-action-play" aria-label="Play now">
+          ${SVG.play()}<span>Play</span>
+        </button>
+        <button class="sp-row-action-btn sp-row-action-queue" aria-label="Add to queue">
+          ${SVG.queueAdd()}<span>Queue</span>
+        </button>
+      </div>
+    `;
+
+    // Tap row → show actions. Use pointerdown+pointerup tracking so layout
+    // shifts from showing the buttons don't cause a missed tap on touch.
+    let _downOnRow = false;
+    row.addEventListener('pointerdown', (e) => {
+      if (isEditMode() || e.target.closest('.sp-row-action-btn')) return;
+      _downOnRow = true;
+    });
+    row.addEventListener('pointerup', (e) => {
+      if (!_downOnRow || isEditMode() || e.target.closest('.sp-row-action-btn')) return;
+      _downOnRow = false;
+      _selectRow(row);
+    });
+    row.addEventListener('pointercancel', () => { _downOnRow = false; });
+
+    row.querySelector('.sp-row-action-play').addEventListener('pointerup', (e) => {
+      if (isEditMode()) return;
+      e.stopPropagation();
+      spotifyCmd('play', { uris: [track.uri] });
+      _addRecentTrack(track);
+      _deselectAll();
+    });
+
+    row.querySelector('.sp-row-action-queue').addEventListener('pointerup', (e) => {
+      if (isEditMode()) return;
+      e.stopPropagation();
+      spotifyCmd('queue_add', { uri: track.uri });
+      _addRecentTrack(track);
+      _flashBtn(e.currentTarget);
+      _deselectAll();
+    });
+
+    return row;
+  }
+
+  // ── Render helpers ───────────────────────────────────────────────────────
   function _renderTrackRows(tracks) {
+    _showingRecents = false;
     results.innerHTML = '';
     if (!tracks.length) {
       results.innerHTML = '<div class="sp-search-empty">No results</div>';
       return;
     }
-    tracks.forEach((track) => {
-      const row = document.createElement('div');
-      row.className = 'sp-search-row';
-      row.innerHTML = `
-        <div class="sp-search-row-main">
-          ${track.albumArt
-            ? `<img src="${track.albumArt}" class="sp-thumb sp-thumb--sm" width="32" height="32" alt="">`
-            : `<div class="sp-thumb sp-thumb--sm sp-thumb--placeholder"></div>`}
-          <div class="sp-search-row-info">
-            <div class="sp-search-row-title">${_esc(track.title)}</div>
-            <div class="sp-search-row-artist">${_esc(track.artist)}</div>
-          </div>
-        </div>
-        <div class="sp-search-row-actions" style="display:none">
-          <button class="sp-row-action-btn sp-row-action-play" aria-label="Play now">
-            ${SVG.play()}<span>Play</span>
-          </button>
-          <button class="sp-row-action-btn sp-row-action-queue" aria-label="Add to queue">
-            ${SVG.queueAdd()}<span>Queue</span>
-          </button>
-        </div>
-      `;
-      row.addEventListener('pointerup', (e) => {
-        if (isEditMode()) return;
-        if (e.target.closest('.sp-row-action-btn')) return;
-        _selectRow(row);
-      });
-      row.querySelector('.sp-row-action-play').addEventListener('pointerup', (e) => {
-        if (isEditMode()) return;
-        e.stopPropagation();
-        spotifyCmd('play', { uris: [track.uri] });
-        _deselectAll();
-      });
-      row.querySelector('.sp-row-action-queue').addEventListener('pointerup', (e) => {
-        if (isEditMode()) return;
-        e.stopPropagation();
-        spotifyCmd('queue_add', { uri: track.uri });
-        _flashBtn(e.currentTarget);
-        _deselectAll();
-      });
-      results.appendChild(row);
-    });
+    tracks.forEach(t => results.appendChild(_buildRow(t)));
   }
 
-  function _showRecentSearches() {
-    const list = _loadRecent();
+  function _showRecentTracks() {
+    _showingRecents = true;
     results.innerHTML = '';
+    const list = _loadRecentTracks();
     if (!list.length) return;
 
     const header = document.createElement('div');
     header.className = 'sp-recent-header';
     header.innerHTML = `<span class="sp-recent-label">Recent</span>
-      <button class="sp-recent-clear-all">Clear all</button>`;
+      <button class="sp-recent-clear-all">Clear</button>`;
     header.querySelector('.sp-recent-clear-all').addEventListener('pointerup', (e) => {
       e.stopPropagation();
       localStorage.removeItem(RECENT_KEY);
       results.innerHTML = '';
     });
     results.appendChild(header);
-
-    list.forEach(({ query, tracks }) => {
-      const row = document.createElement('div');
-      row.className = 'sp-recent-query-row';
-      row.innerHTML = `
-        <svg class="sp-recent-icon" width="13" height="13" viewBox="0 0 24 24" fill="none"
-            stroke="currentColor" stroke-width="2" stroke-linecap="round">
-          <circle cx="12" cy="12" r="10"/>
-          <polyline points="12 6 12 12 16 14"/>
-        </svg>
-        <span class="sp-recent-query-text">${_esc(query)}</span>
-      `;
-      row.addEventListener('pointerup', () => {
-        if (isEditMode()) return;
-        input.value = query;
-        _lastQuery = query;
-        _updateClearBtn();
-        _renderTrackRows(tracks);
-        // Also refresh results in background
-        clearTimeout(_debounce);
-        spotifySearch(query);
-      });
-      results.appendChild(row);
-    });
+    list.forEach(t => results.appendChild(_buildRow(t)));
   }
 
+  // ── Selection ────────────────────────────────────────────────────────────
   function _deselectAll() {
     results.querySelectorAll('.sp-row-selected').forEach(r => {
       r.classList.remove('sp-row-selected');
-      const actions = r.querySelector('.sp-search-row-actions');
-      if (actions) actions.style.display = 'none';
+      const a = r.querySelector('.sp-search-row-actions');
+      if (a) a.style.display = 'none';
     });
     if (_outsideHandler) {
-      document.removeEventListener('pointerdown', _outsideHandler);
+      document.removeEventListener('pointerup', _outsideHandler);
       _outsideHandler = null;
     }
   }
@@ -1063,12 +1062,16 @@ function renderSpotifySearch(ctrl) {
     row.classList.add('sp-row-selected');
     const actions = row.querySelector('.sp-search-row-actions');
     if (actions) actions.style.display = 'flex';
+
+    // Wait long enough (400ms) that the current touch gesture is fully
+    // finished before we start listening for outside taps.
     _outsideHandler = (e) => {
       if (!card.contains(e.target)) _deselectAll();
     };
-    setTimeout(() => document.addEventListener('pointerdown', _outsideHandler), 0);
+    setTimeout(() => document.addEventListener('pointerup', _outsideHandler), 400);
   }
 
+  // ── Input bar ────────────────────────────────────────────────────────────
   function _updateClearBtn() {
     clearBtn.style.display = input.value.length > 0 ? 'flex' : 'none';
   }
@@ -1078,12 +1081,8 @@ function renderSpotifySearch(ctrl) {
     _lastQuery = '';
     _deselectAll();
     _updateClearBtn();
-    _showRecentSearches();
+    _showRecentTracks();
     input.focus();
-  });
-
-  input.addEventListener('focus', () => {
-    if (!isEditMode() && !input.value.trim()) _showRecentSearches();
   });
 
   input.addEventListener('input', () => {
@@ -1091,7 +1090,7 @@ function renderSpotifySearch(ctrl) {
     _updateClearBtn();
     clearTimeout(_debounce);
     const q = input.value.trim();
-    if (!q) { _showRecentSearches(); return; }
+    if (!q) { _showRecentTracks(); return; }
     _debounce = setTimeout(() => { _lastQuery = q; spotifySearch(q); }, 350);
   });
 
@@ -1109,14 +1108,16 @@ function renderSpotifySearch(ctrl) {
     if (isEditMode()) e.preventDefault();
   });
 
+  // Show recent tracks immediately on card creation
+  _showRecentTracks();
+
   card._updateSpotifySearch = function (data) {
+    // Only replace the results if the user is still in search mode
+    // (don't stomp over recents if input is empty)
+    if (!input.value.trim()) return;
     _deselectAll();
     const items = (data && data.items) ? data.items.slice(0, 5) : [];
     _renderTrackRows(items);
-    // Save to recent history
-    if (_lastQuery && items.length) {
-      _addToRecent(_lastQuery, items);
-    }
   };
 
   return card;
