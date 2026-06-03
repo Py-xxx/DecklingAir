@@ -224,10 +224,12 @@ io.on('connection', (socket) => {
   socket.on('soundboard:play', ({ deviceId, file, device, volume } = {}) => {
     const targetId = sanitizeDeviceId(deviceId);
     if (!targetId || typeof file !== 'string' || !file.trim()) return;
+    // If no device specified, fall back to the global soundboard device from settings
+    const resolvedDevice = device || layout.globalSettings?.soundboardDevice || null;
     sendToDevice(targetId, {
       type: 'soundboard',
       file: file.trim(),
-      device: device || null,
+      device: resolvedDevice,
       volume: typeof volume === 'number' ? volume : 1.0,
     });
   });
