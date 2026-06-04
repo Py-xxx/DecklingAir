@@ -2786,8 +2786,9 @@ export function renderSpotifyIntelligence(ctrl) {
       <div class="sp-intel-header">
         <span class="sp-intel-title">Music Intelligence</span>
         <label class="sp-intel-auto-toggle" title="Auto check-ins — get prompted when a pattern is detected">
-          <input type="checkbox" class="sp-intel-auto-check" checked>
           <span class="sp-intel-auto-label">Auto</span>
+          <input type="checkbox" class="sp-intel-auto-check" checked>
+          <span class="sp-intel-switch"></span>
         </label>
       </div>
 
@@ -2831,7 +2832,13 @@ export function renderSpotifyIntelligence(ctrl) {
       <div class="sp-intel-divider"></div>
 
       <button class="sp-intel-checkin-btn">
-        <span class="sp-intel-checkin-icon">💭</span>
+        <svg class="sp-intel-checkin-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"/>
+          <circle cx="9" cy="10" r="0.8" fill="currentColor" stroke="none"/>
+          <circle cx="15" cy="10" r="0.8" fill="currentColor" stroke="none"/>
+          <path d="M8.5 15.5c1 1.5 2.5 2 3.5 2s2.5-.5 3.5-2"/>
+          <path d="M19 3l1.5-1.5M19 3l-1.5-1.5M19 3v-2" style="opacity:0.5"/>
+        </svg>
         How am I feeling?
       </button>
     </div>

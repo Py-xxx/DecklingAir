@@ -1794,16 +1794,22 @@ function _triggerCheckIn() {
 // Called after audio features are merged into a history entry.
 // Tracks the running cluster and fires check-in when confident.
 function _updateCluster(histEntry) {
-  if (histEntry.energy == null || histEntry.valence == null) return;
+  if (histEntry.energy == null || histEntry.valence == null) {
+    console.log(`[Spotify] Cluster: skipping (no audio features) title="${histEntry.title}"`);
+    return;
+  }
 
   if (!_currentCentroid || _currentCluster.length === 0) {
     _currentCluster = [histEntry];
     _currentCentroid = _computeCentroid(_currentCluster);
     _driftBuffer = [];
+    console.log(`[Spotify] Cluster: started — energy=${histEntry.energy} valence=${histEntry.valence}`);
+    _emitIntelligenceState();
     return;
   }
 
   const dist = _clusterDist(_currentCentroid, histEntry);
+  console.log(`[Spotify] Cluster: size=${_currentCluster.length} dist=${dist.toFixed(3)} energy=${histEntry.energy} valence=${histEntry.valence}`);
 
   if (dist < 0.22) {
     // Same cluster — absorb track, update centroid
@@ -1811,13 +1817,15 @@ function _updateCluster(histEntry) {
     _currentCentroid = _computeCentroid(_currentCluster);
     _driftBuffer = [];
 
+    // Always emit so the UI counter updates in real time
+    _emitIntelligenceState();
+
     // Check if active feeling's centroid has now drifted too far
     if (_activeFeeling) {
       const feelingDist = _clusterDist(_activeFeeling.centroid, _currentCentroid);
       if (feelingDist > 0.30 && _currentCluster.length >= 4) {
         _activeFeeling = null;
         if (_io) _io.emit('spotify:feeling_expired');
-        _emitIntelligenceState();
       }
     }
 
@@ -1826,11 +1834,11 @@ function _updateCluster(histEntry) {
     if (_checkInAutoEnabled && !_pendingCheckIn && sz >= 5 &&
         (sz === 5 || (sz - _lastCheckInAt) >= 15)) {
       _triggerCheckIn();
-      _emitIntelligenceState();
     }
   } else {
     // Potential drift — buffer it
     _driftBuffer.push(histEntry);
+    console.log(`[Spotify] Cluster: drift buffer=${_driftBuffer.length}`);
 
     if (_driftBuffer.length >= 3) {
       // Confirmed vibe shift — start fresh cluster from drift buffer
@@ -1838,6 +1846,7 @@ function _updateCluster(histEntry) {
       _currentCentroid = _computeCentroid(_currentCluster);
       _driftBuffer     = [];
       _lastCheckInAt   = 0;
+      console.log(`[Spotify] Cluster: vibe shift — new cluster started`);
 
       // Dismiss stale pending check-in
       if (_pendingCheckIn) {
