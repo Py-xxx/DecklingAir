@@ -1,5 +1,5 @@
 import { VM_STRIPS, VM_BUSES, buildParamOptions } from './controls.js';
-import { vmMacro, requestSoundboardDevices } from './socket.js';
+import { vmMacro, requestSoundboardDevices, socket } from './socket.js';
 import { saveSpotifyConfig, disconnectSpotify, setSpotifyAutoplay, setSpotifySmartShuffle } from './spotify-client.js';
 
 const DEFAULT_SIZES = {
@@ -136,6 +136,7 @@ export function initEditor(state, callbacks) {
   document.getElementById('btn-add-macro-action').addEventListener('click', () => addMacroAction());
   document.getElementById('cfg-desktop-kind').addEventListener('change', updateDesktopActionFields);
 
+  document.getElementById('cfg-soundboard-browse').addEventListener('click', _fbOpen);
   document.getElementById('cfg-soundboard-refresh').addEventListener('click', () => {
     requestSoundboardDevicesForEditor();
   });
@@ -741,6 +742,129 @@ function requestSoundboardDevicesForEditor() {
   const deviceId = _state?.ui?.activeDeviceId;
   if (!deviceId) return;
   requestSoundboardDevices(deviceId);
+}
+
+// ---------------------------------------------------------------------------
+// Soundboard file browser
+// ---------------------------------------------------------------------------
+const _fb = {
+  modal:    null,
+  list:     null,
+  pathEl:   null,
+  upBtn:    null,
+  parent:   null,    // null = at root level, string = parent path
+  pending:  false,
+};
+
+function _fbOpen() {
+  if (!_fb.modal) {
+    _fb.modal  = document.getElementById('filebrowser-modal');
+    _fb.list   = document.getElementById('filebrowser-list');
+    _fb.pathEl = document.getElementById('filebrowser-path');
+    _fb.upBtn  = document.getElementById('filebrowser-up');
+    document.getElementById('filebrowser-close').addEventListener('click',  _fbClose);
+    document.getElementById('filebrowser-cancel').addEventListener('click', _fbClose);
+    _fb.modal.addEventListener('click', e => { if (e.target === _fb.modal) _fbClose(); });
+    _fb.upBtn.addEventListener('click', () => {
+      if (_fb.parent != null) _fbNavigate(_fb.parent);
+      else _fbShowRoots();
+    });
+    // Listen for results from server
+    socket.on('soundboard:browse_roots_result', _fbHandleRoots);
+    socket.on('soundboard:browse_result',       _fbHandleDir);
+  }
+  _fb.modal.style.display = '';
+  _fbShowRoots();
+}
+
+function _fbClose() {
+  if (_fb.modal) _fb.modal.style.display = 'none';
+}
+
+function _fbSetLoading(msg = 'Loading…') {
+  _fb.list.innerHTML = `<div class="filebrowser-loading">${msg}</div>`;
+  _fb.upBtn.disabled = true;
+}
+
+function _fbShowRoots() {
+  const deviceId = _state?.ui?.activeDeviceId;
+  if (!deviceId) {
+    _fb.list.innerHTML = '<div class="filebrowser-loading filebrowser-error">No bridge connected.</div>';
+    return;
+  }
+  _fbSetLoading('Loading drives…');
+  _fb.pathEl.textContent = 'This PC';
+  _fb.parent = null;
+  _fb.upBtn.disabled = true;
+  socket.emit('soundboard:browse_roots', { deviceId });
+}
+
+function _fbNavigate(path) {
+  const deviceId = _state?.ui?.activeDeviceId;
+  if (!deviceId) return;
+  _fbSetLoading('Loading…');
+  socket.emit('soundboard:browse', { deviceId, path });
+}
+
+function _fbHandleRoots({ roots }) {
+  _fb.pathEl.textContent = 'This PC';
+  _fb.parent = null;
+  _fb.upBtn.disabled = true;
+  _fb.list.innerHTML = '';
+  if (!roots || !roots.length) {
+    _fb.list.innerHTML = '<div class="filebrowser-loading filebrowser-error">No drives found.</div>';
+    return;
+  }
+  roots.forEach(root => {
+    const row = _fbMakeDirRow(root.replace(/\\$/, ''), root);
+    _fb.list.appendChild(row);
+  });
+}
+
+function _fbHandleDir({ path, parent, entries, error }) {
+  if (error) {
+    _fb.list.innerHTML = `<div class="filebrowser-loading filebrowser-error">⚠ ${error}</div>`;
+    return;
+  }
+  _fb.pathEl.textContent = path || '—';
+  _fb.parent = parent;   // null when at drive root
+  _fb.upBtn.disabled = false;
+  _fb.list.innerHTML = '';
+  if (!entries || !entries.length) {
+    _fb.list.innerHTML = '<div class="filebrowser-loading">Empty folder</div>';
+    return;
+  }
+  entries.forEach(({ name, isDir, ext }) => {
+    const fullPath = path.replace(/[/\\]$/, '') + '\\' + name;
+    const row = isDir
+      ? _fbMakeDirRow(name, fullPath)
+      : _fbMakeFileRow(name, fullPath, ext);
+    _fb.list.appendChild(row);
+  });
+}
+
+function _fbMakeDirRow(label, fullPath) {
+  const row = document.createElement('div');
+  row.className = 'filebrowser-row filebrowser-dir';
+  row.innerHTML = `<span class="fb-icon">📁</span><span class="fb-name">${_fbEsc(label)}</span>`;
+  row.addEventListener('click', () => _fbNavigate(fullPath));
+  return row;
+}
+
+function _fbMakeFileRow(name, fullPath, ext) {
+  const row = document.createElement('div');
+  row.className = 'filebrowser-row filebrowser-file';
+  const icon = ext === '.mp3' ? '🎵' : ext === '.wav' ? '🔊' : '🎶';
+  row.innerHTML = `<span class="fb-icon">${icon}</span><span class="fb-name">${_fbEsc(name)}</span><span class="fb-ext">${ext}</span>`;
+  row.addEventListener('click', () => {
+    document.getElementById('cfg-soundboard-file').value = fullPath;
+    _fbClose();
+  });
+  return row;
+}
+
+function _fbEsc(str) {
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 function requiresDesktopTarget(action) {

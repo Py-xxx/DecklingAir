@@ -246,6 +246,18 @@ io.on('connection', (socket) => {
     sendToDevice(targetId, { type: 'soundboardDevicesRequest' });
   });
 
+  socket.on('soundboard:browse_roots', ({ deviceId } = {}) => {
+    const targetId = sanitizeDeviceId(deviceId);
+    if (!targetId) return;
+    sendToDevice(targetId, { type: 'soundboardBrowseRoots' });
+  });
+
+  socket.on('soundboard:browse', ({ deviceId, path } = {}) => {
+    const targetId = sanitizeDeviceId(deviceId);
+    if (!targetId) return;
+    sendToDevice(targetId, { type: 'soundboardBrowse', path: path || '' });
+  });
+
   socket.on('layout:save', (nextLayout) => {
     layout = normalizeLayoutStore(nextLayout);
     saveLayout();
@@ -337,6 +349,25 @@ wss.on('connection', (ws, req) => {
       case 'soundboardPlaying':
         if (!currentDeviceId) return;
         io.emit('soundboard:playing', { deviceId: currentDeviceId, file: msg.file });
+        break;
+
+      case 'soundboardBrowseRootsResult':
+        if (!currentDeviceId) return;
+        io.emit('soundboard:browse_roots_result', {
+          deviceId: currentDeviceId,
+          roots: Array.isArray(msg.roots) ? msg.roots : [],
+        });
+        break;
+
+      case 'soundboardBrowseResult':
+        if (!currentDeviceId) return;
+        io.emit('soundboard:browse_result', {
+          deviceId: currentDeviceId,
+          path:    msg.path    ?? '',
+          parent:  msg.parent  ?? null,
+          entries: Array.isArray(msg.entries) ? msg.entries : [],
+          error:   msg.error   ?? null,
+        });
         break;
 
       case 'desktopIcon':

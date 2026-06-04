@@ -361,7 +361,10 @@
             <div class="form-row">
               <div class="form-group fg-grow">
                 <label class="form-label">Audio File Path</label>
-                <input type="text" id="cfg-soundboard-file" class="form-input" placeholder="C:\Sounds\boom.wav">
+                <div class="soundboard-file-row">
+                  <input type="text" id="cfg-soundboard-file" class="form-input" placeholder="C:\Sounds\boom.wav">
+                  <button type="button" id="cfg-soundboard-browse" class="btn-secondary btn-sm" title="Browse files on bridge PC">📂</button>
+                </div>
                 <span class="form-hint">Full path to the audio file on the Windows PC (WAV, MP3, FLAC, OGG…)</span>
               </div>
             </div>
@@ -396,6 +399,27 @@
         <div style="flex:1"></div>
         <button class="btn-secondary" id="modal-cancel">Cancel</button>
         <button class="btn-primary" id="modal-save" style="display:none">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ File Browser Modal ═══ -->
+  <div id="filebrowser-modal" class="modal-backdrop" style="display:none">
+    <div class="modal modal-filebrowser">
+      <div class="modal-header">
+        <h2>Browse Sound Files</h2>
+        <button class="modal-close-btn" id="filebrowser-close" aria-label="Close">✕</button>
+      </div>
+      <div class="filebrowser-toolbar">
+        <button id="filebrowser-up" class="btn-secondary btn-sm" title="Go up" disabled>↑ Up</button>
+        <div id="filebrowser-path" class="filebrowser-path">—</div>
+      </div>
+      <div id="filebrowser-list" class="filebrowser-list">
+        <div class="filebrowser-loading">Connecting to bridge…</div>
+      </div>
+      <div class="modal-footer">
+        <div style="flex:1"></div>
+        <button class="btn-secondary" id="filebrowser-cancel">Cancel</button>
       </div>
     </div>
   </div>

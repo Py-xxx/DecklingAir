@@ -13,10 +13,12 @@ import threading
 import time
 import os
 import shlex
+import string
 import subprocess
 import socket
 import webbrowser
 from datetime import datetime
+from pathlib import Path
 
 import websockets
 import pystray
@@ -400,6 +402,72 @@ def stop_all_sounds():
         ev.set()
 
 
+_AUDIO_EXTENSIONS = {'.mp3', '.wav', '.flac', '.ogg', '.aac', '.m4a', '.opus', '.wma'}
+
+
+def _get_drive_roots():
+    """Return a list of available drive root paths on Windows (e.g. ['C:\\', 'D:\\'])."""
+    roots = []
+    try:
+        bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+        for letter in string.ascii_uppercase:
+            if bitmask & 1:
+                roots.append(f"{letter}:\\")
+            bitmask >>= 1
+    except Exception:
+        # Fallback: just offer C:\
+        roots = ["C:\\"]
+    return roots
+
+
+def _browse_directory(path: str):
+    """
+    List the contents of `path`.
+    Returns a dict: { path, parent, entries: [{name, isDir, ext}] }
+    Entries are sorted: directories first (alphabetical), then audio files (alphabetical).
+    """
+    path = (path or "").strip()
+    # Normalise separators
+    path = os.path.normpath(path) if path else ""
+
+    if not path or not os.path.isdir(path):
+        return {"path": path, "parent": None, "entries": [], "error": "Directory not found"}
+
+    try:
+        raw = os.listdir(path)
+    except PermissionError:
+        return {"path": path, "parent": str(Path(path).parent) if path else None, "entries": [], "error": "Access denied"}
+    except Exception as e:
+        return {"path": path, "parent": None, "entries": [], "error": str(e)}
+
+    dirs = []
+    files = []
+    for name in raw:
+        full = os.path.join(path, name)
+        try:
+            if os.path.isdir(full):
+                dirs.append({"name": name, "isDir": True, "ext": ""})
+            else:
+                ext = os.path.splitext(name)[1].lower()
+                if ext in _AUDIO_EXTENSIONS:
+                    files.append({"name": name, "isDir": False, "ext": ext})
+        except Exception:
+            pass
+
+    dirs.sort(key=lambda e: e["name"].lower())
+    files.sort(key=lambda e: e["name"].lower())
+
+    parent_path = str(Path(path).parent)
+    # At a drive root (e.g. C:\) the parent == path itself — signal no parent
+    parent = None if parent_path == path else parent_path
+
+    return {
+        "path": path,
+        "parent": parent,
+        "entries": dirs + files,
+    }
+
+
 def resolve_desktop_icon(target: str):
     target = (target or "").strip()
     if not target:
@@ -572,6 +640,19 @@ async def receive_loop(ws):
             await ws.send(json.dumps({
                 "type": "soundboardDevices",
                 "devices": get_output_devices(),
+            }))
+
+        elif msg_type == "soundboardBrowseRoots":
+            await ws.send(json.dumps({
+                "type": "soundboardBrowseRootsResult",
+                "roots": _get_drive_roots(),
+            }))
+
+        elif msg_type == "soundboardBrowse":
+            path = msg.get("path", "")
+            await ws.send(json.dumps({
+                "type": "soundboardBrowseResult",
+                **_browse_directory(path),
             }))
 
         elif msg_type == "desktopIconRequest":
