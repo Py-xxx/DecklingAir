@@ -10,6 +10,9 @@ const { URL, URLSearchParams } = require('url');
 // ---------------------------------------------------------------------------
 
 const SPOTIFY_API = 'https://api.spotify.com/v1';
+// ReccoBeats: free drop-in for Spotify's deprecated /audio-features endpoint.
+// Takes Spotify track IDs, returns the same feature schema (0-1 floats, key 0-11, mode 0/1).
+const RECCOBEATS_API = 'https://api.reccobeats.com/v1';
 const SPOTIFY_ACCOUNTS = 'accounts.spotify.com';
 const POLL_INTERVAL = 5000;
 const AUTOPLAY_MIN_QUEUE = 3;
@@ -931,34 +934,99 @@ async function getAllLikedSongs() {
 
 // In-memory cache so we don't re-fetch features for the same track
 const _audioFeaturesCache = new Map();
+// Maps a Spotify track ID → ReccoBeats internal UUID (null = looked up, not found)
+const _reccoIdCache = new Map();
+
+// Resolve a Spotify track ID to its ReccoBeats UUID via the batch lookup endpoint.
+async function _reccoLookupId(trackId) {
+  if (_reccoIdCache.has(trackId)) return _reccoIdCache.get(trackId);
+  try {
+    const data = await httpsRequest('GET', `${RECCOBEATS_API}/track?ids=${trackId}`, {
+      headers: { Accept: 'application/json' },
+    });
+    const uuid = data && Array.isArray(data.content) && data.content[0] ? data.content[0].id : null;
+    _reccoIdCache.set(trackId, uuid || null);
+    return uuid || null;
+  } catch (err) {
+    console.warn('[Spotify] ReccoBeats id lookup failed for', trackId, '-', err.message);
+    _reccoIdCache.set(trackId, null);
+    return null;
+  }
+}
+
+// Fetch audio features from ReccoBeats and normalise to Spotify's field shape.
+async function getReccoBeatsFeatures(trackId) {
+  const uuid = await _reccoLookupId(trackId);
+  if (!uuid) return null;
+  try {
+    const f = await httpsRequest('GET', `${RECCOBEATS_API}/track/${uuid}/audio-features`, {
+      headers: { Accept: 'application/json' },
+    });
+    if (!f || f.tempo == null) return null;
+    return {
+      id: trackId,
+      tempo: f.tempo,
+      energy: f.energy,
+      valence: f.valence,
+      danceability: f.danceability,
+      acousticness: f.acousticness,
+      instrumentalness: f.instrumentalness,
+      key: f.key,
+      mode: f.mode,
+      _source: 'reccobeats',
+    };
+  } catch (err) {
+    console.warn('[Spotify] ReccoBeats features failed for', trackId, '-', err.message);
+    return null;
+  }
+}
 
 async function getAudioFeatures(trackId) {
   if (_audioFeaturesCache.has(trackId)) return _audioFeaturesCache.get(trackId);
+  // Tier 1: Spotify's own endpoint (deprecated — 403s for most apps, kept for the few it works on)
   try {
     const data = await api('GET', `/audio-features/${trackId}`);
     if (data && data.tempo != null) {
       _audioFeaturesCache.set(trackId, data);
       return data;
     }
-    console.warn('[Spotify] Audio features: unexpected response for', trackId, data);
-    return null;
-  } catch (err) {
-    console.warn('[Spotify] Audio features unavailable for', trackId, '-', err.message);
-    return null;
+  } catch {
+    // expected for deprecated endpoint — fall through to ReccoBeats
   }
+  // Tier 2: ReccoBeats fallback
+  const recco = await getReccoBeatsFeatures(trackId);
+  if (recco) {
+    console.log(`[Spotify] Audio features via ReccoBeats — energy=${recco.energy} valence=${recco.valence} tempo=${Math.round(recco.tempo)} id=${trackId}`);
+    _audioFeaturesCache.set(trackId, recco);
+    return recco;
+  }
+  console.warn('[Spotify] Audio features unavailable (Spotify + ReccoBeats) for', trackId);
+  return null;
 }
 
 async function getBatchAudioFeatures(trackIds) {
   if (!trackIds || !trackIds.length) return [];
   const toFetch = trackIds.filter(id => !_audioFeaturesCache.has(id));
   if (toFetch.length) {
+    // Tier 1: Spotify batch (deprecated — usually 403s)
     try {
       const ids = toFetch.slice(0, 100).join(',');
       const data = await api('GET', '/audio-features', { params: { ids } });
       const features = (data && data.audio_features) ? data.audio_features : [];
       features.forEach(f => { if (f && f.id) _audioFeaturesCache.set(f.id, f); });
-    } catch (err) {
-      console.error('[Spotify] Batch audio features error:', err.message);
+    } catch {
+      // expected — fall through to ReccoBeats
+    }
+    // Tier 2: ReccoBeats fallback for whatever's still missing.
+    // Sequential + capped so one-time seeding doesn't fire a request storm.
+    const stillMissing = toFetch.filter(id => !_audioFeaturesCache.has(id)).slice(0, 60);
+    if (stillMissing.length) {
+      let got = 0;
+      for (const id of stillMissing) {
+        const recco = await getReccoBeatsFeatures(id);
+        if (recco) { _audioFeaturesCache.set(id, recco); got++; }
+      }
+      console.log(`[Spotify] Batch features via ReccoBeats: ${got}/${stillMissing.length} enriched`);
     }
   }
   return trackIds.map(id => _audioFeaturesCache.get(id) || null);
