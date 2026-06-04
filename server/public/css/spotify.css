@@ -2291,3 +2291,278 @@
   font-weight: 600;
   animation: sp-pulse 2s ease-in-out infinite;
 }
+
+/* ---------- CHECK-IN TOAST NOTIFICATION ---------- */
+.sp-checkin-toast {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  width: 280px;
+  background: var(--bg-2, #1e1e2e);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 14px;
+  padding: 14px 14px 12px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.55), 0 2px 8px rgba(0,0,0,0.3);
+  z-index: 9999;
+  opacity: 0;
+  transform: translateY(12px) scale(0.97);
+  transition: opacity 0.3s ease, transform 0.3s ease;
+  pointer-events: none;
+}
+.sp-checkin-toast--visible {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  pointer-events: all;
+}
+.sp-checkin-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.sp-checkin-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-2, #aaa);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.sp-checkin-dismiss {
+  background: none;
+  border: none;
+  color: var(--text-3, #888);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 2px 4px;
+  line-height: 1;
+  border-radius: 4px;
+  transition: color 0.15s;
+}
+.sp-checkin-dismiss:hover { color: var(--text, #fff); }
+.sp-checkin-guess {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  background: rgba(255,255,255,0.04);
+  border-radius: 8px;
+}
+.sp-checkin-guess-emoji {
+  font-size: 22px;
+  line-height: 1;
+}
+.sp-checkin-guess-label {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text, #fff);
+}
+.sp-checkin-guess-sub {
+  font-size: 11px;
+  color: var(--text-3, #888);
+  margin-left: 2px;
+}
+.sp-checkin-feelings {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 5px;
+}
+.sp-checkin-feeling-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 7px 4px;
+  background: var(--bg-3, #141420);
+  border: 1px solid transparent;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, transform 0.1s;
+}
+.sp-checkin-feeling-btn:hover {
+  background: rgba(255,255,255,0.07);
+  border-color: rgba(255,255,255,0.15);
+  transform: scale(1.04);
+}
+.sp-checkin-feeling-btn--guess {
+  border-color: var(--sp-green, #1DB954);
+  background: rgba(29,185,84,0.08);
+}
+.sp-ck-emoji { font-size: 18px; line-height: 1; }
+.sp-ck-label { font-size: 9px; color: var(--text-2, #aaa); font-weight: 600; }
+.sp-checkin-changed {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-3, #888);
+  text-align: center;
+  font-style: italic;
+}
+
+/* ---------- INTELLIGENCE CARD ---------- */
+.spotify-intelligence-card {
+  min-width: 180px;
+}
+.sp-intel-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  padding: 10px 12px 10px;
+  box-sizing: border-box;
+}
+.sp-intel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.sp-intel-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-3, #888);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.sp-intel-auto-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+.sp-intel-auto-check {
+  accent-color: var(--sp-green, #1DB954);
+  cursor: pointer;
+  width: 12px;
+  height: 12px;
+}
+.sp-intel-auto-label {
+  font-size: 10px;
+  color: var(--text-3, #888);
+}
+.sp-intel-active {
+  min-height: 38px;
+}
+.sp-intel-feeling-row,
+.sp-intel-vibe-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  background: rgba(29,185,84,0.08);
+  border: 1px solid rgba(29,185,84,0.2);
+  border-radius: 8px;
+}
+.sp-intel-feeling-emoji {
+  font-size: 20px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.sp-intel-vibe-icon {
+  font-size: 14px;
+  color: var(--sp-green, #1DB954);
+  flex-shrink: 0;
+}
+.sp-intel-feeling-info,
+.sp-intel-vibe-info {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+.sp-intel-feeling-label,
+.sp-intel-vibe-label {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text, #fff);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sp-intel-feeling-sub,
+.sp-intel-vibe-sub {
+  font-size: 10px;
+  color: var(--sp-green, #1DB954);
+  opacity: 0.8;
+}
+.sp-intel-stop-btn {
+  background: none;
+  border: none;
+  color: var(--text-3, #888);
+  font-size: 10px;
+  cursor: pointer;
+  padding: 4px 5px;
+  border-radius: 4px;
+  flex-shrink: 0;
+  transition: color 0.15s;
+}
+.sp-intel-stop-btn:hover { color: var(--text, #fff); }
+.sp-intel-idle {
+  padding: 6px 0;
+}
+.sp-intel-idle-text {
+  font-size: 12px;
+  color: var(--text-3, #888);
+}
+.sp-intel-divider {
+  height: 1px;
+  background: var(--sp-border, rgba(255,255,255,0.07));
+  flex-shrink: 0;
+}
+.sp-intel-context-label,
+.sp-intel-cluster-label {
+  font-size: 10px;
+  color: var(--text-3, #888);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 2px;
+}
+.sp-intel-context-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text, #fff);
+}
+.sp-intel-cluster {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sp-intel-cluster-bar-wrap {
+  height: 4px;
+  background: rgba(255,255,255,0.08);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.sp-intel-cluster-bar {
+  height: 100%;
+  background: var(--sp-green, #1DB954);
+  border-radius: 2px;
+  transition: width 0.6s ease;
+  width: 0%;
+}
+.sp-intel-cluster-size {
+  font-size: 10px;
+  color: var(--text-3, #888);
+}
+.sp-intel-checkin-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 12px;
+  background: rgba(255,255,255,0.05);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 8px;
+  color: var(--text-2, #aaa);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+  margin-top: auto;
+}
+.sp-intel-checkin-btn:hover {
+  background: rgba(255,255,255,0.09);
+  border-color: rgba(255,255,255,0.2);
+  color: var(--text, #fff);
+}
+.sp-intel-checkin-icon {
+  font-size: 14px;
+}

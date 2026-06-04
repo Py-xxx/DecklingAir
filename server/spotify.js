@@ -94,6 +94,15 @@ let _flowMode       = false; // harmonic flow ordering for vibe/mood playlists
 let _activeVibeKey  = null;  // currently running continuous vibe (null = stopped)
 let _activeMoodKey  = null;  // currently running continuous mood (null = stopped)
 
+// ── Cluster & feeling detection ───────────────────────────────────────────────
+let _currentCluster    = [];     // tracks in the current emerging cluster (with features)
+let _currentCentroid   = null;   // { energy, valence, bpm } mean of _currentCluster
+let _driftBuffer       = [];     // consecutive tracks that are "far" from _currentCentroid
+let _pendingCheckIn    = null;   // { fingerprint, guessedFeeling, clusterSnapshot, timestamp }
+let _activeFeeling     = null;   // { key, label, emoji, confirmedAt, centroid, clusterTracks }
+let _lastCheckInAt     = 0;      // cluster size when last check-in was triggered
+let _checkInAutoEnabled = true;  // user preference
+
 // ---------------------------------------------------------------------------
 // Config / token storage
 // ---------------------------------------------------------------------------
@@ -179,6 +188,7 @@ function loadUserPrefs() {
     if (fs.existsSync(USER_PREFS_FILE)) {
       const prefs = JSON.parse(fs.readFileSync(USER_PREFS_FILE, 'utf8'));
       _flowMode = !!prefs.flowMode;
+      if (prefs.checkInAuto != null) _checkInAutoEnabled = !!prefs.checkInAuto;
     }
   } catch { }
 }
@@ -186,7 +196,7 @@ function loadUserPrefs() {
 function saveUserPrefs() {
   try {
     fs.mkdirSync(path.dirname(USER_PREFS_FILE), { recursive: true });
-    fs.writeFileSync(USER_PREFS_FILE, JSON.stringify({ flowMode: _flowMode }, null, 2));
+    fs.writeFileSync(USER_PREFS_FILE, JSON.stringify({ flowMode: _flowMode, checkInAuto: _checkInAutoEnabled }, null, 2));
   } catch (err) { console.error('[Spotify] Failed to save user prefs:', err.message); }
 }
 
@@ -324,6 +334,17 @@ function closeActiveSession() {
   const session = _activeSession;
   _activeSession = null;
   _lastProgress  = null;
+
+  // Reset cluster state when session ends
+  _currentCluster  = [];
+  _currentCentroid = null;
+  _driftBuffer     = [];
+  _pendingCheckIn  = null;
+  _lastCheckInAt   = 0;
+  if (_activeFeeling) {
+    _activeFeeling = null;
+    if (_io) _io.emit('spotify:feeling_expired');
+  }
 
   if (session.listenedMs < SESSION_MIN_MS) return; // too short to bother saving
 
@@ -1536,6 +1557,16 @@ const MOOD_STATES = [
   },
 ];
 
+const FEELING_DEFS = {
+  sad:       { emoji: '😔', label: 'Sad',       energy: [0,  45],  valence: [0,  38] },
+  chill:     { emoji: '🧘', label: 'Chill',     energy: [15, 58],  valence: [35, 72] },
+  focused:   { emoji: '🎯', label: 'Focused',   energy: [28, 65],  valence: [22, 62] },
+  happy:     { emoji: '😊', label: 'Happy',     energy: [32, 72],  valence: [55, 100] },
+  energetic: { emoji: '⚡', label: 'Energetic', energy: [60, 100], valence: [22, 78] },
+  hype:      { emoji: '🔥', label: 'Hype',      energy: [70, 100], valence: [55, 100] },
+  angsty:    { emoji: '😤', label: 'Angsty',    energy: [55, 100], valence: [0,  42] },
+};
+
 // ---------------------------------------------------------------------------
 // Playlist builders
 // ---------------------------------------------------------------------------
@@ -1603,6 +1634,52 @@ async function buildMoodPlaylist(moodKey, limit = 25) {
   return _flowMode ? flowOrder(combined) : combined.sort(() => Math.random() - 0.5);
 }
 
+async function buildFeelingPlaylist(feelingKey, sessionTracks = [], limit = 20) {
+  const def = FEELING_DEFS[feelingKey];
+  if (!def) return [];
+
+  const [eMin, eMax] = def.energy;
+  const [vMin, vMax] = def.valence;
+  const all = combinedHistory();
+
+  // Tracks that match the feeling's audio-feature ranges, excluding session tracks already heard
+  const sessionIds = new Set(sessionTracks.map(t => t.id).filter(Boolean));
+  const seen = new Set(sessionIds);
+  const pool = [];
+  for (const e of all) {
+    if (seen.has(e.id)) continue;
+    if (e.energy == null) continue;
+    if (e.energy < eMin || e.energy > eMax) continue;
+    if (e.valence < vMin || e.valence > vMax) continue;
+    seen.add(e.id);
+    pool.push(e);
+  }
+
+  // Sort pool by closeness to session centroid
+  const sessionCentroid = sessionTracks.length ? _computeCentroid(sessionTracks) : null;
+  if (sessionCentroid) {
+    pool.sort((a, b) => _clusterDist(sessionCentroid, a) - _clusterDist(sessionCentroid, b));
+  } else {
+    // Shuffle if no centroid
+    pool.sort(() => Math.random() - 0.5);
+  }
+
+  const discoveryCount = Math.min(Math.floor(limit * 0.3), 7);
+  const baseCount = limit - discoveryCount;
+
+  // Include a few recent session tracks (confirmed to match)
+  const sessionSample = [...sessionTracks].sort(() => Math.random() - 0.5).slice(0, 4);
+  const base = pool.slice(0, baseCount);
+
+  // Discovery: similar to best matches
+  const seedIds = base.slice(0, 3).map(t => t.id).filter(Boolean);
+  const similar = await getSimilarTracks(seedIds, [], discoveryCount + 5).catch(() => []);
+  const discovery = similar.slice(0, discoveryCount);
+
+  const combined = [...sessionSample, ...base, ...discovery];
+  return _flowMode ? flowOrder(combined) : combined.sort(() => Math.random() - 0.5);
+}
+
 // ---------------------------------------------------------------------------
 // Context detection & mood suggestion
 // ---------------------------------------------------------------------------
@@ -1647,11 +1724,137 @@ function detectCurrentContext() {
 }
 
 // ---------------------------------------------------------------------------
+// Session cluster tracking — detects coherent audio-feature patterns
+// ---------------------------------------------------------------------------
+
+function _computeCentroid(tracks) {
+  const ft = tracks.filter(t => t.energy != null);
+  if (!ft.length) return null;
+  const bpmTracks = ft.filter(t => t.bpm);
+  return {
+    energy:  ft.reduce((s, t) => s + t.energy,  0) / ft.length,
+    valence: ft.reduce((s, t) => s + t.valence, 0) / ft.length,
+    bpm: bpmTracks.length ? bpmTracks.reduce((s, t) => s + t.bpm, 0) / bpmTracks.length : null,
+  };
+}
+
+function _clusterDist(c, t) {
+  // Normalised Euclidean distance in energy/valence space (BPM secondary)
+  const dE = (c.energy  - t.energy)  / 100;
+  const dV = (c.valence - t.valence) / 100;
+  const dB = (c.bpm && t.bpm) ? (c.bpm - t.bpm) / 200 : 0;
+  return Math.sqrt(dE * dE * 0.5 + dV * dV * 0.4 + dB * dB * 0.1);
+}
+
+function _guessFeeling(centroid) {
+  let best = 'chill', bestScore = -1;
+  for (const [key, def] of Object.entries(FEELING_DEFS)) {
+    const eMid = (def.energy[0]  + def.energy[1])  / 2;
+    const vMid = (def.valence[0] + def.valence[1]) / 2;
+    const eScore = 1 - Math.abs(centroid.energy  - eMid) / 100;
+    const vScore = 1 - Math.abs(centroid.valence - vMid) / 100;
+    const score  = eScore * 0.5 + vScore * 0.5;
+    if (score > bestScore) { bestScore = score; best = key; }
+  }
+  return best;
+}
+
+function _emitIntelligenceState() {
+  if (!_io) return;
+  _io.emit('spotify:intelligence_state', {
+    activeFeeling:  _activeFeeling ? { key: _activeFeeling.key, label: _activeFeeling.label, emoji: _activeFeeling.emoji } : null,
+    activeMoodKey:  _activeMoodKey,
+    activeVibeKey:  _activeVibeKey,
+    clusterSize:    _currentCluster.length,
+    clusterCentroid: _currentCentroid,
+    pendingCheckIn: _pendingCheckIn ? { guessedFeeling: _pendingCheckIn.guessedFeeling } : null,
+    context:        detectCurrentContext(),
+  });
+}
+
+function _triggerCheckIn() {
+  const centroid = { ..._currentCentroid };
+  const guessedFeeling = _guessFeeling(centroid);
+  _pendingCheckIn = {
+    fingerprint:     centroid,
+    guessedFeeling,
+    clusterSnapshot: [..._currentCluster],
+    timestamp:       Date.now(),
+  };
+  _lastCheckInAt = _currentCluster.length;
+  if (_io) {
+    _io.emit('spotify:checkin', {
+      guessedFeeling,
+      guess: FEELING_DEFS[guessedFeeling],
+      feelings: Object.entries(FEELING_DEFS).map(([key, def]) => ({ key, ...def })),
+    });
+  }
+}
+
+// Called after audio features are merged into a history entry.
+// Tracks the running cluster and fires check-in when confident.
+function _updateCluster(histEntry) {
+  if (histEntry.energy == null || histEntry.valence == null) return;
+
+  if (!_currentCentroid || _currentCluster.length === 0) {
+    _currentCluster = [histEntry];
+    _currentCentroid = _computeCentroid(_currentCluster);
+    _driftBuffer = [];
+    return;
+  }
+
+  const dist = _clusterDist(_currentCentroid, histEntry);
+
+  if (dist < 0.22) {
+    // Same cluster — absorb track, update centroid
+    _currentCluster.push(histEntry);
+    _currentCentroid = _computeCentroid(_currentCluster);
+    _driftBuffer = [];
+
+    // Check if active feeling's centroid has now drifted too far
+    if (_activeFeeling) {
+      const feelingDist = _clusterDist(_activeFeeling.centroid, _currentCentroid);
+      if (feelingDist > 0.30 && _currentCluster.length >= 4) {
+        _activeFeeling = null;
+        if (_io) _io.emit('spotify:feeling_expired');
+        _emitIntelligenceState();
+      }
+    }
+
+    // Trigger check-in when cluster first hits 5 tracks, then every 15 more
+    const sz = _currentCluster.length;
+    if (_checkInAutoEnabled && !_pendingCheckIn && sz >= 5 &&
+        (sz === 5 || (sz - _lastCheckInAt) >= 15)) {
+      _triggerCheckIn();
+      _emitIntelligenceState();
+    }
+  } else {
+    // Potential drift — buffer it
+    _driftBuffer.push(histEntry);
+
+    if (_driftBuffer.length >= 3) {
+      // Confirmed vibe shift — start fresh cluster from drift buffer
+      _currentCluster  = [..._driftBuffer];
+      _currentCentroid = _computeCentroid(_currentCluster);
+      _driftBuffer     = [];
+      _lastCheckInAt   = 0;
+
+      // Dismiss stale pending check-in
+      if (_pendingCheckIn) {
+        _pendingCheckIn = null;
+        if (_io) _io.emit('spotify:checkin_dismiss', { reason: 'vibe_changed' });
+      }
+      _emitIntelligenceState();
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Continuous queue refill — called on every track change when a mood/vibe is active
 // ---------------------------------------------------------------------------
 
 async function maybeRefillContinuousQueue(state) {
-  if (!_activeMoodKey && !_activeVibeKey) return;
+  if (!_activeMoodKey && !_activeVibeKey && !_activeFeeling) return;
   try {
     const queueData = await getQueue();
     const queueLength = queueData?.queue?.length || 0;
@@ -1659,7 +1862,9 @@ async function maybeRefillContinuousQueue(state) {
 
     const refillCount = 12;
     let tracks;
-    if (_activeMoodKey) {
+    if (_activeFeeling) {
+      tracks = await buildFeelingPlaylist(_activeFeeling.key, _activeFeeling.clusterTracks || [], refillCount);
+    } else if (_activeMoodKey) {
       tracks = await buildMoodPlaylist(_activeMoodKey, refillCount);
     } else {
       tracks = await buildVibePlaylist(_activeVibeKey, refillCount);
@@ -1673,7 +1878,7 @@ async function maybeRefillContinuousQueue(state) {
         await new Promise(r => setTimeout(r, 100));
       } catch { /* skip unplayable */ }
     }
-    const label = _activeMoodKey || _activeVibeKey;
+    const label = _activeFeeling?.label || _activeMoodKey || _activeVibeKey;
     if (added > 0) console.log(`[Spotify] Continuous refill +${added} tracks (${label})`);
   } catch (err) {
     console.error('[Spotify] Continuous refill error:', err.message);
@@ -1985,6 +2190,7 @@ async function poll() {
                 if (_io) _io.emit('spotify:audio_features', _serializeFeatures(f));
               }
               appendHistory(histEntry);
+              _updateCluster(histEntry);
             })
             .catch(() => { appendHistory(histEntry); });
         }
@@ -2564,7 +2770,104 @@ function init(io) {
     socket.on('spotify:stop_continuous', () => {
       _activeMoodKey = null;
       _activeVibeKey = null;
+      _activeFeeling = null;
+      _pendingCheckIn = null;
       _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: null });
+      _io.emit('spotify:feeling_expired');
+      _emitIntelligenceState();
+    });
+
+    // ----- spotify:get_intelligence -----
+    socket.on('spotify:get_intelligence', () => {
+      socket.emit('spotify:intelligence_state', {
+        activeFeeling:   _activeFeeling ? { key: _activeFeeling.key, label: _activeFeeling.label, emoji: _activeFeeling.emoji } : null,
+        activeMoodKey:   _activeMoodKey,
+        activeVibeKey:   _activeVibeKey,
+        clusterSize:     _currentCluster.length,
+        clusterCentroid: _currentCentroid,
+        pendingCheckIn:  _pendingCheckIn ? { guessedFeeling: _pendingCheckIn.guessedFeeling } : null,
+        context:         detectCurrentContext(),
+        checkInAuto:     _checkInAutoEnabled,
+        feelings:        Object.entries(FEELING_DEFS).map(([key, def]) => ({ key, ...def })),
+      });
+    });
+
+    // ----- spotify:checkin_response -----
+    socket.on('spotify:checkin_response', async ({ feeling } = {}) => {
+      if (!_pendingCheckIn || !FEELING_DEFS[feeling]) return;
+
+      // Verify the current cluster still matches the check-in fingerprint
+      if (_currentCentroid) {
+        const drift = _clusterDist(_pendingCheckIn.fingerprint, _currentCentroid);
+        if (drift > 0.30) {
+          // Cluster has drifted — discard answer silently, generate fresh check-in
+          _pendingCheckIn = null;
+          socket.emit('spotify:checkin_stale');
+          // If current cluster is already confident, trigger a new check-in
+          if (_currentCluster.length >= 5) _triggerCheckIn();
+          return;
+        }
+      }
+
+      const def = FEELING_DEFS[feeling];
+      _activeFeeling = {
+        key:          feeling,
+        label:        def.label,
+        emoji:        def.emoji,
+        confirmedAt:  Date.now(),
+        centroid:     { ..._pendingCheckIn.fingerprint },
+        clusterTracks: _pendingCheckIn.clusterSnapshot,
+      };
+      _pendingCheckIn = null;
+
+      // Stop any running mood/vibe — feeling takes over
+      _activeMoodKey = null;
+      _activeVibeKey = null;
+
+      _emitIntelligenceState();
+      _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: null });
+      socket.emit('spotify:insights_action', { ok: true, msg: `Got it · "${def.label}" · building your playlist…` });
+
+      // Queue feeling playlist
+      try {
+        const tracks = await buildFeelingPlaylist(feeling, _activeFeeling.clusterTracks, 20);
+        let queued = 0;
+        for (const t of tracks) {
+          try {
+            await addToQueue(t.uri || `spotify:track:${t.id}`);
+            queued++;
+            await new Promise(r => setTimeout(r, 100));
+          } catch { }
+        }
+        if (queued > 0) console.log(`[Spotify] Feeling "${feeling}" queued ${queued} tracks`);
+      } catch (err) {
+        console.error('[Spotify] Feeling playlist error:', err.message);
+      }
+    });
+
+    // ----- spotify:dismiss_checkin -----
+    socket.on('spotify:dismiss_checkin', () => {
+      _pendingCheckIn = null;
+      // Bump the threshold so we don't re-trigger until 15 more tracks
+      _lastCheckInAt = _currentCluster.length;
+    });
+
+    // ----- spotify:set_checkin_auto -----
+    socket.on('spotify:set_checkin_auto', ({ enabled } = {}) => {
+      _checkInAutoEnabled = !!enabled;
+      saveUserPrefs();
+      _io.emit('spotify:checkin_auto', { enabled: _checkInAutoEnabled });
+    });
+
+    // ----- spotify:stop_feeling -----
+    socket.on('spotify:stop_feeling', () => {
+      _activeFeeling = null;
+      _activeMoodKey = null;
+      _activeVibeKey = null;
+      _pendingCheckIn = null;
+      _io.emit('spotify:feeling_expired');
+      _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: null });
+      _emitIntelligenceState();
     });
 
     // ----- spotify:set_flow_mode -----

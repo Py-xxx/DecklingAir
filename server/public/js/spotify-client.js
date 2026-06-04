@@ -240,3 +240,31 @@ export function setSpotifyAutoplay(enabled) {
 export function setSpotifySmartShuffle(enabled) {
   socket.emit('spotify:set_smart_shuffle', { enabled });
 }
+
+/** Respond to a feeling check-in prompt. */
+export function respondToCheckIn(feeling) {
+  socket.emit('spotify:checkin_response', { feeling });
+}
+
+/** Dismiss the current check-in without answering. */
+export function dismissCheckIn() {
+  socket.emit('spotify:dismiss_checkin');
+}
+
+/** Fetch full intelligence state. */
+export function getIntelligence() {
+  return new Promise((resolve) => {
+    socket.once('spotify:intelligence_state', resolve);
+    socket.emit('spotify:get_intelligence');
+  });
+}
+
+/** Toggle automatic check-in prompts. */
+export function setCheckInAuto(enabled) {
+  socket.emit('spotify:set_checkin_auto', { enabled });
+}
+
+/** Stop all active feeling/mood/vibe playback. */
+export function stopFeeling() {
+  socket.emit('spotify:stop_feeling');
+}

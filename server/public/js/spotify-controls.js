@@ -29,6 +29,11 @@ import {
   playMood,
   stopContinuous,
   setFlowMode,
+  respondToCheckIn,
+  dismissCheckIn,
+  getIntelligence,
+  setCheckInAuto,
+  stopFeeling,
 } from './spotify-client.js';
 import { socket } from './socket.js';
 
@@ -2081,6 +2086,7 @@ function renderSpotifyStats(ctrl) {
 // ---------------------------------------------------------------------------
 
 export function renderSpotifyInsights(ctrl) {
+  _initCheckInNotification();
   const card = document.createElement('div');
   card.className = 'control-card spotify-insights-card';
   card.dataset.id = ctrl.id;
@@ -2670,17 +2676,320 @@ export function renderSpotifyInsights(ctrl) {
 }
 
 // ---------------------------------------------------------------------------
+// Global check-in notification (fixed, lives in body)
+// ---------------------------------------------------------------------------
+
+let _checkInEl = null;
+let _checkInDismissTimeout = null;
+
+function _initCheckInNotification() {
+  if (_checkInEl) return; // already initialised
+
+  _checkInEl = document.createElement('div');
+  _checkInEl.className = 'sp-checkin-toast';
+  _checkInEl.style.display = 'none';
+  _checkInEl.innerHTML = `
+    <div class="sp-checkin-header">
+      <span class="sp-checkin-title">How are you feeling?</span>
+      <button class="sp-checkin-dismiss" title="Dismiss">✕</button>
+    </div>
+    <div class="sp-checkin-guess">
+      <span class="sp-checkin-guess-emoji"></span>
+      <span class="sp-checkin-guess-label"></span>
+      <span class="sp-checkin-guess-sub">· We think</span>
+    </div>
+    <div class="sp-checkin-feelings"></div>
+    <div class="sp-checkin-changed" style="display:none">Vibe changed · updating…</div>
+  `;
+  document.body.appendChild(_checkInEl);
+
+  _checkInEl.querySelector('.sp-checkin-dismiss').addEventListener('pointerup', () => {
+    dismissCheckIn();
+    _hideCheckIn();
+  });
+
+  // Server says check-in is stale / vibe changed
+  socket.on('spotify:checkin_dismiss', () => {
+    const changedEl = _checkInEl.querySelector('.sp-checkin-changed');
+    changedEl.style.display = '';
+    clearTimeout(_checkInDismissTimeout);
+    _checkInDismissTimeout = setTimeout(() => _hideCheckIn(), 2500);
+  });
+
+  socket.on('spotify:checkin_stale', () => {
+    _hideCheckIn();
+  });
+
+  // New check-in prompt from server
+  socket.on('spotify:checkin', ({ guessedFeeling, guess, feelings }) => {
+    clearTimeout(_checkInDismissTimeout);
+    const changedEl = _checkInEl.querySelector('.sp-checkin-changed');
+    changedEl.style.display = 'none';
+
+    // Set guess
+    _checkInEl.querySelector('.sp-checkin-guess-emoji').textContent = guess?.emoji || '';
+    _checkInEl.querySelector('.sp-checkin-guess-label').textContent = guess?.label || '';
+
+    // Build feeling buttons
+    const feelingsEl = _checkInEl.querySelector('.sp-checkin-feelings');
+    feelingsEl.innerHTML = '';
+    feelings.forEach(f => {
+      const btn = document.createElement('button');
+      btn.className = 'sp-checkin-feeling-btn' + (f.key === guessedFeeling ? ' sp-checkin-feeling-btn--guess' : '');
+      btn.dataset.key = f.key;
+      btn.innerHTML = `<span class="sp-ck-emoji">${f.emoji}</span><span class="sp-ck-label">${f.label}</span>`;
+      btn.addEventListener('pointerup', () => {
+        respondToCheckIn(f.key);
+        _hideCheckIn();
+      });
+      feelingsEl.appendChild(btn);
+    });
+
+    _showCheckIn();
+  });
+}
+
+function _showCheckIn() {
+  if (!_checkInEl) return;
+  _checkInEl.style.display = '';
+  // Small delay then add visible class for CSS transition
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      _checkInEl.classList.add('sp-checkin-toast--visible');
+    });
+  });
+}
+
+function _hideCheckIn() {
+  if (!_checkInEl) return;
+  _checkInEl.classList.remove('sp-checkin-toast--visible');
+  clearTimeout(_checkInDismissTimeout);
+  _checkInDismissTimeout = setTimeout(() => {
+    if (_checkInEl) _checkInEl.style.display = 'none';
+  }, 350); // match CSS transition
+}
+
+// ---------------------------------------------------------------------------
+// Intelligence card
+// ---------------------------------------------------------------------------
+
+export function renderSpotifyIntelligence(ctrl) {
+  _initCheckInNotification();
+
+  const card = document.createElement('div');
+  card.className = 'control-card spotify-intelligence-card';
+  card.dataset.id = ctrl.id;
+  applyGridPlacement(card, ctrl);
+
+  card.innerHTML = `
+    <div class="sp-intel-wrap">
+      <div class="sp-intel-header">
+        <span class="sp-intel-title">Music Intelligence</span>
+        <label class="sp-intel-auto-toggle" title="Auto check-ins — get prompted when a pattern is detected">
+          <input type="checkbox" class="sp-intel-auto-check" checked>
+          <span class="sp-intel-auto-label">Auto</span>
+        </label>
+      </div>
+
+      <div class="sp-intel-active">
+        <div class="sp-intel-feeling-row" style="display:none">
+          <span class="sp-intel-feeling-emoji"></span>
+          <div class="sp-intel-feeling-info">
+            <span class="sp-intel-feeling-label"></span>
+            <span class="sp-intel-feeling-sub">Feeling · keeps going</span>
+          </div>
+          <button class="sp-intel-stop-btn" title="Stop">■</button>
+        </div>
+        <div class="sp-intel-vibe-row" style="display:none">
+          <span class="sp-intel-vibe-icon">✦</span>
+          <div class="sp-intel-vibe-info">
+            <span class="sp-intel-vibe-label"></span>
+            <span class="sp-intel-vibe-sub">keeps going ∞</span>
+          </div>
+          <button class="sp-intel-stop-btn sp-intel-vibe-stop-btn" title="Stop">■</button>
+        </div>
+        <div class="sp-intel-idle" style="display:none">
+          <span class="sp-intel-idle-text">Nothing active</span>
+        </div>
+      </div>
+
+      <div class="sp-intel-divider"></div>
+
+      <div class="sp-intel-context">
+        <div class="sp-intel-context-label">Right now</div>
+        <div class="sp-intel-context-value">—</div>
+      </div>
+
+      <div class="sp-intel-cluster">
+        <div class="sp-intel-cluster-label">Listening pattern</div>
+        <div class="sp-intel-cluster-bar-wrap">
+          <div class="sp-intel-cluster-bar"></div>
+        </div>
+        <span class="sp-intel-cluster-size">0 tracks</span>
+      </div>
+
+      <div class="sp-intel-divider"></div>
+
+      <button class="sp-intel-checkin-btn">
+        <span class="sp-intel-checkin-icon">💭</span>
+        How am I feeling?
+      </button>
+    </div>
+  `;
+
+  card.appendChild(dragHandle());
+  card.appendChild(resizeHandle());
+  card.appendChild(editOverlay(ctrl.id));
+
+  const feelingRow   = card.querySelector('.sp-intel-feeling-row');
+  const vibeRow      = card.querySelector('.sp-intel-vibe-row');
+  const idleEl       = card.querySelector('.sp-intel-idle');
+  const feelingEmoji = card.querySelector('.sp-intel-feeling-emoji');
+  const feelingLabel = card.querySelector('.sp-intel-feeling-label');
+  const vibeLabelEl  = card.querySelector('.sp-intel-vibe-label');
+  const contextVal   = card.querySelector('.sp-intel-context-value');
+  const clusterBar   = card.querySelector('.sp-intel-cluster-bar');
+  const clusterSize  = card.querySelector('.sp-intel-cluster-size');
+  const autoCheck    = card.querySelector('.sp-intel-auto-check');
+  const checkinBtn   = card.querySelector('.sp-intel-checkin-btn');
+
+  let _currentClusterSizeCache = 0;
+
+  function _renderState(data) {
+    if (!data) return;
+
+    // Active state
+    const { activeFeeling, activeMoodKey, activeVibeKey, clusterSize: cs, clusterCentroid, context } = data;
+
+    if (cs != null) _currentClusterSizeCache = cs;
+
+    if (activeFeeling) {
+      feelingEmoji.textContent = activeFeeling.emoji;
+      feelingLabel.textContent = activeFeeling.label;
+      feelingRow.style.display = '';
+      vibeRow.style.display    = 'none';
+      idleEl.style.display     = 'none';
+    } else if (activeMoodKey || activeVibeKey) {
+      vibeLabelEl.textContent  = activeMoodKey || activeVibeKey;
+      vibeRow.style.display    = '';
+      feelingRow.style.display = 'none';
+      idleEl.style.display     = 'none';
+    } else {
+      feelingRow.style.display = 'none';
+      vibeRow.style.display    = 'none';
+      idleEl.style.display     = '';
+    }
+
+    // Context suggestion
+    if (context?.suggestedMoodName) {
+      contextVal.textContent = `${context.suggestedMoodEmoji || ''} ${context.suggestedMoodName}`;
+    } else {
+      contextVal.textContent = '—';
+    }
+
+    // Cluster bar (confidence indicator, max display = 20 tracks)
+    const pct = Math.min(100, ((_currentClusterSizeCache || 0) / 20) * 100);
+    clusterBar.style.width = pct + '%';
+    clusterSize.textContent = `${_currentClusterSizeCache || 0} track${_currentClusterSizeCache !== 1 ? 's' : ''} detected`;
+
+    // Auto check-in toggle
+    if (data.checkInAuto != null) autoCheck.checked = data.checkInAuto;
+  }
+
+  // Stop buttons
+  card.querySelectorAll('.sp-intel-stop-btn').forEach(btn => {
+    btn.addEventListener('pointerup', () => {
+      if (isEditMode()) return;
+      stopFeeling();
+    });
+  });
+
+  // Check-in button — manually trigger the popup
+  checkinBtn.addEventListener('pointerup', () => {
+    if (isEditMode()) return;
+    // If there's a pending check-in already, just show it
+    if (_checkInEl && _checkInEl.style.display !== 'none') return;
+    // Otherwise ask server to get current context and show generic feeling picker
+    socket.emit('spotify:get_intelligence');
+    socket.once('spotify:intelligence_state', (data) => {
+      if (data.pendingCheckIn) {
+        // Server already has a pending one — the checkin event will have been sent
+        return;
+      }
+      // Manually show feeling picker with no guess
+      if (_checkInEl) {
+        _checkInEl.querySelector('.sp-checkin-guess-emoji').textContent = '💭';
+        _checkInEl.querySelector('.sp-checkin-guess-label').textContent = 'You tell us';
+        _checkInEl.querySelector('.sp-checkin-changed').style.display = 'none';
+        const feelingsEl = _checkInEl.querySelector('.sp-checkin-feelings');
+        feelingsEl.innerHTML = '';
+        (data.feelings || []).forEach(f => {
+          const btn = document.createElement('button');
+          btn.className = 'sp-checkin-feeling-btn';
+          btn.dataset.key = f.key;
+          btn.innerHTML = `<span class="sp-ck-emoji">${f.emoji}</span><span class="sp-ck-label">${f.label}</span>`;
+          btn.addEventListener('pointerup', () => {
+            respondToCheckIn(f.key);
+            _hideCheckIn();
+          });
+          feelingsEl.appendChild(btn);
+        });
+        _showCheckIn();
+      }
+    });
+  });
+
+  // Auto check-in toggle
+  autoCheck.addEventListener('change', () => {
+    setCheckInAuto(autoCheck.checked);
+  });
+
+  // Socket listeners
+  const _onIntelState = (data) => {
+    _currentClusterSizeCache = data.clusterSize || 0;
+    _renderState(data);
+  };
+  const _onFeelingExp = () => _renderState({ activeFeeling: null, activeMoodKey: null, activeVibeKey: null, clusterSize: _currentClusterSizeCache, context: null });
+  const _onContState  = (data) => {
+    _renderState({ ...data, clusterSize: _currentClusterSizeCache });
+  };
+  const _onCheckinAuto = ({ enabled }) => { autoCheck.checked = enabled; };
+
+  socket.on('spotify:intelligence_state', _onIntelState);
+  socket.on('spotify:feeling_expired',    _onFeelingExp);
+  socket.on('spotify:continuous_state',   _onContState);
+  socket.on('spotify:checkin_auto',       _onCheckinAuto);
+
+  // Cleanup
+  const _cleanObs = new MutationObserver(() => {
+    if (!document.contains(card)) {
+      socket.off('spotify:intelligence_state', _onIntelState);
+      socket.off('spotify:feeling_expired',    _onFeelingExp);
+      socket.off('spotify:continuous_state',   _onContState);
+      socket.off('spotify:checkin_auto',       _onCheckinAuto);
+      _cleanObs.disconnect();
+    }
+  });
+  _cleanObs.observe(document.body, { childList: true, subtree: true });
+
+  getIntelligence().then(_renderState);
+
+  return card;
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch export
 // ---------------------------------------------------------------------------
 
 export function renderSpotifyControl(ctrl) {
   switch (ctrl.type) {
-    case 'spotify_player':    return renderSpotifyPlayer(ctrl);
-    case 'spotify_search':    return renderSpotifySearch(ctrl);
-    case 'spotify_playlists': return renderSpotifyPlaylists(ctrl);
-    case 'spotify_queue':     return renderSpotifyQueue(ctrl);
-    case 'spotify_stats':     return renderSpotifyStats(ctrl);
-    case 'spotify_insights':  return renderSpotifyInsights(ctrl);
+    case 'spotify_player':       return renderSpotifyPlayer(ctrl);
+    case 'spotify_search':       return renderSpotifySearch(ctrl);
+    case 'spotify_playlists':    return renderSpotifyPlaylists(ctrl);
+    case 'spotify_queue':        return renderSpotifyQueue(ctrl);
+    case 'spotify_stats':        return renderSpotifyStats(ctrl);
+    case 'spotify_insights':     return renderSpotifyInsights(ctrl);
+    case 'spotify_intelligence': return renderSpotifyIntelligence(ctrl);
     default:
       console.warn('[spotify-controls] Unknown control type:', ctrl.type);
       return null;
