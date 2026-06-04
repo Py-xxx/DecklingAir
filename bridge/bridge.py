@@ -17,6 +17,7 @@ import string
 import subprocess
 import socket
 import webbrowser
+import winreg
 from datetime import datetime
 from pathlib import Path
 
@@ -55,8 +56,33 @@ def load_config():
 cfg = load_config()
 PI_HOST    = cfg.get("pi_host", "192.168.1.100")
 PI_PORT    = cfg.get("bridge_port", 3003)
+WEB_PORT   = cfg.get("web_port", 3002)
 LOG_LEVEL  = cfg.get("log_level", "INFO")
 POLL_MS    = cfg.get("poll_interval_ms", 50)
+
+_BRIDGE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOCKFILE    = os.path.join(_BRIDGE_DIR, "bridge.pid")
+LOG_FILE    = os.path.join(_BRIDGE_DIR, "bridge.log")
+
+STATE_COLORS = {
+    "starting":     "#6c63ff",
+    "vm_wait":      "#f59e0b",
+    "connecting":   "#6c63ff",
+    "connected":    "#1db954",
+    "reconnecting": "#f59e0b",
+    "error":        "#dc2626",
+}
+STATE_LABELS = {
+    "starting":     "Starting…",
+    "vm_wait":      "Waiting for VoiceMeeter…",
+    "connecting":   "Connecting…",
+    "connected":    "Connected",
+    "reconnecting": "Reconnecting…",
+    "error":        "Error",
+}
+
+STARTUP_REG_KEY   = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_REG_VALUE = "VMControlBridge"
 
 
 def slugify_device_id(value: str) -> str:
@@ -70,20 +96,31 @@ DEVICE_NAME = cfg.get("device_name") or socket.gethostname()
 DEVICE_ID = cfg.get("device_id") or slugify_device_id(DEVICE_NAME)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ]
-)
+_log_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+_log_level = getattr(logging, LOG_LEVEL, logging.INFO)
+
+_file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+_file_handler.setFormatter(_log_fmt)
+_file_handler.setLevel(_log_level)
+
+_stream_handler = logging.StreamHandler(sys.stdout)
+_stream_handler.setFormatter(_log_fmt)
+_stream_handler.setLevel(_log_level)
+
+logging.basicConfig(level=_log_level, handlers=[_stream_handler, _file_handler])
 log = logging.getLogger(__name__)
 
 # ── Globals ───────────────────────────────────────────────────────────────────
 vm = VoiceMeeterRemote()
-running = True
-tray_icon = None
-status_text = "Starting..."
+running      = True
+tray_icon    = None
+conn_state   = "starting"
+vm_connected = False          # True once vm.login() succeeds
+_async_thread: threading.Thread = None
+_event_loop: asyncio.AbstractEventLoop = None
+_reconnect_requested = threading.Event()
+_current_ws  = None           # active websocket, used by force-reconnect
+
 SCREENSHOT_DIR = os.path.join(os.path.expanduser("~"), "Pictures", "VM Control Screenshots")
 KEYEVENTF_KEYUP = 0x0002
 ICON_CACHE = {}
@@ -121,34 +158,147 @@ VK_CODES = {
 def make_icon_image(color="#6c63ff"):
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    # Simple bar-chart icon
     bars = [(8, 32, 20, 60), (24, 16, 36, 60), (40, 8, 52, 60)]
     r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
     for bar in bars:
         d.rectangle(bar, fill=(r, g, b, 220))
     return img
 
-def update_tray_status(text: str):
-    global status_text, tray_icon
-    status_text = text
+def set_conn_state(state: str, notify: str = None):
+    """Update connection state, tray icon colour, and tooltip. Optionally show balloon."""
+    global conn_state
+    conn_state = state
+    color = STATE_COLORS.get(state, "#6c63ff")
+    label = STATE_LABELS.get(state, state)
     if tray_icon:
-        tray_icon.title = f"VM Control Bridge — {text}"
+        tray_icon.icon  = make_icon_image(color)
+        tray_icon.title = f"VM Control Bridge — {label}"
+        if notify:
+            try:
+                tray_icon.notify(notify, "VM Control Bridge")
+            except Exception:
+                pass
+
+def update_tray_status(text: str):
+    """Legacy helper — maps text to nearest conn_state."""
+    if "connected" in text.lower() and "re" not in text.lower():
+        set_conn_state("connected")
+    elif "reconnect" in text.lower():
+        set_conn_state("reconnecting")
+    elif "connect" in text.lower():
+        set_conn_state("connecting")
+
+# ── Startup registry helpers ───────────────────────────────────────────────────
+def _startup_cmd():
+    """Command to register for Windows startup."""
+    python_dir = os.path.dirname(sys.executable)
+    pythonw = os.path.join(python_dir, "pythonw.exe")
+    if not os.path.exists(pythonw):
+        pythonw = sys.executable
+    return f'"{pythonw}" "{os.path.abspath(__file__)}"'
+
+def is_startup_enabled() -> bool:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_KEY) as key:
+            val, _ = winreg.QueryValueEx(key, STARTUP_REG_VALUE)
+            return bool(val)
+    except Exception:
+        return False
+
+def _set_startup(enabled: bool):
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                winreg.SetValueEx(key, STARTUP_REG_VALUE, 0, winreg.REG_SZ, _startup_cmd())
+                log.info("Added to Windows startup")
+            else:
+                try:
+                    winreg.DeleteValue(key, STARTUP_REG_VALUE)
+                    log.info("Removed from Windows startup")
+                except FileNotFoundError:
+                    pass
+    except Exception as e:
+        log.error("Registry error: %s", e)
+
+# ── Single-instance helpers ────────────────────────────────────────────────────
+def _kill_pid(pid: int):
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/PID", str(pid)],
+            capture_output=True,
+            **hidden_subprocess_kwargs(),
+        )
+    except Exception:
+        pass
+
+def ensure_single_instance():
+    """Kill any previous bridge instance, then write our PID to the lockfile."""
+    if os.path.exists(LOCKFILE):
+        try:
+            with open(LOCKFILE) as f:
+                old_pid = int(f.read().strip())
+            if old_pid != os.getpid():
+                log.info("Killing previous instance (PID %d)", old_pid)
+                _kill_pid(old_pid)
+                time.sleep(0.5)
+        except Exception:
+            pass
+    try:
+        with open(LOCKFILE, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception as e:
+        log.warning("Could not write lockfile: %s", e)
+
+# ── Tray action handlers ───────────────────────────────────────────────────────
+def _tray_reconnect(icon, item):
+    """Force-close the current websocket so run_bridge() retries immediately."""
+    global _current_ws
+    _reconnect_requested.set()
+    ws = _current_ws
+    if ws and _event_loop:
+        asyncio.run_coroutine_threadsafe(ws.close(), _event_loop)
+
+def _tray_open_web_ui(icon, item):
+    webbrowser.open(f"http://{PI_HOST}:{WEB_PORT}")
+
+def _tray_open_log(icon, item):
+    try:
+        os.startfile(LOG_FILE)
+    except Exception:
+        subprocess.Popen(["notepad.exe", LOG_FILE], **hidden_subprocess_kwargs())
+
+def _tray_toggle_startup(icon, item):
+    _set_startup(not is_startup_enabled())
 
 def quit_app(icon, item):
     global running
     running = False
+    try:
+        os.remove(LOCKFILE)
+    except Exception:
+        pass
     icon.stop()
 
 def setup_tray():
     global tray_icon
-    icon_img = make_icon_image()
+    icon_img = make_icon_image(STATE_COLORS["starting"])
     menu = pystray.Menu(
         pystray.MenuItem("VM Control Bridge", None, enabled=False),
-        pystray.MenuItem(lambda item: status_text, None, enabled=False),
+        pystray.MenuItem(lambda item: STATE_LABELS.get(conn_state, conn_state), None, enabled=False),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Reconnect",          _tray_reconnect),
+        pystray.MenuItem("Open Web UI",        _tray_open_web_ui),
+        pystray.MenuItem("Open Log",           _tray_open_log),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(
+            "Start with Windows",
+            _tray_toggle_startup,
+            checked=lambda item: is_startup_enabled(),
+        ),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", quit_app),
     )
-    tray_icon = pystray.Icon("VMControl", icon_img, "VM Control Bridge", menu)
+    tray_icon = pystray.Icon("VMControl", icon_img, "VM Control Bridge — Starting…", menu)
     return tray_icon
 
 
@@ -508,18 +658,24 @@ $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
 
 # ── WebSocket bridge session ──────────────────────────────────────────────────
 async def run_bridge():
+    global _current_ws
     url = f"ws://{PI_HOST}:{PI_PORT}"
     log.info("Connecting to %s", url)
+    attempt = 0
 
     while running:
+        _reconnect_requested.clear()
+        attempt += 1
+        set_conn_state("connecting")
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
+                _current_ws = ws
+                attempt = 0
                 log.info("Connected to server")
-                update_tray_status("Connected")
+                set_conn_state("connected", notify="Connected to server")
 
-                # Send hello
-                vm_type = vm.get_type()
-                vm_ver  = vm.get_version()
+                vm_type = vm.get_type() if vm_connected else 0
+                vm_ver  = vm.get_version() if vm_connected else "unknown"
                 await ws.send(json.dumps({
                     "type": "hello",
                     "deviceId": DEVICE_ID,
@@ -528,36 +684,45 @@ async def run_bridge():
                     "vmType": vm_type,
                     "vmVersion": vm_ver,
                     "capabilities": {
-                        "voiceMeeter": True,
+                        "voiceMeeter": vm_connected,
                         "desktopActions": True,
                         "desktopIcons": True,
                         "soundboard": _sounddevice_available and _miniaudio_available,
                     },
                 }))
-                log.info("VoiceMeeter type=%d version=%s", vm_type, vm_ver)
+                if vm_connected:
+                    log.info("VoiceMeeter type=%d version=%s", vm_type, vm_ver)
+                    state = vm.get_all_params()
+                    await ws.send(json.dumps({"type": "state", "data": state}))
 
-                # Send initial full state
-                state = vm.get_all_params()
-                await ws.send(json.dumps({"type": "state", "data": state}))
-
-                # Start polling task
                 poll_task = asyncio.create_task(poll_loop(ws))
                 try:
                     await receive_loop(ws)
                 finally:
+                    _current_ws = None
                     poll_task.cancel()
                     try: await poll_task
                     except asyncio.CancelledError: pass
 
         except (websockets.ConnectionClosed, OSError, ConnectionRefusedError) as e:
-            log.warning("Connection lost: %s. Retrying in 5s...", e)
-            update_tray_status("Reconnecting...")
+            _current_ws = None
+            log.warning("Connection lost: %s", e)
+            set_conn_state("reconnecting", notify="Connection lost — reconnecting…")
         except Exception as e:
+            _current_ws = None
             log.error("Unexpected error: %s", e, exc_info=True)
+            set_conn_state("reconnecting")
 
         if not running:
             break
-        await asyncio.sleep(5)
+
+        # Wait up to 5 s before retrying, but bail immediately if force-reconnect
+        delay = min(5, attempt * 2)
+        log.info("Retrying in %ds (attempt %d)…", delay, attempt)
+        for _ in range(delay * 10):
+            if not running or _reconnect_requested.is_set():
+                break
+            await asyncio.sleep(0.1)
 
 async def receive_loop(ws):
     """Handle incoming commands from the Pi server."""
@@ -670,18 +835,49 @@ async def receive_loop(ws):
 
 async def poll_loop(ws):
     """Periodically poll VoiceMeeter for state changes and level data."""
+    global vm_connected
     interval = POLL_MS / 1000.0
-    level_tick = 0
+    vm_retry_ticks = 0   # countdown before next VM login attempt
 
     while running:
         try:
-            # Check for parameter changes
+            # ── VoiceMeeter reconnect ──────────────────────────────────────
+            if not vm_connected:
+                if vm_retry_ticks <= 0:
+                    result = vm.login()
+                    if result >= 0:
+                        vm_connected = True
+                        log.info("VoiceMeeter connected (login code %d)", result)
+                        # Announce updated capabilities now that VM is live
+                        await ws.send(json.dumps({
+                            "type": "hello",
+                            "deviceId": DEVICE_ID,
+                            "deviceName": DEVICE_NAME,
+                            "platform": "windows",
+                            "vmType": vm.get_type(),
+                            "vmVersion": vm.get_version(),
+                            "capabilities": {
+                                "voiceMeeter": True,
+                                "desktopActions": True,
+                                "desktopIcons": True,
+                                "soundboard": _sounddevice_available and _miniaudio_available,
+                            },
+                        }))
+                        state = vm.get_all_params()
+                        await ws.send(json.dumps({"type": "state", "data": state}))
+                    else:
+                        vm_retry_ticks = int(5.0 / interval)
+                else:
+                    vm_retry_ticks -= 1
+                await asyncio.sleep(interval)
+                continue
+
+            # ── Normal poll ───────────────────────────────────────────────
             if vm.is_dirty():
                 state = vm.get_all_params()
                 await ws.send(json.dumps({"type": "state", "data": state}))
                 log.debug("State update sent")
 
-            # Send level data every tick
             levels = vm.get_all_levels()
             await ws.send(json.dumps({"type": "levels", "data": levels}))
 
@@ -690,40 +886,68 @@ async def poll_loop(ws):
             break
         except Exception as e:
             log.error("Poll error: %s", e)
+            # If VoiceMeeter disappeared, flag for reconnect
+            if vm_connected and ("dll" in str(e).lower() or "voicemeeter" in str(e).lower() or isinstance(e, OSError)):
+                log.warning("VoiceMeeter connection lost, will retry…")
+                vm_connected = False
+                set_conn_state("vm_wait")
+                vm_retry_ticks = int(5.0 / interval)
 
         await asyncio.sleep(interval)
 
 # ── Asyncio thread ────────────────────────────────────────────────────────────
 def run_async_thread():
     """Run the asyncio event loop in a background thread."""
+    global _event_loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    _event_loop = loop
     try:
         loop.run_until_complete(run_bridge())
     except Exception as e:
         log.error("Async thread error: %s", e)
     finally:
+        _event_loop = None
         loop.close()
+
+# ── Async-thread watchdog ──────────────────────────────────────────────────────
+def _watchdog_thread():
+    """Restart the async networking thread if it unexpectedly dies."""
+    global _async_thread
+    while running:
+        time.sleep(10)
+        if not running:
+            break
+        if _async_thread and not _async_thread.is_alive():
+            log.warning("Networking thread died unexpectedly — restarting…")
+            set_conn_state("reconnecting")
+            _async_thread = threading.Thread(target=run_async_thread, daemon=True, name="bridge-async")
+            _async_thread.start()
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    global running
+    global running, vm_connected, _async_thread
 
-    log.info("VM Control Bridge starting...")
+    log.info("=" * 60)
+    log.info("VM Control Bridge starting (PID %d)", os.getpid())
 
-    # Initialize VoiceMeeter DLL
+    # ── Single instance: kill old process if running ──────────────────────────
+    ensure_single_instance()
+
+    # ── VoiceMeeter DLL ───────────────────────────────────────────────────────
     if not vm.initialize():
-        log.error("Could not load VoiceMeeter DLL. Exiting.")
-        sys.exit(1)
+        log.error("VoiceMeeter DLL not found — is VoiceMeeter installed?")
+        # Don't exit; VM ops will just be disabled until DLL appears
+    else:
+        result = vm.login()
+        if result >= 0:
+            vm_connected = True
+            log.info("VoiceMeeter login OK (code %d)", result)
+        else:
+            log.warning("VoiceMeeter not running yet (code %d) — will retry automatically", result)
+            set_conn_state("vm_wait")
 
-    result = vm.login()
-    if result < 0:
-        log.error("VoiceMeeter login failed (code %d). Is VoiceMeeter running?", result)
-        # Don't exit — VM might start later; keep trying
-
-    log.info("VoiceMeeter login code: %d (0=ok, 1=launched, <0=error)", result)
-
-    # Log available audio output devices so device names are visible in logs
+    # ── Audio device log ──────────────────────────────────────────────────────
     if _sounddevice_available:
         try:
             log.info("Available audio output devices:")
@@ -733,20 +957,21 @@ def main():
         except Exception as e:
             log.warning("Could not query audio devices: %s", e)
 
-    update_tray_status("Connecting...")
+    # ── Start networking thread + watchdog ────────────────────────────────────
+    _async_thread = threading.Thread(target=run_async_thread, daemon=True, name="bridge-async")
+    _async_thread.start()
 
-    # Start async networking thread
-    async_thread = threading.Thread(target=run_async_thread, daemon=True)
-    async_thread.start()
+    watchdog = threading.Thread(target=_watchdog_thread, daemon=True, name="bridge-watchdog")
+    watchdog.start()
 
-    # Run tray icon on main thread (required on Windows)
+    # ── Tray icon runs on main thread (Windows requirement) ───────────────────
     icon = setup_tray()
-    log.info("Starting system tray icon (close via tray menu)")
-    icon.run()  # Blocks until quit
+    log.info("Tray icon running — right-click to reconnect, open web UI, or quit")
+    icon.run()  # blocks until quit_app() calls icon.stop()
 
-    # Cleanup
+    # ── Cleanup ───────────────────────────────────────────────────────────────
     running = False
-    log.info("Shutting down...")
+    log.info("Shutting down…")
     try:
         vm.logout()
     except Exception:
