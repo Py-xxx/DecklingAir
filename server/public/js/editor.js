@@ -422,7 +422,7 @@ function showConfigSection(type) {
     spotify_queue:     'cfg-spotify-queue',
     spotify_stats:        'cfg-spotify-stats',
     spotify_insights:     'cfg-spotify-insights',
-    spotify_intelligence: 'cfg-spotify-insights',
+    spotify_intelligence: 'cfg-spotify-intelligence',
   };
 
   const sectionId = sectionMap[type];

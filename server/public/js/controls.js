@@ -866,7 +866,8 @@ export function renderControl(ctrl, vmState) {
     case 'spotify_playlists':
     case 'spotify_queue':
     case 'spotify_stats':
-    case 'spotify_insights':  return renderSpotifyControl(ctrl);
+    case 'spotify_insights':
+    case 'spotify_intelligence': return renderSpotifyControl(ctrl);
     default: {
       const d = document.createElement('div');
       d.className = 'control-card'; d.style.padding = '12px';
