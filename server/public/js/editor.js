@@ -17,8 +17,9 @@ const DEFAULT_SIZES = {
   spotify_search:    [3, 3],
   spotify_playlists: [3, 4],
   spotify_queue:     [2, 3],
-  spotify_stats:     [2, 4],
-  spotify_insights:  [4, 5],
+  spotify_stats:        [2, 4],
+  spotify_insights:     [4, 5],
+  spotify_intelligence: [2, 3],
 };
 
 const VM_ONLY_TYPES = new Set([
@@ -419,8 +420,9 @@ function showConfigSection(type) {
     spotify_search:    'cfg-spotify-search',
     spotify_playlists: 'cfg-spotify-playlists',
     spotify_queue:     'cfg-spotify-queue',
-    spotify_stats:     'cfg-spotify-stats',
-    spotify_insights:  'cfg-spotify-insights',
+    spotify_stats:        'cfg-spotify-stats',
+    spotify_insights:     'cfg-spotify-insights',
+    spotify_intelligence: 'cfg-spotify-insights',
   };
 
   const sectionId = sectionMap[type];
@@ -675,7 +677,8 @@ function buildControlConfig(type) {
   if (type === 'spotify_search') return { label: label || 'Search' };
   if (type === 'spotify_queue')  return { label: label || 'Queue' };
   if (type === 'spotify_stats')  return { label: label || 'Session Stats' };
-  if (type === 'spotify_insights') return { label: label || 'Music Intelligence' };
+  if (type === 'spotify_insights')     return { label: label || 'Music Intelligence' };
+  if (type === 'spotify_intelligence') return { label: label || 'Now Playing Intel' };
   if (type === 'spotify_playlists') {
     const columns = Number.parseInt(document.getElementById('cfg-spotify-pl-cols')?.value, 10) || 3;
     const showSpecialPlaylists = document.getElementById('cfg-spotify-pl-special')?.checked ?? false;
