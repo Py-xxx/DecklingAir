@@ -383,6 +383,32 @@ async function seedFromSpotify() {
       } catch (e) { console.warn(`[Spotify] top-tracks ${range} seed failed:`, e.message); }
     }
 
+    // 3. Fetch audio features for all seeds in batches of 100 so they can
+    //    participate in vibe clustering (energy/valence/bpm etc.)
+    const seedIds = seeds.map(s => s.id).filter(Boolean);
+    const idToSeed = new Map(seeds.map(s => [s.id, s]));
+    for (let i = 0; i < seedIds.length; i += 100) {
+      const batch = seedIds.slice(i, i + 100);
+      try {
+        const features = await getBatchAudioFeatures(batch);
+        features.forEach((f, idx) => {
+          if (!f) return;
+          const seed = idToSeed.get(batch[idx]);
+          if (!seed) return;
+          seed.bpm      = Math.round(f.tempo || 0);
+          seed.energy   = Math.round((f.energy        || 0) * 100);
+          seed.valence  = Math.round((f.valence        || 0) * 100);
+          seed.dance    = Math.round((f.danceability   || 0) * 100);
+          seed.acoustic = Math.round((f.acousticness   || 0) * 100);
+          seed.inst     = Math.round((f.instrumentalness || 0) * 100);
+        });
+      } catch (e) {
+        console.warn('[Spotify] Seed audio features batch failed:', e.message);
+      }
+    }
+    const withFeatures = seeds.filter(s => s.energy != null).length;
+    console.log(`[Spotify] Seed audio features: ${withFeatures}/${seeds.length} enriched`);
+
     _seededHistory = seeds;
     _seedTimestamp = Date.now();
     console.log(`[Spotify] Seed complete — ${_seededHistory.length} total seeded entries`);
@@ -714,6 +740,23 @@ async function getPlaylists(limit = 50) {
   return api('GET', '/me/playlists', { params: { limit } });
 }
 
+async function getAllPlaylists() {
+  const limit = 50;
+  let offset = 0;
+  let allItems = [];
+  const first = await api('GET', '/me/playlists', { params: { limit, offset: 0 } });
+  if (!first) return { items: [] };
+  const total = first.total || 0;
+  allItems = allItems.concat(first.items || []);
+  while (allItems.length < total) {
+    offset = allItems.length;
+    const page = await api('GET', '/me/playlists', { params: { limit, offset } });
+    if (!page || !page.items || !page.items.length) break;
+    allItems = allItems.concat(page.items);
+  }
+  return { items: allItems };
+}
+
 async function getPlaylistTracks(playlistId, limit = 100) {
   // Feb 2026: /tracks → /items; response field track → item
   return api('GET', `/playlists/${playlistId}/items`, {
@@ -722,6 +765,43 @@ async function getPlaylistTracks(playlistId, limit = 100) {
       fields: 'items(item(id,uri,name,duration_ms,artists(id,name),album(name,images)))',
     },
   });
+}
+
+async function getAllPlaylistTracks(playlistId) {
+  const limit = 100;
+  const fields = 'total,items(item(id,uri,name,duration_ms,artists(id,name),album(name,images)))';
+  const first = await api('GET', `/playlists/${playlistId}/items`, {
+    params: { limit, offset: 0, fields },
+  });
+  if (!first) return [];
+  const total = first.total || 0;
+  let allItems = first.items || [];
+  while (allItems.length < total) {
+    const page = await api('GET', `/playlists/${playlistId}/items`, {
+      params: { limit, offset: allItems.length, fields: 'items(item(id,uri,name,duration_ms,artists(id,name),album(name,images)))' },
+    });
+    if (!page || !page.items || !page.items.length) break;
+    allItems = allItems.concat(page.items);
+  }
+  return allItems;
+}
+
+async function getAllLikedSongs() {
+  const limit = 50;
+  let offset = 0;
+  let allItems = [];
+  // First page also gives total
+  const first = await getLikedSongTracks(limit, 0);
+  if (!first) return [];
+  const total = first.total || 0;
+  allItems = allItems.concat(first.items || []);
+  while (allItems.length < total) {
+    offset = allItems.length;
+    const page = await getLikedSongTracks(limit, offset);
+    if (!page || !page.items || !page.items.length) break;
+    allItems = allItems.concat(page.items);
+  }
+  return allItems;
 }
 
 // In-memory cache so we don't re-fetch features for the same track
@@ -1625,25 +1705,54 @@ function init(io) {
     });
 
     // ----- spotify:search -----
-    socket.on('spotify:search', async ({ query } = {}) => {
+    socket.on('spotify:search', async ({ query, type = 'track' } = {}) => {
+      const validTypes = ['track', 'artist', 'album', 'playlist'];
+      const searchType = validTypes.includes(type) ? type : 'track';
       try {
-        const results = await search(query, 'track', 10);
-        const tracks =
-          results && results.tracks && results.tracks.items
-            ? results.tracks.items.map((t) => ({
-                id: t.id,
-                uri: t.uri,
-                title: t.name,
-                artist: t.artists ? t.artists.map((a) => a.name).join(', ') : '',
-                album: t.album ? t.album.name : '',
-                albumArt:
-                  t.album && t.album.images && t.album.images.length > 0
-                    ? t.album.images[0].url
-                    : null,
-                duration: t.duration_ms,
-              }))
-            : [];
-        socket.emit('spotify:search_results', { items: tracks });
+        const results = await search(query, searchType, 10);
+        let items = [];
+
+        if (searchType === 'track') {
+          items = (results?.tracks?.items || []).map((t) => ({
+            type: 'track',
+            id: t.id, uri: t.uri,
+            title: t.name,
+            artist: t.artists ? t.artists.map((a) => a.name).join(', ') : '',
+            album: t.album ? t.album.name : '',
+            albumArt: t.album?.images?.[0]?.url || null,
+            duration: t.duration_ms,
+          }));
+        } else if (searchType === 'artist') {
+          items = (results?.artists?.items || []).map((a) => ({
+            type: 'artist',
+            id: a.id, uri: a.uri,
+            name: a.name,
+            genres: (a.genres || []).slice(0, 2).join(', '),
+            image: a.images?.[0]?.url || null,
+            followers: a.followers?.total || 0,
+          }));
+        } else if (searchType === 'album') {
+          items = (results?.albums?.items || []).map((al) => ({
+            type: 'album',
+            id: al.id, uri: al.uri,
+            name: al.name,
+            artist: al.artists ? al.artists.map((a) => a.name).join(', ') : '',
+            image: al.images?.[0]?.url || null,
+            year: al.release_date ? al.release_date.slice(0, 4) : '',
+            total: al.total_tracks || 0,
+          }));
+        } else if (searchType === 'playlist') {
+          items = (results?.playlists?.items || []).filter(Boolean).map((p) => ({
+            type: 'playlist',
+            id: p.id, uri: p.uri,
+            name: p.name,
+            owner: p.owner?.display_name || '',
+            image: p.images?.[0]?.url || null,
+            total: p.tracks?.total || 0,
+          }));
+        }
+
+        socket.emit('spotify:search_results', { type: searchType, items });
       } catch (err) {
         console.error('[Spotify] Search error:', err.message);
         socket.emit('spotify:error', { message: err.message });
@@ -1658,7 +1767,7 @@ function init(io) {
         if (!_userId) await getUserProfile();
         console.log(`[Spotify] get_playlists: userId=${_userId} ownedOnly=${ownedOnly}`);
 
-        const data = await getPlaylists(50);
+        const data = await getAllPlaylists();
         const playlists =
           data && data.items
             ? data.items
@@ -1689,21 +1798,18 @@ function init(io) {
     // ----- spotify:get_playlist_tracks -----
     socket.on('spotify:get_playlist_tracks', async ({ playlistId } = {}) => {
       try {
-        const data = await getPlaylistTracks(playlistId, 100);
-        const tracks =
-          data && data.items
-            ? data.items
-                // Feb 2026: response field renamed track → item; fall back for safety
-                .map((entry) => entry.item || entry.track)
-                .filter((t) => t && t.id)
-                .map((t) => ({
-                  id: t.id,
-                  uri: t.uri,
-                  title: t.name,
-                  artist: t.artists ? t.artists.map((a) => a.name).join(', ') : '',
-                  duration: t.duration_ms,
-                }))
-            : [];
+        const allItems = await getAllPlaylistTracks(playlistId);
+        const tracks = allItems
+          // Feb 2026: response field renamed track → item; fall back for safety
+          .map((entry) => entry.item || entry.track)
+          .filter((t) => t && t.id)
+          .map((t) => ({
+            id: t.id,
+            uri: t.uri,
+            title: t.name,
+            artist: t.artists ? t.artists.map((a) => a.name).join(', ') : '',
+            duration: t.duration_ms,
+          }));
         socket.emit('spotify:playlist_tracks', { playlistId, tracks });
       } catch (err) {
         console.error('[Spotify] Get playlist tracks error:', err.message);
@@ -1712,23 +1818,20 @@ function init(io) {
     });
 
     // ----- spotify:get_liked_songs -----
-    socket.on('spotify:get_liked_songs', async ({ limit = 50, offset = 0 } = {}) => {
+    socket.on('spotify:get_liked_songs', async () => {
       try {
-        const data = await getLikedSongTracks(limit, offset);
-        const tracks =
-          data && data.items
-            ? data.items
-                // Feb 2026: response field renamed track → item; keep both for safety
-                .map((entry) => entry.item || entry.track)
-                .filter((t) => t && t.id)
-                .map((t) => ({
-                  id: t.id,
-                  uri: t.uri,
-                  title: t.name,
-                  artist: t.artists ? t.artists.map((a) => a.name).join(', ') : '',
-                  duration: t.duration_ms,
-                }))
-            : [];
+        const allItems = await getAllLikedSongs();
+        const tracks = allItems
+          // Feb 2026: response field renamed track → item; keep both for safety
+          .map((entry) => entry.item || entry.track)
+          .filter((t) => t && t.id)
+          .map((t) => ({
+            id: t.id,
+            uri: t.uri,
+            title: t.name,
+            artist: t.artists ? t.artists.map((a) => a.name).join(', ') : '',
+            duration: t.duration_ms,
+          }));
         socket.emit('spotify:liked_songs', { tracks });
       } catch (err) {
         console.error('[Spotify] Get liked songs error:', err.message);
@@ -1765,6 +1868,14 @@ function init(io) {
     // ----- spotify:get_stats -----
     socket.on('spotify:get_stats', () => {
       socket.emit('spotify:stats', buildStats());
+    });
+
+    // ----- spotify:get_sessions -----
+    socket.on('spotify:get_sessions', () => {
+      const past = [..._sessions]
+        .sort((a, b) => b.startTime - a.startTime)
+        .slice(0, 100);
+      socket.emit('spotify:sessions', { sessions: past });
     });
 
     // ----- spotify:reset_session -----

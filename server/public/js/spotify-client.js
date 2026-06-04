@@ -27,8 +27,8 @@ export function spotifyCmd(action, args = {}) {
  * Trigger a server-side search. Results arrive via 'spotify:search_results'.
  * @param {string} query
  */
-export function spotifySearch(query) {
-  socket.emit('spotify:search', { query });
+export function spotifySearch(query, type = 'track') {
+  socket.emit('spotify:search', { query, type });
 }
 
 // ---------------------------------------------------------------------------
