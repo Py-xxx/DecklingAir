@@ -162,7 +162,12 @@ function loadHistory() {
     _history = lines
       .map(l => { try { return l.trim() ? JSON.parse(l) : null; } catch { return null; } })
       .filter(Boolean);
-    console.log(`[Spotify] Loaded ${_history.length} history entries`);
+    const withFeatures = _history.filter(e => e.energy != null).length;
+    console.log(`[Spotify] Loaded ${_history.length} history entries (${withFeatures} with audio features)`);
+    if (_history.length > 0) {
+      const sample = _history[_history.length - 1];
+      console.log(`[Spotify] History sample keys: ${Object.keys(sample).join(',')} — id=${sample.id} energy=${sample.energy}`);
+    }
   } catch (err) {
     console.error('[Spotify] Failed to load history:', err.message);
     _history = [];
@@ -1794,12 +1799,34 @@ function _triggerCheckIn() {
 // Look up stored audio features for a track ID from history (most recent first).
 // Returns the history entry with features, or null if not found.
 function _findStoredFeatures(trackId) {
+  let historyMatch = null;
+  let historyMatchNoFeatures = null;
   for (let i = _history.length - 1; i >= 0; i--) {
     const e = _history[i];
-    if (e.id === trackId && e.energy != null) return e;
+    if (e.id === trackId) {
+      if (e.energy != null) { historyMatch = e; break; }
+      else if (!historyMatchNoFeatures) historyMatchNoFeatures = e;
+    }
   }
+  if (historyMatch) return historyMatch;
+
+  let seededMatch = null;
+  let seededMatchNoFeatures = null;
   for (const e of _seededHistory) {
-    if (e.id === trackId && e.energy != null) return e;
+    if (e.id === trackId) {
+      if (e.energy != null) { seededMatch = e; break; }
+      else if (!seededMatchNoFeatures) seededMatchNoFeatures = e;
+    }
+  }
+  if (seededMatch) return seededMatch;
+
+  // Log why we couldn't find it
+  if (historyMatchNoFeatures) {
+    console.log(`[Spotify] Features: found in history but energy=null for id=${trackId} — keys: ${Object.keys(historyMatchNoFeatures).join(',')}`);
+  } else if (seededMatchNoFeatures) {
+    console.log(`[Spotify] Features: found in seeded but energy=null for id=${trackId} — keys: ${Object.keys(seededMatchNoFeatures).join(',')}`);
+  } else {
+    console.log(`[Spotify] Features: id=${trackId} not found in history(${_history.length}) or seeded(${_seededHistory.length})`);
   }
   return null;
 }
