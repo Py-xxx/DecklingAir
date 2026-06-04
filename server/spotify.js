@@ -41,10 +41,16 @@ const REQUIRED_SCOPES = [
   'user-read-private',
 ];
 
-const CONFIG_FILE = path.join(__dirname, 'data', 'spotify-config.json');
-const TOKENS_FILE = path.join(__dirname, 'data', 'spotify-tokens.json');
-const HISTORY_FILE   = path.join(__dirname, 'data', 'listening-history.ndjson');
+const CONFIG_FILE     = path.join(__dirname, 'data', 'spotify-config.json');
+const TOKENS_FILE     = path.join(__dirname, 'data', 'spotify-tokens.json');
+const HISTORY_FILE    = path.join(__dirname, 'data', 'listening-history.ndjson');
+const SESSIONS_FILE   = path.join(__dirname, 'data', 'sessions.ndjson');
 const VIBE_NAMES_FILE = path.join(__dirname, 'data', 'vibe-names.json');
+
+const SESSION_GAP_MS      = 10 * 60 * 1000;  // 10 min silence → close session
+const SESSION_MIN_MS      = 15 * 1000;        // ignore sessions shorter than 15s
+const RECONCILE_INTERVAL  = 30 * 60 * 1000;  // reconcile away-plays every 30 min
+const PROGRESS_DELTA_MAX  = POLL_INTERVAL * 2.5; // sanity cap on progress delta
 
 // ---------------------------------------------------------------------------
 // Module state
@@ -63,6 +69,17 @@ let _sessionStats = {
   startTime: Date.now(),
   tracksPlayed: [], // { id, title, artist, startTime, durationMs }
 };
+
+// ── Persistent session tracking ───────────────────────────────────────────────
+// _sessions:       closed sessions loaded from sessions.ndjson + newly closed ones
+// _activeSession:  in-progress session (null when nothing is playing)
+// _lastProgress:   last progress_ms from poll (null when paused/unknown)
+let _sessions       = [];
+let _activeSession  = null;  // { id, startTime, lastActivityTime, listenedMs, trackCount }
+let _lastProgress   = null;
+let _reconcileTimer = null;
+let _statsBroadcastTick = 0; // counter to throttle periodic stats broadcasts
+
 let _history        = [];   // all-time log entries, loaded from file on start
 let _seededHistory  = [];   // in-memory only: entries seeded from Spotify API
 let _seedTimestamp  = 0;    // when _seededHistory was last populated
@@ -154,6 +171,137 @@ function appendHistory(entry) {
     fs.appendFileSync(HISTORY_FILE, JSON.stringify(entry) + '\n');
     _history.push(entry);
   } catch (err) { console.error('[Spotify] Failed to append history:', err.message); }
+}
+
+// ── Session persistence ───────────────────────────────────────────────────────
+
+function loadSessions() {
+  try {
+    if (!fs.existsSync(SESSIONS_FILE)) { _sessions = []; return; }
+    const lines = fs.readFileSync(SESSIONS_FILE, 'utf8')
+      .split('\n').filter(l => l.trim());
+    _sessions = lines.map(l => { try { return JSON.parse(l); } catch { return null; } })
+                     .filter(Boolean);
+    console.log(`[Spotify] Loaded ${_sessions.length} past sessions`);
+  } catch (err) {
+    console.error('[Spotify] Failed to load sessions:', err.message);
+    _sessions = [];
+  }
+}
+
+function appendSession(session) {
+  try {
+    fs.mkdirSync(path.dirname(SESSIONS_FILE), { recursive: true });
+    fs.appendFileSync(SESSIONS_FILE, JSON.stringify(session) + '\n');
+  } catch (err) { console.error('[Spotify] Failed to append session:', err.message); }
+}
+
+function openActiveSession() {
+  _activeSession = {
+    id:               `session_${Date.now()}`,
+    startTime:        Date.now(),
+    lastActivityTime: Date.now(),
+    listenedMs:       0,
+    trackCount:       0,
+  };
+}
+
+function closeActiveSession() {
+  if (!_activeSession) return;
+  const session = _activeSession;
+  _activeSession = null;
+  _lastProgress  = null;
+
+  if (session.listenedMs < SESSION_MIN_MS) return; // too short to bother saving
+
+  const record = {
+    id:          session.id,
+    startTime:   session.startTime,
+    endTime:     Date.now(),
+    listenedMs:  session.listenedMs,
+    trackCount:  session.trackCount,
+    source:      'live',
+  };
+  _sessions.push(record);
+  appendSession(record);
+  console.log(`[Spotify] Session closed — ${Math.round(record.listenedMs / 60000)} min listened, ${record.trackCount} tracks`);
+}
+
+// ── Away-listening reconciliation ─────────────────────────────────────────────
+
+async function reconcileRecentlyPlayed() {
+  if (!isAuthed()) return;
+  try {
+    const rp = await api('GET', '/me/player/recently-played', { params: { limit: 50 } });
+    const items = rp?.items || [];
+    if (!items.length) return;
+
+    // Build a set of timestamp ranges we already have covered (live sessions)
+    const covered = [..._sessions, ...(_activeSession ? [{
+      startTime: _activeSession.startTime,
+      endTime:   _activeSession.lastActivityTime + SESSION_GAP_MS,
+    }] : [])];
+
+    const isCovered = (ts) => covered.some(s =>
+      ts >= (s.startTime - 5 * 60 * 1000) && ts <= (s.endTime + 5 * 60 * 1000)
+    );
+
+    // Also skip plays already in our own log (within 2 min)
+    const ownTimestamps = new Set(_history.map(e => e.ts));
+    const isInHistory = (ts) => {
+      for (const t of ownTimestamps) {
+        if (Math.abs(t - ts) < 120000) return true;
+      }
+      return false;
+    };
+
+    // Collect uncovered plays
+    const awayPlays = [];
+    for (const item of items) {
+      const t = item.track;
+      if (!t?.id) continue;
+      const ts = new Date(item.played_at).getTime();
+      if (isCovered(ts) || isInHistory(ts)) continue;
+      awayPlays.push({ ts, durMs: t.duration_ms || 0, id: t.id });
+    }
+
+    if (!awayPlays.length) return;
+
+    // Sort ascending and group into sessions by gap
+    awayPlays.sort((a, b) => a.ts - b.ts);
+    const awaySessions = [];
+    let cur = null;
+    for (const play of awayPlays) {
+      if (!cur || (play.ts - cur.lastTs) > SESSION_GAP_MS) {
+        if (cur) awaySessions.push(cur);
+        cur = { startTime: play.ts, lastTs: play.ts, listenedMs: 0, trackCount: 0 };
+      }
+      cur.lastTs     = play.ts;
+      cur.listenedMs += Math.round(play.durMs * 0.85); // ~85%: Spotify logs at 30s+ completion
+      cur.trackCount += 1;
+    }
+    if (cur) awaySessions.push(cur);
+
+    // Save only sessions not already reconciled (check startTime overlap)
+    const existingStarts = new Set(_sessions.filter(s => s.source === 'away').map(s => s.startTime));
+    for (const s of awaySessions) {
+      if (existingStarts.has(s.startTime)) continue;
+      if (s.listenedMs < SESSION_MIN_MS) continue;
+      const record = {
+        id:         `away_${s.startTime}`,
+        startTime:  s.startTime,
+        endTime:    s.lastTs,
+        listenedMs: s.listenedMs,
+        trackCount: s.trackCount,
+        source:     'away',
+      };
+      _sessions.push(record);
+      appendSession(record);
+      console.log(`[Spotify] Away session added — ${Math.round(record.listenedMs / 60000)} min, ${record.trackCount} tracks`);
+    }
+  } catch (err) {
+    console.warn('[Spotify] Reconcile recently-played failed:', err.message);
+  }
 }
 
 /**
@@ -1060,6 +1208,8 @@ function computeFilter({ minEnergy=0, maxEnergy=100, minValence=0, maxValence=10
 
 function buildStats() {
   const tracks = _sessionStats.tracksPlayed;
+
+  // ── Top artists in this UI session ───────────────────────────────────────
   const artistCounts = {};
   tracks.forEach((t) => {
     if (t.artist) {
@@ -1073,7 +1223,7 @@ function buildStats() {
     .slice(0, 5)
     .map(([name, count]) => ({ name, count }));
 
-  // Build recent tracks deduplicated by ID (don't show same track twice)
+  // ── Recent tracks (no duplicates) ─────────────────────────────────────────
   const seenIds = new Set();
   const recentTracks = [];
   for (let i = tracks.length - 1; i >= 0 && recentTracks.length < 5; i--) {
@@ -1084,11 +1234,35 @@ function buildStats() {
     }
   }
 
+  // ── Listened time (all sessions + active) ────────────────────────────────
+  const now          = Date.now();
+  const todayStart   = new Date(); todayStart.setHours(0, 0, 0, 0);
+  const todayMs_ts   = todayStart.getTime();
+  const weekMs_ts    = now - 7 * 24 * 60 * 60 * 1000;
+
+  const activeMs     = _activeSession?.listenedMs || 0;
+  const activeStart  = _activeSession?.startTime  || now;
+
+  let totalMs = activeMs;
+  let todayMs = activeStart >= todayMs_ts ? activeMs : 0;
+  let weekMs  = activeStart >= weekMs_ts  ? activeMs : 0;
+
+  for (const s of _sessions) {
+    totalMs += s.listenedMs;
+    if (s.startTime >= todayMs_ts) todayMs += s.listenedMs;
+    if (s.startTime >= weekMs_ts)  weekMs  += s.listenedMs;
+  }
+
   return {
-    startTime: _sessionStats.startTime,
+    startTime:   _sessionStats.startTime,
     tracksCount: tracks.length,
     topArtists,
     recentTracks,
+    // Listened-time breakdown
+    listenedMs: activeMs,    // current active session
+    todayMs,                 // today (midnight→now)
+    weekMs,                  // rolling 7 days
+    totalMs,                 // all time
   };
 }
 
@@ -1104,7 +1278,41 @@ async function poll() {
     if (state && state.track) {
       const trackChanged = _lastTrackId && _lastTrackId !== state.track.id;
 
+      // ── Listen-time accumulation ─────────────────────────────────────────
+      if (state.isPlaying && state.progress != null) {
+        // Open a new session if none is active
+        if (!_activeSession) openActiveSession();
+
+        const sameTrack = state.track.id === _lastTrackId;
+        if (sameTrack && _lastProgress != null) {
+          const delta = state.progress - _lastProgress;
+          // Only count forward movement within a reasonable range (rules out seeks)
+          if (delta > 0 && delta < PROGRESS_DELTA_MAX) {
+            _activeSession.listenedMs       += delta;
+            _activeSession.lastActivityTime  = Date.now();
+          }
+        }
+        // Always update lastProgress while playing (reset on track change below)
+        _lastProgress = state.progress;
+        if (_activeSession) _activeSession.lastActivityTime = Date.now();
+
+        // Bump track count when a new track starts
+        if (trackChanged || (!_lastTrackId && _activeSession.trackCount === 0)) {
+          _activeSession.trackCount += 1;
+        }
+      } else {
+        // Not playing — reset progress cursor
+        _lastProgress = null;
+        // Check if the current session has gone quiet long enough to close
+        if (_activeSession) {
+          const gap = Date.now() - _activeSession.lastActivityTime;
+          if (gap > SESSION_GAP_MS) closeActiveSession();
+        }
+      }
+
+      // Reset progress cursor on track change to avoid a spurious delta
       if (trackChanged) {
+        _lastProgress = null;
         _autoQueueCount = Math.max(0, _autoQueueCount - 1);
         // Broadcast fresh queue ~1.5 s after track change so Spotify's queue
         // endpoint has time to reflect the new state.
@@ -1176,12 +1384,25 @@ async function poll() {
       }
 
       _lastTrackId = state.track.id;
+    } else {
+      // No track / no state — reset progress, check session gap
+      _lastProgress = null;
+      if (_activeSession) {
+        const gap = Date.now() - _activeSession.lastActivityTime;
+        if (gap > SESSION_GAP_MS) closeActiveSession();
+      }
     }
 
     _lastState = state;
 
     if (_io) {
       _io.emit('spotify:state', state);
+      // Broadcast updated stats every ~30 s while playing so the time tiles stay fresh
+      _statsBroadcastTick++;
+      if (_statsBroadcastTick >= 6) { // 6 × 5 s = 30 s
+        _statsBroadcastTick = 0;
+        _io.emit('spotify:stats', buildStats());
+      }
     }
   } catch (err) {
     // Do not crash — log only
@@ -1195,6 +1416,15 @@ function startPolling() {
   _pollTimer = setInterval(poll, POLL_INTERVAL);
   // Seed history from Spotify in the background (non-blocking)
   if (_seedTimestamp === 0) seedFromSpotify().catch(() => {});
+  // Reconcile away-listening every 30 minutes
+  if (!_reconcileTimer) {
+    // First reconcile shortly after startup, then on the regular interval
+    setTimeout(() => reconcileRecentlyPlayed().catch(() => {}), 60 * 1000);
+    _reconcileTimer = setInterval(
+      () => reconcileRecentlyPlayed().catch(() => {}),
+      RECONCILE_INTERVAL
+    );
+  }
 }
 
 function stopPolling() {
@@ -1202,6 +1432,12 @@ function stopPolling() {
     clearInterval(_pollTimer);
     _pollTimer = null;
   }
+  if (_reconcileTimer) {
+    clearInterval(_reconcileTimer);
+    _reconcileTimer = null;
+  }
+  // Close any active session so time isn't lost on graceful shutdown
+  closeActiveSession();
 }
 
 // ---------------------------------------------------------------------------
@@ -1261,6 +1497,7 @@ function init(io) {
   _io = io;
 
   loadHistory();
+  loadSessions();
   loadVibeNames();
 
   // Start polling if already authed

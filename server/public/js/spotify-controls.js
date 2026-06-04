@@ -1571,7 +1571,21 @@ function renderSpotifyStats(ctrl) {
         </div>
         <div class="sp-stat-tile">
           <div class="sp-stat-value sp-stat-time">—</div>
-          <div class="sp-stat-label">Listened</div>
+          <div class="sp-stat-label">This Session</div>
+        </div>
+      </div>
+      <div class="sp-stats-time-row">
+        <div class="sp-time-tile">
+          <div class="sp-time-value sp-stat-today">—</div>
+          <div class="sp-time-label">Today</div>
+        </div>
+        <div class="sp-time-tile">
+          <div class="sp-time-value sp-stat-week">—</div>
+          <div class="sp-time-label">This Week</div>
+        </div>
+        <div class="sp-time-tile">
+          <div class="sp-time-value sp-stat-total">—</div>
+          <div class="sp-time-label">All Time</div>
         </div>
       </div>
       <div class="sp-stats-artists">
@@ -1605,6 +1619,9 @@ function renderSpotifyStats(ctrl) {
   const sinceEl       = card.querySelector('.sp-stats-since');
   const tracksEl      = card.querySelector('.sp-stat-tracks');
   const timeEl        = card.querySelector('.sp-stat-time');
+  const todayEl       = card.querySelector('.sp-stat-today');
+  const weekEl        = card.querySelector('.sp-stat-week');
+  const totalEl       = card.querySelector('.sp-stat-total');
   const artistsList   = card.querySelector('.sp-stats-artists-list');
   const recentList    = card.querySelector('.sp-stats-recent-list');
   const saveBtn       = card.querySelector('.sp-save-session-btn');
@@ -1614,38 +1631,39 @@ function renderSpotifyStats(ctrl) {
   const saveCancel    = card.querySelector('.sp-save-session-cancel');
   const saveFeedback  = card.querySelector('.sp-save-session-feedback');
 
-  // ---- Actual play-time timer (counts only while Spotify is playing) ----
-  let _listenedMs = 0;   // accumulated ms while playing
-  let _playStart  = null; // Date.now() when playback last started, null when paused
+  // ── Listen-time display ─────────────────────────────────────────────────
+  // The server tracks real listened time via progress_ms delta.
+  // We store the last server-reported values and tick up locally while playing
+  // for a smooth display between the 5s poll intervals.
+  let _srvListenedMs = 0;   // server's listenedMs for current session
+  let _srvTodayMs    = 0;
+  let _srvWeekMs     = 0;
+  let _srvTotalMs    = 0;
+  let _srvUpdatedAt  = 0;   // wall-clock when we last got a server update
+  let _isPlaying     = false;
 
-  function _getLiveMs() {
-    return _listenedMs + (_playStart !== null ? Date.now() - _playStart : 0);
+  function _liveSessionMs() {
+    if (!_isPlaying || !_srvUpdatedAt) return _srvListenedMs;
+    return _srvListenedMs + Math.min(Date.now() - _srvUpdatedAt, 10000);
   }
 
   const _onStateForTimer = (state) => {
-    const playing = !!(state && state.isPlaying);
-    if (playing && _playStart === null) {
-      _playStart = Date.now();
-    } else if (!playing && _playStart !== null) {
-      _listenedMs += Date.now() - _playStart;
-      _playStart = null;
-    }
-    // Always keep the tile up to date immediately on state change
-    timeEl.textContent = fmtDuration(_getLiveMs());
+    _isPlaying = !!(state && state.isPlaying);
   };
   socket.on('spotify:state', _onStateForTimer);
 
-  // Tick every second so the displayed time advances while playing
+  // Tick every second so the session counter moves smoothly
   const _timerInterval = setInterval(() => {
-    if (_playStart !== null) timeEl.textContent = fmtDuration(_getLiveMs());
+    if (_isPlaying) timeEl.textContent = fmtDuration(_liveSessionMs());
   }, 1000);
 
   resetBtn.addEventListener('pointerup', () => {
     if (isEditMode()) return;
-    // Reset client-side timer too
-    _listenedMs = 0;
-    _playStart = null;
-    timeEl.textContent = fmtDuration(0);
+    // Reset local counters
+    _srvListenedMs = 0; _srvTodayMs = 0; _srvWeekMs = 0;
+    _srvUpdatedAt  = 0;
+    timeEl.textContent  = fmtDuration(0);
+    todayEl.textContent = fmtDuration(0);
     resetSpotifySession();
   });
 
@@ -1708,9 +1726,20 @@ function renderSpotifyStats(ctrl) {
 
   function _render(data) {
     if (!data) return;
-    sinceEl.textContent = `since ${fmtTime(data.startTime)}`;
+    sinceEl.textContent  = `since ${fmtTime(data.startTime)}`;
     tracksEl.textContent = data.tracksCount ?? 0;
-    // timeEl is owned by the play-timer above — don't overwrite it here
+
+    // Sync server-reported times and update display
+    _srvListenedMs = data.listenedMs ?? 0;
+    _srvTodayMs    = data.todayMs    ?? 0;
+    _srvWeekMs     = data.weekMs     ?? 0;
+    _srvTotalMs    = data.totalMs    ?? 0;
+    _srvUpdatedAt  = Date.now();
+
+    timeEl.textContent  = fmtDuration(_liveSessionMs());
+    todayEl.textContent = fmtDuration(_srvTodayMs);
+    weekEl.textContent  = fmtDuration(_srvWeekMs);
+    totalEl.textContent = fmtDuration(_srvTotalMs);
 
     artistsList.innerHTML = '';
     const artists = (data.topArtists || []).slice(0, 5);

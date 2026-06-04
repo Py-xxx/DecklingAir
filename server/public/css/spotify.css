@@ -1217,6 +1217,38 @@
   color: var(--text-3, #888);
 }
 
+/* ── Listen-time breakdown row (Today / Week / All Time) ── */
+.sp-stats-time-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.sp-time-tile {
+  background: var(--bg-2, #1e1e1e);
+  border-radius: 8px;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sp-time-value {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--accent, #6c63ff);
+  line-height: 1;
+}
+
+.sp-time-label {
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-3, #888);
+}
+
 .sp-stats-artists,
 .sp-stats-recent {
   display: flex;
