@@ -1791,6 +1791,19 @@ function _triggerCheckIn() {
   }
 }
 
+// Look up stored audio features for a track ID from history (most recent first).
+// Returns the history entry with features, or null if not found.
+function _findStoredFeatures(trackId) {
+  for (let i = _history.length - 1; i >= 0; i--) {
+    const e = _history[i];
+    if (e.id === trackId && e.energy != null) return e;
+  }
+  for (const e of _seededHistory) {
+    if (e.id === trackId && e.energy != null) return e;
+  }
+  return null;
+}
+
 // Called after audio features are merged into a history entry.
 // Tracks the running cluster and fires check-in when confident.
 function _updateCluster(histEntry) {
@@ -2175,7 +2188,7 @@ async function poll() {
           }
           if (_io) _io.emit('spotify:stats', buildStats());
 
-          // Build history entry — features fetched and merged then appended
+          // Build history entry — use stored features first, API only as last resort
           const histEntry = {
             ts: Date.now(),
             h:  new Date().getHours(),
@@ -2185,23 +2198,43 @@ async function poll() {
             album: state.track.album || '',
             dur: state.track.duration,
           };
-          getAudioFeatures(state.track.id)
-            .then((f) => {
-              if (f) {
-                histEntry.bpm      = Math.round(f.tempo || 0);
-                histEntry.energy   = Math.round((f.energy   || 0) * 100);
-                histEntry.valence  = Math.round((f.valence  || 0) * 100);
-                histEntry.dance    = Math.round((f.danceability || 0) * 100);
-                histEntry.acoustic = Math.round((f.acousticness  || 0) * 100);
-                histEntry.inst     = Math.round((f.instrumentalness || 0) * 100);
-                histEntry.key      = f.key != null && f.key >= 0 ? PITCH_CLASSES[f.key] : null;
-                histEntry.mode     = f.mode === 1 ? 'Maj' : f.mode === 0 ? 'Min' : null;
-                if (_io) _io.emit('spotify:audio_features', _serializeFeatures(f));
-              }
-              appendHistory(histEntry);
-              _updateCluster(histEntry);
-            })
-            .catch(() => { appendHistory(histEntry); });
+          const _stored = _findStoredFeatures(state.track.id);
+          if (_stored) {
+            console.log(`[Spotify] Features: from history — energy=${_stored.energy} valence=${_stored.valence} title="${state.track.title}"`);
+            histEntry.bpm      = _stored.bpm;
+            histEntry.energy   = _stored.energy;
+            histEntry.valence  = _stored.valence;
+            histEntry.dance    = _stored.dance;
+            histEntry.acoustic = _stored.acoustic;
+            histEntry.inst     = _stored.inst;
+            histEntry.key      = _stored.key;
+            histEntry.mode     = _stored.mode;
+            if (_io) _io.emit('spotify:audio_features', {
+              bpm: histEntry.bpm, energy: histEntry.energy, valence: histEntry.valence,
+              dance: histEntry.dance, acoustic: histEntry.acoustic, inst: histEntry.inst,
+              key: histEntry.key, mode: histEntry.mode,
+            });
+            appendHistory(histEntry);
+            _updateCluster(histEntry);
+          } else {
+            getAudioFeatures(state.track.id)
+              .then((f) => {
+                if (f) {
+                  histEntry.bpm      = Math.round(f.tempo || 0);
+                  histEntry.energy   = Math.round((f.energy   || 0) * 100);
+                  histEntry.valence  = Math.round((f.valence  || 0) * 100);
+                  histEntry.dance    = Math.round((f.danceability || 0) * 100);
+                  histEntry.acoustic = Math.round((f.acousticness  || 0) * 100);
+                  histEntry.inst     = Math.round((f.instrumentalness || 0) * 100);
+                  histEntry.key      = f.key != null && f.key >= 0 ? PITCH_CLASSES[f.key] : null;
+                  histEntry.mode     = f.mode === 1 ? 'Maj' : f.mode === 0 ? 'Min' : null;
+                  if (_io) _io.emit('spotify:audio_features', _serializeFeatures(f));
+                }
+                appendHistory(histEntry);
+                _updateCluster(histEntry);
+              })
+              .catch(() => { appendHistory(histEntry); });
+          }
         }
       }
 
@@ -2228,9 +2261,18 @@ async function poll() {
         }
         // Emit audio features on first track load too (not just track changes)
         if (!_lastTrackId) {
-          getAudioFeatures(state.track.id)
-            .then((f) => { if (f && _io) _io.emit('spotify:audio_features', _serializeFeatures(f)); })
-            .catch(() => {});
+          const _storedFirst = _findStoredFeatures(state.track.id);
+          if (_storedFirst && _io) {
+            _io.emit('spotify:audio_features', {
+              bpm: _storedFirst.bpm, energy: _storedFirst.energy, valence: _storedFirst.valence,
+              dance: _storedFirst.dance, acoustic: _storedFirst.acoustic, inst: _storedFirst.inst,
+              key: _storedFirst.key, mode: _storedFirst.mode,
+            });
+          } else {
+            getAudioFeatures(state.track.id)
+              .then((f) => { if (f && _io) _io.emit('spotify:audio_features', _serializeFeatures(f)); })
+              .catch(() => {});
+          }
         }
       } else if (_lastState) {
         state.liked = _lastState.liked;
