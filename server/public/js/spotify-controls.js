@@ -2099,7 +2099,7 @@ export function renderSpotifyInsights(ctrl) {
         <button class="sp-ins-tab" data-tab="patterns">Patterns</button>
         <button class="sp-ins-tab" data-tab="vibes">Vibes</button>
         <button class="sp-ins-tab" data-tab="mood">Mood</button>
-        <button class="sp-ins-tab" data-tab="rightnow">Right Now</button>
+        <button class="sp-ins-tab" data-tab="rightnow">Routine</button>
         <button class="sp-ins-tab" data-tab="filter">Filter</button>
       </div>
       <div class="sp-ins-content">
@@ -2165,7 +2165,7 @@ export function renderSpotifyInsights(ctrl) {
         <div class="sp-ins-panel" data-panel="rightnow" style="display:none">
           <div class="sp-ins-rn-empty" style="display:none">
             <div class="sp-ins-empty-icon">▶</div>
-            <div class="sp-ins-empty-msg">Keep listening to enable Right Now</div>
+            <div class="sp-ins-empty-msg">Keep listening to enable Routine</div>
             <div class="sp-ins-empty-sub">Not enough data for your current time yet</div>
           </div>
           <div class="sp-ins-rn-content" style="display:none">
@@ -2446,7 +2446,7 @@ export function renderSpotifyInsights(ctrl) {
   card.querySelector('.sp-ins-rn-play-btn').addEventListener('pointerup', () => {
     if (isEditMode()) return;
     playNow();
-    _showFeedback('Queuing your Right Now vibe…');
+    _showFeedback('Queuing your routine vibe…');
   });
 
   // ---- Filter tab ----
