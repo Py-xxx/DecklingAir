@@ -41,11 +41,16 @@ const REQUIRED_SCOPES = [
   'user-read-private',
 ];
 
-const CONFIG_FILE     = path.join(__dirname, 'data', 'spotify-config.json');
-const TOKENS_FILE     = path.join(__dirname, 'data', 'spotify-tokens.json');
-const HISTORY_FILE    = path.join(__dirname, 'data', 'listening-history.ndjson');
-const SESSIONS_FILE   = path.join(__dirname, 'data', 'sessions.ndjson');
-const VIBE_NAMES_FILE = path.join(__dirname, 'data', 'vibe-names.json');
+const CONFIG_FILE        = path.join(__dirname, 'data', 'spotify-config.json');
+const TOKENS_FILE        = path.join(__dirname, 'data', 'spotify-tokens.json');
+const HISTORY_FILE       = path.join(__dirname, 'data', 'listening-history.ndjson');
+const SESSIONS_FILE      = path.join(__dirname, 'data', 'sessions.ndjson');
+const VIBE_NAMES_FILE    = path.join(__dirname, 'data', 'vibe-names.json');
+const VIBE_ARCHIVE_FILE  = path.join(__dirname, 'data', 'vibe-archive.ndjson');
+const USER_PREFS_FILE    = path.join(__dirname, 'data', 'user-prefs.json');
+
+const SESSION_PRUNE_DAYS       = 90;
+const CONTINUOUS_REFILL_THRESHOLD = 3;  // refill queue when fewer than this many tracks remain
 
 const SESSION_GAP_MS      = 10 * 60 * 1000;  // 10 min silence → close session
 const SESSION_MIN_MS      = 15 * 1000;        // ignore sessions shorter than 15s
@@ -63,6 +68,7 @@ let _lastTrackId = null;
 let _autoQueueCount = 0;
 let _autoplayEnabled = false;
 let _smartShuffleEnabled = false;
+let _smartShuffleTrackCount = 0; // playlist tracks heard since last injected track
 let _userProfile = null;
 let _userId = null;
 let _sessionStats = {
@@ -84,6 +90,9 @@ let _history        = [];   // all-time log entries, loaded from file on start
 let _seededHistory  = [];   // in-memory only: entries seeded from Spotify API
 let _seedTimestamp  = 0;    // when _seededHistory was last populated
 let _vibeNames      = {};   // { vibeKey: 'Custom Name' }
+let _flowMode       = false; // harmonic flow ordering for vibe/mood playlists
+let _activeVibeKey  = null;  // currently running continuous vibe (null = stopped)
+let _activeMoodKey  = null;  // currently running continuous mood (null = stopped)
 
 // ---------------------------------------------------------------------------
 // Config / token storage
@@ -165,6 +174,22 @@ function saveVibeNames() {
   } catch (err) { console.error('[Spotify] Failed to save vibe names:', err.message); }
 }
 
+function loadUserPrefs() {
+  try {
+    if (fs.existsSync(USER_PREFS_FILE)) {
+      const prefs = JSON.parse(fs.readFileSync(USER_PREFS_FILE, 'utf8'));
+      _flowMode = !!prefs.flowMode;
+    }
+  } catch { }
+}
+
+function saveUserPrefs() {
+  try {
+    fs.mkdirSync(path.dirname(USER_PREFS_FILE), { recursive: true });
+    fs.writeFileSync(USER_PREFS_FILE, JSON.stringify({ flowMode: _flowMode }, null, 2));
+  } catch (err) { console.error('[Spotify] Failed to save user prefs:', err.message); }
+}
+
 function appendHistory(entry) {
   try {
     fs.mkdirSync(path.dirname(HISTORY_FILE), { recursive: true });
@@ -183,6 +208,7 @@ function loadSessions() {
     _sessions = lines.map(l => { try { return JSON.parse(l); } catch { return null; } })
                      .filter(Boolean);
     console.log(`[Spotify] Loaded ${_sessions.length} past sessions`);
+    pruneAndArchiveSessions();
   } catch (err) {
     console.error('[Spotify] Failed to load sessions:', err.message);
     _sessions = [];
@@ -196,6 +222,92 @@ function appendSession(session) {
   } catch (err) { console.error('[Spotify] Failed to append session:', err.message); }
 }
 
+/**
+ * Move sessions older than SESSION_PRUNE_DAYS into the compact vibe archive,
+ * then rewrite sessions.ndjson with only the recent entries.
+ *
+ * vibe-archive.ndjson — one line per unique track URI:
+ *   { "uri": "spotify:track:…", "vibeKey": "hype", "count": 5, "lastSeen": <ms> }
+ *
+ * The archive is never pruned — it's small (one line per unique track) and is the
+ * long-term memory for vibe clustering.
+ */
+function pruneAndArchiveSessions() {
+  const cutoffMs = Date.now() - SESSION_PRUNE_DAYS * 24 * 60 * 60 * 1000;
+  const toKeep   = _sessions.filter(s => (s.endTime || s.startTime) >= cutoffMs);
+  const toPrune  = _sessions.filter(s => (s.endTime || s.startTime) <  cutoffMs);
+
+  if (!toPrune.length) return;
+  console.log(`[Spotify] Pruning ${toPrune.length} sessions older than ${SESSION_PRUNE_DAYS} days`);
+
+  // ── Load existing vibe archive ──────────────────────────────────────────────
+  const archiveMap = new Map(); // uri → entry
+  try {
+    if (fs.existsSync(VIBE_ARCHIVE_FILE)) {
+      const lines = fs.readFileSync(VIBE_ARCHIVE_FILE, 'utf8').split('\n').filter(l => l.trim());
+      for (const line of lines) {
+        try {
+          const entry = JSON.parse(line);
+          if (entry.uri) archiveMap.set(entry.uri, entry);
+        } catch { /* skip malformed */ }
+      }
+    }
+  } catch (err) {
+    console.error('[Spotify] Failed to load vibe archive:', err.message);
+  }
+
+  // ── Extract track → vibe mappings from pruned sessions ─────────────────────
+  const allHistory = [..._history, ..._seededHistory];
+  for (const session of toPrune) {
+    const trackIds = session.trackIds || [];
+    for (const trackId of trackIds) {
+      const histEntry = allHistory.find(h => h.id === trackId);
+      if (!histEntry) continue;
+      const vibeKey = getVibeKey(histEntry);
+      if (!vibeKey) continue;
+
+      const uri = `spotify:track:${trackId}`;
+      const existing = archiveMap.get(uri);
+      if (existing) {
+        existing.count    = (existing.count || 1) + 1;
+        existing.lastSeen = Math.max(existing.lastSeen || 0, session.endTime || session.startTime);
+        // If observed in a different vibe now, keep the most recent assignment
+        if ((session.endTime || session.startTime) > (existing.lastSeen || 0)) {
+          existing.vibeKey = vibeKey;
+        }
+      } else {
+        archiveMap.set(uri, {
+          uri,
+          vibeKey,
+          count:    1,
+          lastSeen: session.endTime || session.startTime,
+        });
+      }
+    }
+  }
+
+  // ── Write updated vibe archive ──────────────────────────────────────────────
+  try {
+    fs.mkdirSync(path.dirname(VIBE_ARCHIVE_FILE), { recursive: true });
+    const content = [...archiveMap.values()].map(e => JSON.stringify(e)).join('\n');
+    fs.writeFileSync(VIBE_ARCHIVE_FILE, content + (content ? '\n' : ''));
+    console.log(`[Spotify] Vibe archive updated — ${archiveMap.size} unique tracks`);
+  } catch (err) {
+    console.error('[Spotify] Failed to write vibe archive:', err.message);
+    return; // Don't prune sessions.ndjson if the archive write failed
+  }
+
+  // ── Rewrite sessions.ndjson with only the recent entries ───────────────────
+  try {
+    _sessions = toKeep;
+    const content = toKeep.map(s => JSON.stringify(s)).join('\n');
+    fs.writeFileSync(SESSIONS_FILE, content + (content ? '\n' : ''));
+    console.log(`[Spotify] sessions.ndjson pruned — ${toKeep.length} sessions kept`);
+  } catch (err) {
+    console.error('[Spotify] Failed to rewrite sessions file:', err.message);
+  }
+}
+
 function openActiveSession() {
   _activeSession = {
     id:               `session_${Date.now()}`,
@@ -203,6 +315,7 @@ function openActiveSession() {
     lastActivityTime: Date.now(),
     listenedMs:       0,
     trackCount:       0,
+    trackIds:         [],
   };
 }
 
@@ -220,6 +333,7 @@ function closeActiveSession() {
     endTime:     Date.now(),
     listenedMs:  session.listenedMs,
     trackCount:  session.trackCount,
+    trackIds:    session.trackIds || [],
     source:      'live',
   };
   _sessions.push(record);
@@ -698,28 +812,13 @@ async function playWithContinuation(uri) {
   const trackId = uri.split(':').pop();
   let continuationUris = [];
 
-  // 1. Try recommendations
+  // getSimilarTracks already has a 3-tier fallback; just unwrap URIs
   try {
-    const recs = await getRecommendations({ seedTracks: [trackId], limit: 24 });
-    continuationUris = (recs?.tracks || []).map(t => t.uri).filter(u => u !== uri);
-    if (continuationUris.length) console.log(`[Spotify] Continuation: ${continuationUris.length} recommendations`);
+    const similar = await getSimilarTracks([trackId], [], 24);
+    continuationUris = similar.map(t => t.uri).filter(u => u !== uri);
+    if (continuationUris.length) console.log(`[Spotify] Continuation: ${continuationUris.length} similar tracks`);
   } catch (e) {
-    console.warn('[Spotify] Recommendations unavailable:', e.message);
-  }
-
-  // 2. Fall back to artist top tracks
-  if (!continuationUris.length) {
-    try {
-      const track  = await api('GET', `/tracks/${trackId}`);
-      const artist = track?.artists?.[0]?.id;
-      if (artist) {
-        const res = await api('GET', `/artists/${artist}/top-tracks`);
-        continuationUris = (res?.tracks || []).map(t => t.uri).filter(u => u !== uri).slice(0, 19);
-        if (continuationUris.length) console.log(`[Spotify] Continuation: ${continuationUris.length} artist top tracks`);
-      }
-    } catch (e) {
-      console.warn('[Spotify] Artist top tracks unavailable:', e.message);
-    }
+    console.warn('[Spotify] Continuation tracks unavailable:', e.message);
   }
 
   // Play selected track first; if we have continuation tracks bundle them in
@@ -900,6 +999,92 @@ async function getRecommendations({ seedTracks = [], seedArtists = [], limit = 5
   return api('GET', '/recommendations', { params });
 }
 
+/**
+ * Get tracks similar to the given seeds.
+ * Three-tier fallback because /recommendations is deprecated and 403s for many apps:
+ *   1. /recommendations  (still works for some; fastest)
+ *   2. related-artists → their top-tracks  (always available)
+ *   3. user's own short-term top tracks shuffled  (last resort)
+ *
+ * Returns an array of raw Spotify track objects (with .uri, .id, .name, .artists …).
+ */
+async function getSimilarTracks(seedTrackIds = [], seedArtistIds = [], limit = 5) {
+  const dedupe = (tracks, excludeUris = new Set()) => {
+    const seen = new Set(excludeUris);
+    return tracks.filter(t => {
+      if (!t?.uri || seen.has(t.uri)) return false;
+      seen.add(t.uri);
+      return true;
+    });
+  };
+
+  const excludeUris = new Set(seedTrackIds.map(id => `spotify:track:${id}`));
+
+  // ── Tier 1: /recommendations ────────────────────────────────────────────────
+  try {
+    const recs = await getRecommendations({ seedTracks: seedTrackIds, seedArtists: seedArtistIds, limit });
+    const tracks = dedupe(recs?.tracks || [], excludeUris);
+    if (tracks.length > 0) {
+      console.log(`[Spotify] getSimilarTracks: ${tracks.length} from /recommendations`);
+      return tracks.slice(0, limit);
+    }
+  } catch (err) {
+    console.warn('[Spotify] /recommendations unavailable, trying fallback:', err.message);
+  }
+
+  // ── Tier 2: related artists → their top tracks ──────────────────────────────
+  try {
+    // Resolve artist IDs from seed tracks if none provided
+    let artistIds = [...seedArtistIds];
+    if (artistIds.length === 0 && seedTrackIds.length > 0) {
+      try {
+        const trackData = await api('GET', `/tracks/${seedTrackIds[0]}`);
+        artistIds = (trackData?.artists || []).map(a => a.id).filter(Boolean).slice(0, 2);
+      } catch { /* ignore */ }
+    }
+
+    if (artistIds.length > 0) {
+      const candidateTracks = [];
+      for (const artistId of artistIds.slice(0, 2)) {
+        try {
+          const related = await api('GET', `/artists/${artistId}/related-artists`);
+          const relatedArtists = (related?.artists || [])
+            .sort(() => Math.random() - 0.5)
+            .slice(0, 4);
+          for (const ra of relatedArtists) {
+            try {
+              const topTracks = await api('GET', `/artists/${ra.id}/top-tracks`);
+              candidateTracks.push(...(topTracks?.tracks || []).slice(0, 3));
+            } catch { /* ignore */ }
+          }
+        } catch { /* ignore */ }
+      }
+      const filtered = dedupe(candidateTracks, excludeUris).sort(() => Math.random() - 0.5);
+      if (filtered.length > 0) {
+        console.log(`[Spotify] getSimilarTracks: ${filtered.length} from related-artists fallback`);
+        return filtered.slice(0, limit);
+      }
+    }
+  } catch (err) {
+    console.warn('[Spotify] Related-artists fallback failed:', err.message);
+  }
+
+  // ── Tier 3: user's own short-term top tracks ────────────────────────────────
+  try {
+    const top = await api('GET', '/me/top/tracks', { params: { time_range: 'short_term', limit: 50 } });
+    const tracks = dedupe(top?.items || [], excludeUris).sort(() => Math.random() - 0.5);
+    if (tracks.length > 0) {
+      console.log(`[Spotify] getSimilarTracks: ${tracks.length} from user top-tracks fallback`);
+      return tracks.slice(0, limit);
+    }
+  } catch (err) {
+    console.warn('[Spotify] Top-tracks fallback failed:', err.message);
+  }
+
+  console.warn('[Spotify] getSimilarTracks: all tiers exhausted, returning empty');
+  return [];
+}
+
 async function getUserProfile() {
   if (_userProfile) return _userProfile;
   _userProfile = await api('GET', '/me');
@@ -1011,23 +1196,58 @@ async function maybeQueueRecommendations(state) {
   if (_autoQueueCount >= AUTOPLAY_MIN_QUEUE) return;
   if (!state || !state.track) return;
 
+  const seedTracks  = [state.track.id].filter(Boolean);
+  const seedArtists = (state.track.artistIds || []).slice(0, 2);
+
   try {
-    const seedTracks = [state.track.id].filter(Boolean);
-    const seedArtists = (state.track.artistIds || []).slice(0, 2);
-
-    const recs = await getRecommendations({ seedTracks, seedArtists, limit: 5 });
-    const tracks = (recs && recs.tracks) ? recs.tracks : [];
-
+    const tracks = await getSimilarTracks(seedTracks, seedArtists, 5);
     for (const track of tracks) {
       try {
         await addToQueue(track.uri);
         _autoQueueCount++;
       } catch (err) {
-        console.error('[Spotify] Failed to queue recommendation:', err.message);
+        console.error('[Spotify] Failed to queue autoplay track:', err.message);
       }
     }
   } catch (err) {
-    console.error('[Spotify] Failed to fetch recommendations:', err.message);
+    console.error('[Spotify] Autoplay fetch failed:', err.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Smart shuffle — injects a discovery track every N playlist tracks
+// ---------------------------------------------------------------------------
+
+// Every 3 playlist tracks heard, inject one similar track that isn't in the playlist.
+// Only fires while playing inside a playlist context.
+const SMART_SHUFFLE_INJECT_EVERY = 3;
+
+async function maybeSmartShuffle(state) {
+  if (!_smartShuffleEnabled) return;
+  if (!state?.track) return;
+  // Only inject when actually inside a playlist (not an album, artist, or free-play context)
+  const contextIsPlaylist = state.context?.type === 'playlist' || state.context?.uri?.includes(':playlist:');
+  if (!contextIsPlaylist) return;
+
+  _smartShuffleTrackCount++;
+  if (_smartShuffleTrackCount % SMART_SHUFFLE_INJECT_EVERY !== 0) return;
+
+  const seedTracks  = [state.track.id].filter(Boolean);
+  const seedArtists = (state.track.artistIds || []).slice(0, 2);
+
+  try {
+    const tracks = await getSimilarTracks(seedTracks, seedArtists, 1);
+    for (const track of tracks) {
+      try {
+        await addToQueue(track.uri);
+        _autoQueueCount++;
+        console.log(`[Spotify] Smart shuffle injected: ${track.name}`);
+      } catch (err) {
+        console.error('[Spotify] Smart shuffle inject error:', err.message);
+      }
+    }
+  } catch (err) {
+    console.error('[Spotify] Smart shuffle fetch failed:', err.message);
   }
 }
 
@@ -1129,6 +1349,335 @@ function getVibeKey(e) {
 
 function getVibeName(key) {
   return _vibeNames[key] || VIBE_DEFAULTS[key] || key;
+}
+
+// ---------------------------------------------------------------------------
+// Camelot wheel — harmonic key compatibility
+// ---------------------------------------------------------------------------
+
+// Maps "PitchClass:Mode" → Camelot code (e.g. 'C:Maj' → '8B')
+const CAMELOT = {
+  'C:Maj':  '8B',  'A:Min':  '8A',
+  'G:Maj':  '9B',  'E:Min':  '9A',
+  'D:Maj':  '10B', 'B:Min':  '10A',
+  'A:Maj':  '11B', 'F♯:Min': '11A',
+  'E:Maj':  '12B', 'C♯:Min': '12A',
+  'B:Maj':  '1B',  'G♯:Min': '1A',
+  'F♯:Maj': '2B',  'D♯:Min': '2A',
+  'C♯:Maj': '3B',  'A♯:Min': '3A',
+  'G♯:Maj': '4B',  'F:Min':  '4A',
+  'D♯:Maj': '5B',  'C:Min':  '5A',
+  'A♯:Maj': '6B',  'G:Min':  '6A',
+  'F:Maj':  '7B',  'D:Min':  '7A',
+};
+
+function _camelotPos(key, mode) {
+  if (!key || !mode) return null;
+  const code = CAMELOT[`${key}:${mode}`];
+  if (!code) return null;
+  return { num: parseInt(code.slice(0, -1), 10), letter: code.slice(-1), code };
+}
+
+function _camelotScore(posA, posB) {
+  if (!posA || !posB) return 0.3;
+  if (posA.code === posB.code) return 1.0;
+  if (posA.num === posB.num) return 0.8;  // parallel major/minor
+  const diff = Math.abs(posA.num - posB.num);
+  const wrap = Math.min(diff, 12 - diff);
+  if (wrap === 1) return 0.8;
+  if (wrap === 2) return 0.4;
+  return 0.0;
+}
+
+function _bpmScore(bpmA, bpmB) {
+  if (!bpmA || !bpmB) return 0.5;
+  const r = bpmA / bpmB;
+  if (Math.abs(r - 1) < 0.06) return 1.0;
+  if (Math.abs(r - 1) < 0.12) return 0.7;
+  if (Math.abs(r * 2 - 1) < 0.06 || Math.abs(r / 2 - 1) < 0.06) return 0.5;
+  return Math.max(0, 1 - Math.abs(1 - r));
+}
+
+function _energyScore(eA, eB) {
+  if (eA == null || eB == null) return 0.5;
+  return 1 - Math.abs(eA - eB) / 100;
+}
+
+function _trackFlowScore(a, b) {
+  return _camelotScore(a._cam, b._cam) * 0.35 +
+         _bpmScore(a.bpm, b.bpm)        * 0.35 +
+         _energyScore(a.energy, b.energy) * 0.30;
+}
+
+// Greedy nearest-neighbour ordering for harmonic, BPM-smooth, energy-smooth playlists.
+// Input: array of history entries or Spotify track objects (must have .key, .mode, .bpm, .energy)
+function flowOrder(tracks) {
+  if (tracks.length <= 2) return tracks;
+  const ann = tracks.map(t => ({ ...t, _cam: _camelotPos(t.key, t.mode) }));
+  const remaining = [...ann];
+  const startIdx = Math.floor(Math.random() * remaining.length);
+  const ordered = [remaining.splice(startIdx, 1)[0]];
+  while (remaining.length > 0) {
+    const last = ordered[ordered.length - 1];
+    let best = 0, bestScore = -1;
+    for (let i = 0; i < remaining.length; i++) {
+      const s = _trackFlowScore(last, remaining[i]);
+      if (s > bestScore) { bestScore = s; best = i; }
+    }
+    ordered.push(remaining.splice(best, 1)[0]);
+  }
+  return ordered.map(({ _cam, ...t }) => t);
+}
+
+// ---------------------------------------------------------------------------
+// Mood states
+// ---------------------------------------------------------------------------
+
+const MOOD_STATES = [
+  {
+    key: 'lock_in',
+    name: 'Lock In',
+    emoji: '🎯',
+    desc: 'Deep focus, no distractions',
+    vibeWeights: { grind: 3, flow: 2, intense: 1 },
+    filters: { minEnergy: 35, maxEnergy: 78, maxValence: 55 },
+    contextSignals: { hours: [9,10,11,12,13,14,15,16] },
+    discoveryRatio: 0.25,
+  },
+  {
+    key: 'full_send',
+    name: 'Full Send',
+    emoji: '🚀',
+    desc: 'Maximum energy, full hype',
+    vibeWeights: { hype: 3, drive: 2, good_vibes: 1 },
+    filters: { minEnergy: 70 },
+    contextSignals: { hours: [17,18,19,20,21,22] },
+    discoveryRatio: 0.35,
+  },
+  {
+    key: 'in_the_flow',
+    name: 'In The Flow',
+    emoji: '🌊',
+    desc: 'Smooth and productive',
+    vibeWeights: { flow: 3, good_vibes: 2, chill: 1 },
+    filters: { minEnergy: 30, maxEnergy: 65 },
+    contextSignals: { hours: [10,11,12,13,14,15] },
+    discoveryRatio: 0.20,
+  },
+  {
+    key: 'late_one',
+    name: 'Late One',
+    emoji: '🌙',
+    desc: 'Deep in the night',
+    vibeWeights: { t_latenight: 3, melancholy: 2, ease: 1 },
+    filters: { maxEnergy: 55 },
+    contextSignals: { hours: [0,1,2,3,23] },
+    discoveryRatio: 0.20,
+  },
+  {
+    key: 'the_feels',
+    name: 'The Feels',
+    emoji: '💭',
+    desc: 'Emotional and introspective',
+    vibeWeights: { melancholy: 3, ease: 2, t_latenight: 1 },
+    filters: { maxEnergy: 52, maxValence: 50 },
+    contextSignals: {},
+    discoveryRatio: 0.20,
+  },
+  {
+    key: 'slow_start',
+    name: 'Slow Start',
+    emoji: '☀️',
+    desc: 'Gentle morning energy',
+    vibeWeights: { chill: 3, t_morning: 2, ease: 1 },
+    filters: { maxEnergy: 55, minValence: 35 },
+    contextSignals: { hours: [6,7,8,9] },
+    discoveryRatio: 0.15,
+  },
+  {
+    key: 'on_the_road',
+    name: 'On The Road',
+    emoji: '🛣️',
+    desc: 'Driving, windows down',
+    vibeWeights: { drive: 3, good_vibes: 2, hype: 1 },
+    filters: { minEnergy: 50, minValence: 35 },
+    contextSignals: {},
+    discoveryRatio: 0.25,
+  },
+  {
+    key: 'going_hard',
+    name: 'Going Hard',
+    emoji: '💪',
+    desc: 'Workout, push through it',
+    vibeWeights: { intense: 3, hype: 2, drive: 1 },
+    filters: { minEnergy: 68 },
+    contextSignals: { hours: [6,7,8,17,18,19] },
+    discoveryRatio: 0.30,
+  },
+  {
+    key: 'big_night',
+    name: 'Big Night',
+    emoji: '✨',
+    desc: 'Pre-game, going out',
+    vibeWeights: { hype: 3, good_vibes: 2, drive: 1 },
+    filters: { minEnergy: 62, minValence: 52 },
+    contextSignals: { hours: [20,21,22,23], dow: [4,5,6] },
+    discoveryRatio: 0.35,
+  },
+  {
+    key: 'cooling_off',
+    name: 'Cooling Off',
+    emoji: '🛋️',
+    desc: 'Wind down, decompress',
+    vibeWeights: { chill: 3, ease: 2, t_evening: 1 },
+    filters: { maxEnergy: 52, minValence: 30 },
+    contextSignals: { hours: [21,22,23,0] },
+    discoveryRatio: 0.15,
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Playlist builders
+// ---------------------------------------------------------------------------
+
+async function buildVibePlaylist(vibeKey, limit = 25) {
+  const vibes = computeVibes();
+  if (!vibes.ready) return [];
+  const cluster = vibes.clusters.find(c => c.key === vibeKey);
+  if (!cluster) return [];
+
+  const pool = [...cluster.tracks];
+  const discoveryCount = Math.min(Math.floor(limit * 0.3), 8);
+  const baseCount = limit - discoveryCount;
+
+  const base = [...pool].sort(() => Math.random() - 0.5).slice(0, baseCount);
+
+  // Fetch discovery tracks similar to seeds from this vibe
+  const seedIds = base.slice(0, 3).map(t => t.id).filter(Boolean);
+  const similar = await getSimilarTracks(seedIds, [], discoveryCount + 5).catch(() => []);
+  const discovery = similar.slice(0, discoveryCount);
+
+  const all = [...base, ...discovery];
+  return _flowMode ? flowOrder(all) : all;
+}
+
+async function buildMoodPlaylist(moodKey, limit = 25) {
+  const mood = MOOD_STATES.find(m => m.key === moodKey);
+  if (!mood) return [];
+
+  const all = combinedHistory();
+  const withFeatures = all.filter(e => e.energy != null && e.uri);
+  const f = mood.filters || {};
+  const maxVibeW = Math.max(...Object.values(mood.vibeWeights));
+
+  const scored = [];
+  const seen = new Set();
+  for (const e of withFeatures) {
+    if (seen.has(e.id)) continue;
+    seen.add(e.id);
+    // Hard feature filters
+    if (f.minEnergy != null && e.energy < f.minEnergy) continue;
+    if (f.maxEnergy != null && e.energy > f.maxEnergy) continue;
+    if (f.minValence != null && e.valence < f.minValence) continue;
+    if (f.maxValence != null && e.valence > f.maxValence) continue;
+    if (f.minBpm != null && e.bpm && e.bpm < f.minBpm) continue;
+    if (f.maxBpm != null && e.bpm && e.bpm > f.maxBpm) continue;
+    const vibeKey = getVibeKey(e);
+    const vibeScore = (mood.vibeWeights[vibeKey] || 0) / maxVibeW;
+    scored.push({ ...e, _vs: vibeScore });
+  }
+
+  // Sort by vibe score with slight randomness so repeated calls return different results
+  scored.sort((a, b) => (b._vs - a._vs) + (Math.random() - 0.5) * 0.5);
+
+  const discoveryCount = Math.min(Math.floor(limit * (mood.discoveryRatio || 0.25)), 8);
+  const baseCount = limit - discoveryCount;
+  const base = scored.slice(0, baseCount);
+
+  // Discovery: find similar tracks to top-scoring tracks
+  const seedIds = base.slice(0, 3).map(t => t.id).filter(Boolean);
+  const similar = await getSimilarTracks(seedIds, [], discoveryCount + 5).catch(() => []);
+  const discovery = similar.slice(0, discoveryCount);
+
+  const combined = [...base, ...discovery];
+  return _flowMode ? flowOrder(combined) : combined.sort(() => Math.random() - 0.5);
+}
+
+// ---------------------------------------------------------------------------
+// Context detection & mood suggestion
+// ---------------------------------------------------------------------------
+
+function detectCurrentContext() {
+  const now  = new Date();
+  const h    = now.getHours();
+  const dow  = now.getDay();
+
+  let timeSlot;
+  if      (h >= 0  && h < 4)  timeSlot = 'latenight';
+  else if (h >= 4  && h < 8)  timeSlot = 'earlyam';
+  else if (h >= 8  && h < 11) timeSlot = 'morning';
+  else if (h >= 11 && h < 14) timeSlot = 'midday';
+  else if (h >= 14 && h < 18) timeSlot = 'afternoon';
+  else if (h >= 18 && h < 21) timeSlot = 'evening';
+  else                          timeSlot = 'night';
+
+  const isWeekend = dow === 0 || dow === 6;
+
+  // Energy trend from recent history
+  const recent = _history.slice(-5).filter(e => e.energy != null);
+  const recentEnergy = recent.length
+    ? Math.round(recent.reduce((s, e) => s + e.energy, 0) / recent.length)
+    : null;
+
+  // Score each mood by context signal match
+  let suggestedMoodKey = null;
+  let bestScore = -1;
+  for (const mood of MOOD_STATES) {
+    let score = 0;
+    const cs = mood.contextSignals || {};
+    if (cs.hours && cs.hours.includes(h))      score += 3;
+    if (cs.dow   && cs.dow.includes(dow))       score += 2;
+    if (cs.isWeekend != null && cs.isWeekend === isWeekend) score += 1;
+    if (score > bestScore) { bestScore = score; suggestedMoodKey = mood.key; }
+  }
+
+  const suggestedMood = MOOD_STATES.find(m => m.key === suggestedMoodKey);
+  return { hour: h, dow, timeSlot, isWeekend, recentEnergy, suggestedMoodKey,
+           suggestedMoodName: suggestedMood?.name, suggestedMoodEmoji: suggestedMood?.emoji };
+}
+
+// ---------------------------------------------------------------------------
+// Continuous queue refill — called on every track change when a mood/vibe is active
+// ---------------------------------------------------------------------------
+
+async function maybeRefillContinuousQueue(state) {
+  if (!_activeMoodKey && !_activeVibeKey) return;
+  try {
+    const queueData = await getQueue();
+    const queueLength = queueData?.queue?.length || 0;
+    if (queueLength >= CONTINUOUS_REFILL_THRESHOLD) return;
+
+    const refillCount = 12;
+    let tracks;
+    if (_activeMoodKey) {
+      tracks = await buildMoodPlaylist(_activeMoodKey, refillCount);
+    } else {
+      tracks = await buildVibePlaylist(_activeVibeKey, refillCount);
+    }
+
+    let added = 0;
+    for (const t of tracks) {
+      try {
+        await addToQueue(t.uri || `spotify:track:${t.id}`);
+        added++;
+        await new Promise(r => setTimeout(r, 100));
+      } catch { /* skip unplayable */ }
+    }
+    const label = _activeMoodKey || _activeVibeKey;
+    if (added > 0) console.log(`[Spotify] Continuous refill +${added} tracks (${label})`);
+  } catch (err) {
+    console.error('[Spotify] Continuous refill error:', err.message);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1379,6 +1928,9 @@ async function poll() {
         // Bump track count when a new track starts
         if (trackChanged || (!_lastTrackId && _activeSession.trackCount === 0)) {
           _activeSession.trackCount += 1;
+          if (state.track.id && !_activeSession.trackIds.includes(state.track.id)) {
+            _activeSession.trackIds.push(state.track.id);
+          }
         }
       } else {
         // Not playing — reset progress cursor
@@ -1451,6 +2003,12 @@ async function poll() {
         if (trackChanged) {
           maybeQueueRecommendations(state).catch((err) =>
             console.error('[Spotify] Autoplay error:', err.message)
+          );
+          maybeSmartShuffle(state).catch((err) =>
+            console.error('[Spotify] Smart shuffle error:', err.message)
+          );
+          maybeRefillContinuousQueue(state).catch((err) =>
+            console.error('[Spotify] Continuous refill error:', err.message)
           );
         }
         // Emit audio features on first track load too (not just track changes)
@@ -1533,38 +2091,26 @@ async function playPlaylistWithSmartShuffle(playlistUri, playlistId) {
     try {
       const tracksData = await getPlaylistTracks(playlistId, 50);
       const items = (tracksData && tracksData.items) ? tracksData.items : [];
-      // Feb 2026: response field renamed track → item
       const tracks = items.map((i) => i.item || i.track).filter(Boolean);
 
-      // Pick 3 random tracks as seeds
-      const shuffled = tracks.sort(() => Math.random() - 0.5);
+      const shuffled   = [...tracks].sort(() => Math.random() - 0.5);
       const seedTracks = shuffled.slice(0, 3).map((t) => t.id).filter(Boolean);
-
-      // Pick 2 random artist seeds from those tracks
-      const artistIds = [];
+      const artistIds  = [];
       for (const t of shuffled.slice(0, 3)) {
-        if (t.artists) {
-          for (const a of t.artists) {
-            if (a.id && !artistIds.includes(a.id)) artistIds.push(a.id);
-          }
+        for (const a of (t.artists || [])) {
+          if (a.id && !artistIds.includes(a.id)) artistIds.push(a.id);
         }
       }
       const seedArtists = artistIds.slice(0, 2);
 
-      const recs = await getRecommendations({ seedTracks, seedArtists, limit: 5 });
-      const recTracks = (recs && recs.tracks) ? recs.tracks : [];
-
-      for (const track of recTracks) {
-        try {
-          await addToQueue(track.uri);
-        } catch (err) {
-          console.error('[Spotify] Smart shuffle queue error:', err.message);
-        }
+      const similar = await getSimilarTracks(seedTracks, seedArtists, 5);
+      for (const track of similar) {
+        try { await addToQueue(track.uri); } catch { /* ignore */ }
       }
-
-      _autoQueueCount = recTracks.length;
+      _autoQueueCount      = similar.length;
+      _smartShuffleTrackCount = 0;
     } catch (err) {
-      console.error('[Spotify] Smart shuffle error:', err.message);
+      console.error('[Spotify] Smart shuffle (playlist start) error:', err.message);
     }
   }
 }
@@ -1579,6 +2125,7 @@ function init(io) {
   loadHistory();
   loadSessions();
   loadVibeNames();
+  loadUserPrefs();
 
   // Start polling if already authed
   if (isAuthed()) {
@@ -1944,6 +2491,11 @@ function init(io) {
         rightNow: computeRightNow(),
         total:    combinedHistory().length,
         ownTotal: _history.length,
+        flowMode:      _flowMode,
+        activeMoodKey: _activeMoodKey,
+        activeVibeKey: _activeVibeKey,
+        moods: MOOD_STATES.map(({ key, name, emoji, desc }) => ({ key, name, emoji, desc })),
+        context: detectCurrentContext(),
       });
     });
 
@@ -1958,20 +2510,84 @@ function init(io) {
     // ----- spotify:play_vibe -----
     socket.on('spotify:play_vibe', async ({ key } = {}) => {
       try {
-        const vibes = computeVibes();
-        if (!vibes.ready) return;
-        const cluster = vibes.clusters.find(c => c.key === key);
-        if (!cluster) return;
-        const tracks = [...cluster.tracks].sort(() => Math.random() - 0.5).slice(0, 25);
+        const tracks = await buildVibePlaylist(key, 25);
+        if (!tracks.length) {
+          socket.emit('spotify:insights_action', { ok: false, msg: 'Not enough data for this vibe' });
+          return;
+        }
+        _activeVibeKey = key;
+        _activeMoodKey = null;
         let queued = 0;
         for (const t of tracks) {
-          try { await addToQueue(t.uri); queued++; await new Promise(r => setTimeout(r, 120)); }
-          catch { /* skip unplayable */ }
+          try {
+            await addToQueue(t.uri || `spotify:track:${t.id}`);
+            queued++;
+            await new Promise(r => setTimeout(r, 120));
+          } catch { /* skip unplayable */ }
         }
-        socket.emit('spotify:insights_action', { ok: true, msg: `Queued ${queued} tracks from "${cluster.name}"` });
+        const label = getVibeName(key);
+        socket.emit('spotify:insights_action', { ok: true, msg: `Queued ${queued} tracks · "${label}" · keeps going ∞` });
+        _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: key });
       } catch (err) {
         socket.emit('spotify:insights_action', { ok: false, msg: err.message });
       }
+    });
+
+    // ----- spotify:play_mood -----
+    socket.on('spotify:play_mood', async ({ key } = {}) => {
+      try {
+        const mood = MOOD_STATES.find(m => m.key === key);
+        if (!mood) return;
+        const tracks = await buildMoodPlaylist(key, 25);
+        if (!tracks.length) {
+          socket.emit('spotify:insights_action', { ok: false, msg: 'Not enough history for this mood yet' });
+          return;
+        }
+        _activeMoodKey = key;
+        _activeVibeKey = null;
+        let queued = 0;
+        for (const t of tracks) {
+          try {
+            await addToQueue(t.uri || `spotify:track:${t.id}`);
+            queued++;
+            await new Promise(r => setTimeout(r, 120));
+          } catch { /* skip unplayable */ }
+        }
+        socket.emit('spotify:insights_action', { ok: true, msg: `Queued ${queued} tracks · "${mood.name}" · keeps going ∞` });
+        _io.emit('spotify:continuous_state', { activeMoodKey: key, activeVibeKey: null });
+      } catch (err) {
+        socket.emit('spotify:insights_action', { ok: false, msg: err.message });
+      }
+    });
+
+    // ----- spotify:stop_continuous -----
+    socket.on('spotify:stop_continuous', () => {
+      _activeMoodKey = null;
+      _activeVibeKey = null;
+      _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: null });
+    });
+
+    // ----- spotify:set_flow_mode -----
+    socket.on('spotify:set_flow_mode', ({ enabled } = {}) => {
+      _flowMode = !!enabled;
+      saveUserPrefs();
+      _io.emit('spotify:flow_mode', { enabled: _flowMode });
+    });
+
+    // ----- spotify:get_moods -----
+    socket.on('spotify:get_moods', () => {
+      const context = detectCurrentContext();
+      socket.emit('spotify:moods', {
+        moods: MOOD_STATES.map(({ key, name, emoji, desc }) => ({ key, name, emoji, desc })),
+        activeMoodKey: _activeMoodKey,
+        activeVibeKey: _activeVibeKey,
+        context,
+      });
+    });
+
+    // ----- spotify:get_context -----
+    socket.on('spotify:get_context', () => {
+      socket.emit('spotify:context', detectCurrentContext());
     });
 
     // ----- spotify:play_now -----  (Right Now tab)
@@ -1979,13 +2595,18 @@ function init(io) {
       try {
         const rn = computeRightNow();
         if (!rn.ready) return;
-        const tracks = [...rn.topTracks].sort(() => Math.random() - 0.5).slice(0, 25);
+        // Use the vibe key from right-now to enable continuous mode
+        _activeVibeKey = rn.vibeKey || null;
+        _activeMoodKey = null;
+        let pool = [...rn.topTracks].sort(() => Math.random() - 0.5).slice(0, 25);
+        if (_flowMode) pool = flowOrder(pool);
         let queued = 0;
-        for (const t of tracks) {
+        for (const t of pool) {
           try { await addToQueue(t.uri); queued++; await new Promise(r => setTimeout(r, 120)); }
           catch { /* skip */ }
         }
-        socket.emit('spotify:insights_action', { ok: true, msg: `Queued ${queued} tracks for right now` });
+        socket.emit('spotify:insights_action', { ok: true, msg: `Queued ${queued} tracks for right now · keeps going ∞` });
+        _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: _activeVibeKey });
       } catch (err) {
         socket.emit('spotify:insights_action', { ok: false, msg: err.message });
       }
@@ -2086,6 +2707,7 @@ function init(io) {
       _lastState = null;
       _lastTrackId = null;
       _autoQueueCount = 0;
+      _smartShuffleTrackCount = 0;
       _userProfile = null;
       _userId = null;
       io.emit('spotify:auth_status', { connected: false, configured: true });

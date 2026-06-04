@@ -2162,3 +2162,132 @@
   font-size: 11px;
   color: var(--text-2, #aaa);
 }
+
+/* ---------- VIBES TOOLBAR (flow toggle + continuous badge) ---------- */
+.sp-ins-vibes-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0 6px;
+  border-bottom: 1px solid var(--sp-border, rgba(255,255,255,0.07));
+  margin-bottom: 6px;
+}
+.sp-ins-flow-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  user-select: none;
+}
+.sp-ins-flow-check {
+  accent-color: var(--sp-green, #1DB954);
+  cursor: pointer;
+}
+.sp-ins-flow-label {
+  font-size: 11px;
+  color: var(--text-2, #aaa);
+}
+.sp-ins-continuous-badge {
+  font-size: 11px;
+  color: var(--sp-green, #1DB954);
+  font-weight: 700;
+  margin-left: auto;
+  animation: sp-pulse 2s ease-in-out infinite;
+}
+@keyframes sp-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.5; }
+}
+.sp-ins-stop-btn {
+  background: none;
+  border: 1px solid var(--sp-border, rgba(255,255,255,0.15));
+  border-radius: 4px;
+  color: var(--text-2, #aaa);
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.sp-ins-stop-btn:hover {
+  color: var(--text, #fff);
+  border-color: rgba(255,255,255,0.35);
+}
+
+/* ---------- MOOD TAB ---------- */
+.sp-ins-mood-context {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  background: rgba(29,185,84,0.08);
+  border: 1px solid rgba(29,185,84,0.2);
+  border-radius: 6px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-2, #aaa);
+}
+.sp-ins-ctx-icon {
+  font-size: 16px;
+  flex-shrink: 0;
+}
+.sp-ins-ctx-text strong {
+  color: var(--text, #fff);
+}
+.sp-ins-mood-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px;
+}
+.sp-mood-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 10px 8px;
+  background: var(--bg-2, #1e1e1e);
+  border: 1px solid var(--sp-border, rgba(255,255,255,0.07));
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, transform 0.1s;
+  text-align: center;
+}
+.sp-mood-card:hover {
+  background: var(--bg-3, #252535);
+  border-color: rgba(255,255,255,0.18);
+  transform: scale(1.02);
+}
+.sp-mood-card--active {
+  border-color: var(--sp-green, #1DB954);
+  background: rgba(29,185,84,0.1);
+}
+.sp-mood-card--active:hover {
+  background: rgba(29,185,84,0.15);
+}
+.sp-mood-emoji {
+  font-size: 20px;
+  line-height: 1;
+}
+.sp-mood-name {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text, #fff);
+}
+.sp-mood-desc {
+  font-size: 10px;
+  color: var(--text-3, #888);
+  line-height: 1.2;
+}
+.sp-ins-mood-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--sp-border, rgba(255,255,255,0.07));
+}
+.sp-ins-mood-active-label {
+  font-size: 11px;
+  color: var(--sp-green, #1DB954);
+  font-weight: 600;
+  animation: sp-pulse 2s ease-in-out infinite;
+}

@@ -26,6 +26,9 @@ import {
   getFilterCount,
   setSpotifyAutoplay,
   setSpotifySmartShuffle,
+  playMood,
+  stopContinuous,
+  setFlowMode,
 } from './spotify-client.js';
 import { socket } from './socket.js';
 
@@ -2089,6 +2092,7 @@ export function renderSpotifyInsights(ctrl) {
         <button class="sp-ins-tab active" data-tab="profile">Profile</button>
         <button class="sp-ins-tab" data-tab="patterns">Patterns</button>
         <button class="sp-ins-tab" data-tab="vibes">Vibes</button>
+        <button class="sp-ins-tab" data-tab="mood">Mood</button>
         <button class="sp-ins-tab" data-tab="rightnow">Right Now</button>
         <button class="sp-ins-tab" data-tab="filter">Filter</button>
       </div>
@@ -2125,12 +2129,30 @@ export function renderSpotifyInsights(ctrl) {
 
         <!-- VIBES -->
         <div class="sp-ins-panel" data-panel="vibes" style="display:none">
+          <div class="sp-ins-vibes-toolbar">
+            <label class="sp-ins-flow-toggle" title="Orders tracks for harmonic key, BPM and energy compatibility">
+              <input type="checkbox" class="sp-ins-flow-check">
+              <span class="sp-ins-flow-label">Flow order</span>
+            </label>
+            <span class="sp-ins-continuous-badge" style="display:none">● Live</span>
+            <button class="sp-ins-stop-btn" style="display:none">Stop</button>
+          </div>
           <div class="sp-ins-vibes-empty" style="display:none">
             <div class="sp-ins-empty-icon">✨</div>
             <div class="sp-ins-empty-msg">Keep listening to build your vibe profile</div>
             <div class="sp-ins-empty-sub sp-ins-vibe-progress"></div>
           </div>
           <div class="sp-ins-vibes-list"></div>
+        </div>
+
+        <!-- MOOD -->
+        <div class="sp-ins-panel" data-panel="mood" style="display:none">
+          <div class="sp-ins-mood-context"></div>
+          <div class="sp-ins-mood-grid"></div>
+          <div class="sp-ins-mood-footer" style="display:none">
+            <span class="sp-ins-mood-active-label"></span>
+            <button class="sp-ins-stop-btn sp-ins-mood-stop-btn">Stop</button>
+          </div>
         </div>
 
         <!-- RIGHT NOW -->
@@ -2508,6 +2530,108 @@ export function renderSpotifyInsights(ctrl) {
     _showFeedback('Queuing filtered tracks…');
   });
 
+  // ---- Mood tab ----
+  let _moodsCache = [];
+  function _renderMoods(moods, activeMoodKey, activeVibeKey, context) {
+    _moodsCache = moods || [];
+    const grid = card.querySelector('.sp-ins-mood-grid');
+    const footer = card.querySelector('.sp-ins-mood-footer');
+    const activeLabel = card.querySelector('.sp-ins-mood-active-label');
+    const ctxEl = card.querySelector('.sp-ins-mood-context');
+
+    // Context suggestion
+    if (context?.suggestedMoodName) {
+      ctxEl.innerHTML = `<span class="sp-ins-ctx-icon">${context.suggestedMoodEmoji || '💡'}</span> <span class="sp-ins-ctx-text">Right now feels like <strong>${_esc(context.suggestedMoodName)}</strong></span>`;
+      ctxEl.style.display = '';
+    } else {
+      ctxEl.style.display = 'none';
+    }
+
+    // Active state footer
+    const anyActive = activeMoodKey || activeVibeKey;
+    if (anyActive) {
+      const activeLabel2 = activeMoodKey
+        ? (moods.find(m => m.key === activeMoodKey)?.name || activeMoodKey)
+        : activeVibeKey;
+      activeLabel.textContent = `● ${activeLabel2} · keeps going`;
+      footer.style.display = '';
+    } else {
+      footer.style.display = 'none';
+    }
+
+    // Mood cards
+    grid.innerHTML = '';
+    moods.forEach(mood => {
+      const isActive = mood.key === activeMoodKey;
+      const card2 = document.createElement('div');
+      card2.className = 'sp-mood-card' + (isActive ? ' sp-mood-card--active' : '');
+      card2.dataset.key = mood.key;
+      card2.innerHTML = `
+        <span class="sp-mood-emoji">${mood.emoji}</span>
+        <span class="sp-mood-name">${_esc(mood.name)}</span>
+        <span class="sp-mood-desc">${_esc(mood.desc)}</span>
+      `;
+      card2.addEventListener('pointerup', () => {
+        if (isEditMode()) return;
+        playMood(mood.key);
+        _showFeedback(`Building "${mood.name}" playlist…`);
+      });
+      grid.appendChild(card2);
+    });
+  }
+
+  function _updateContinuousState({ activeMoodKey, activeVibeKey }) {
+    // Update Vibes tab badges
+    const badge = card.querySelector('.sp-ins-continuous-badge');
+    const stopBtn = card.querySelector('.sp-ins-vibes-toolbar .sp-ins-stop-btn');
+    if (activeVibeKey) {
+      badge.style.display = '';
+      stopBtn.style.display = '';
+    } else {
+      badge.style.display = 'none';
+      stopBtn.style.display = 'none';
+    }
+    // Update Mood tab
+    const moodFooter = card.querySelector('.sp-ins-mood-footer');
+    const moodActiveLabel = card.querySelector('.sp-ins-mood-active-label');
+    if (activeMoodKey || activeVibeKey) {
+      const moodName = _moodsCache.find(m => m.key === activeMoodKey)?.name;
+      const label = moodName || activeMoodKey || activeVibeKey;
+      moodActiveLabel.textContent = `● ${label} · keeps going`;
+      moodFooter.style.display = '';
+    } else {
+      moodFooter.style.display = 'none';
+    }
+    // Refresh mood card active states
+    card.querySelectorAll('.sp-mood-card').forEach(el => {
+      el.classList.toggle('sp-mood-card--active', el.dataset.key === activeMoodKey);
+    });
+  }
+
+  // Flow toggle
+  const flowCheck = card.querySelector('.sp-ins-flow-check');
+  flowCheck.addEventListener('change', () => {
+    setFlowMode(flowCheck.checked);
+  });
+
+  // Stop continuous (Vibes toolbar)
+  card.querySelector('.sp-ins-vibes-toolbar .sp-ins-stop-btn').addEventListener('pointerup', () => {
+    if (isEditMode()) return;
+    stopContinuous();
+  });
+
+  // Stop continuous (Mood footer)
+  card.querySelector('.sp-ins-mood-stop-btn').addEventListener('pointerup', () => {
+    if (isEditMode()) return;
+    stopContinuous();
+  });
+
+  // Continuous state updates from server
+  const _onContinuousState = (data) => _updateContinuousState(data);
+  const _onFlowMode = ({ enabled }) => { flowCheck.checked = enabled; };
+  socket.on('spotify:continuous_state', _onContinuousState);
+  socket.on('spotify:flow_mode', _onFlowMode);
+
   // ---- Main data load ----
   function _loadAll(data) {
     if (!data) return;
@@ -2515,6 +2639,14 @@ export function renderSpotifyInsights(ctrl) {
     _renderPatterns(data.patterns || { grid: [], max: 1, blockNames: [], dayNames: [], total: 0 });
     _renderVibes(data.vibes      || { ready: false, needed: 20, current: 0 });
     _renderRightNow(data.rightNow|| {});
+    // Mood tab
+    if (data.moods) {
+      _renderMoods(data.moods, data.activeMoodKey, data.activeVibeKey, data.context);
+    }
+    // Flow toggle state
+    if (data.flowMode != null) flowCheck.checked = data.flowMode;
+    // Continuous badge
+    _updateContinuousState({ activeMoodKey: data.activeMoodKey, activeVibeKey: data.activeVibeKey });
     // Init filter count
     _requestFilterCount();
   }
@@ -2525,6 +2657,8 @@ export function renderSpotifyInsights(ctrl) {
       socket.off('spotify:insights_action', _onAction);
       socket.off('spotify:vibe_renamed',    _onVibeRenamed);
       socket.off('spotify:filter_count',    _onFilterCount);
+      socket.off('spotify:continuous_state', _onContinuousState);
+      socket.off('spotify:flow_mode',        _onFlowMode);
       _cleanObs.disconnect();
     }
   });

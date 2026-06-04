@@ -150,6 +150,21 @@ export function getFilterCount(params) {
   socket.emit('spotify:get_filter_count', params);
 }
 
+/** Queue a mood playlist and enable continuous mode. */
+export function playMood(key) {
+  socket.emit('spotify:play_mood', { key });
+}
+
+/** Stop continuous vibe/mood playback. */
+export function stopContinuous() {
+  socket.emit('spotify:stop_continuous');
+}
+
+/** Toggle harmonic flow ordering for vibes/moods. */
+export function setFlowMode(enabled) {
+  socket.emit('spotify:set_flow_mode', { enabled });
+}
+
 export function saveSessionAsPlaylist(name) {
   return new Promise((resolve) => {
     socket.once('spotify:session_playlist_saved', resolve);
