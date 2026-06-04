@@ -2877,7 +2877,7 @@ export function renderSpotifyIntelligence(ctrl) {
       vibeRow.style.display    = 'none';
       idleEl.style.display     = 'none';
     } else if (activeMoodKey || activeVibeKey) {
-      vibeLabelEl.textContent  = activeMoodKey || activeVibeKey;
+      vibeLabelEl.textContent  = data.activeMoodName || activeMoodKey || activeVibeKey;
       vibeRow.style.display    = '';
       feelingRow.style.display = 'none';
       idleEl.style.display     = 'none';

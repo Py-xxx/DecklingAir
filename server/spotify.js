@@ -934,34 +934,66 @@ async function getAllLikedSongs() {
 
 // In-memory cache so we don't re-fetch features for the same track
 const _audioFeaturesCache = new Map();
-// Maps a Spotify track ID → ReccoBeats internal UUID (null = looked up, not found)
+// Maps a Spotify track ID → ReccoBeats internal UUID (null = looked up, genuinely not found)
 const _reccoIdCache = new Map();
+
+// ReccoBeats throttle: all requests are serialized through one promise chain with a
+// minimum gap that widens automatically on 429 and relaxes on success. Prevents the
+// request storms that were triggering HTTP 429 during seeding.
+let _reccoChain = Promise.resolve();
+let _reccoGap = 350;
+const RECCO_GAP_MIN = 350;
+const RECCO_GAP_MAX = 4000;
+
+function _reccoThrottle(fn) {
+  const run = _reccoChain.then(async () => {
+    await new Promise(r => setTimeout(r, _reccoGap));
+    return fn();
+  });
+  _reccoChain = run.then(() => {}, () => {}); // keep the chain alive on success or failure
+  return run;
+}
+
+// Serialized + backed-off GET against ReccoBeats. Throws on final failure so callers
+// can distinguish a transient error (don't cache) from a genuine not-found (cache).
+async function _reccoGet(url) {
+  const maxAttempts = 4;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const data = await _reccoThrottle(() =>
+        httpsRequest('GET', url, { headers: { Accept: 'application/json' } })
+      );
+      if (_reccoGap > RECCO_GAP_MIN) _reccoGap = Math.max(RECCO_GAP_MIN, _reccoGap - 150);
+      return data;
+    } catch (err) {
+      const transient = err.status === 429 || (err.status >= 500 && err.status < 600);
+      if (transient && attempt < maxAttempts) {
+        _reccoGap = Math.min(RECCO_GAP_MAX, _reccoGap + 500);
+        await new Promise(r => setTimeout(r, 600 * Math.pow(2, attempt - 1)));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
 
 // Resolve a Spotify track ID to its ReccoBeats UUID via the batch lookup endpoint.
 async function _reccoLookupId(trackId) {
   if (_reccoIdCache.has(trackId)) return _reccoIdCache.get(trackId);
-  try {
-    const data = await httpsRequest('GET', `${RECCOBEATS_API}/track?ids=${trackId}`, {
-      headers: { Accept: 'application/json' },
-    });
-    const uuid = data && Array.isArray(data.content) && data.content[0] ? data.content[0].id : null;
-    _reccoIdCache.set(trackId, uuid || null);
-    return uuid || null;
-  } catch (err) {
-    console.warn('[Spotify] ReccoBeats id lookup failed for', trackId, '-', err.message);
-    _reccoIdCache.set(trackId, null);
-    return null;
-  }
+  const data = await _reccoGet(`${RECCOBEATS_API}/track?ids=${trackId}`); // may throw (transient)
+  const uuid = data && Array.isArray(data.content) && data.content[0] ? data.content[0].id : null;
+  _reccoIdCache.set(trackId, uuid || null); // only reached on a successful 200 → genuine result
+  return uuid || null;
 }
 
 // Fetch audio features from ReccoBeats and normalise to Spotify's field shape.
+// Returns null on genuine not-found OR transient failure; transient failures are not
+// cached, so the next track change retries them.
 async function getReccoBeatsFeatures(trackId) {
-  const uuid = await _reccoLookupId(trackId);
-  if (!uuid) return null;
   try {
-    const f = await httpsRequest('GET', `${RECCOBEATS_API}/track/${uuid}/audio-features`, {
-      headers: { Accept: 'application/json' },
-    });
+    const uuid = await _reccoLookupId(trackId);
+    if (!uuid) return null;
+    const f = await _reccoGet(`${RECCOBEATS_API}/track/${uuid}/audio-features`);
     if (!f || f.tempo == null) return null;
     return {
       id: trackId,
@@ -976,7 +1008,7 @@ async function getReccoBeatsFeatures(trackId) {
       _source: 'reccobeats',
     };
   } catch (err) {
-    console.warn('[Spotify] ReccoBeats features failed for', trackId, '-', err.message);
+    console.warn('[Spotify] ReccoBeats unavailable for', trackId, '-', err.message);
     return null;
   }
 }
@@ -1019,7 +1051,7 @@ async function getBatchAudioFeatures(trackIds) {
     }
     // Tier 2: ReccoBeats fallback for whatever's still missing.
     // Sequential + capped so one-time seeding doesn't fire a request storm.
-    const stillMissing = toFetch.filter(id => !_audioFeaturesCache.has(id)).slice(0, 60);
+    const stillMissing = toFetch.filter(id => !_audioFeaturesCache.has(id)).slice(0, 30);
     if (stillMissing.length) {
       let got = 0;
       for (const id of stillMissing) {
@@ -1102,6 +1134,7 @@ async function getRecommendations({ seedTracks = [], seedArtists = [], limit = 5
  *
  * Returns an array of raw Spotify track objects (with .uri, .id, .name, .artists …).
  */
+let _recommendationsDeadLogged = false;
 async function getSimilarTracks(seedTrackIds = [], seedArtistIds = [], limit = 5) {
   const dedupe = (tracks, excludeUris = new Set()) => {
     const seen = new Set(excludeUris);
@@ -1123,7 +1156,11 @@ async function getSimilarTracks(seedTrackIds = [], seedArtistIds = [], limit = 5
       return tracks.slice(0, limit);
     }
   } catch (err) {
-    console.warn('[Spotify] /recommendations unavailable, trying fallback:', err.message);
+    // /recommendations is deprecated and 404s for most apps — log once, then stay quiet
+    if (!_recommendationsDeadLogged) {
+      console.warn('[Spotify] /recommendations unavailable, using related-artists fallback:', err.message);
+      _recommendationsDeadLogged = true;
+    }
   }
 
   // ── Tier 2: related artists → their top tracks ──────────────────────────────
@@ -1524,111 +1561,13 @@ function flowOrder(tracks) {
 }
 
 // ---------------------------------------------------------------------------
-// Mood states
+// Feelings & moods
+//
+// There is one mood profile per feeling. The feeling is the human-friendly answer
+// to the "how are you feeling?" check-in; the mood is the playlist profile it drives.
+// Each mood references its feeling (mood.feeling) and is filtered by that feeling's
+// energy/valence range, so the two are always in sync.
 // ---------------------------------------------------------------------------
-
-const MOOD_STATES = [
-  {
-    key: 'lock_in',
-    name: 'Lock In',
-    emoji: '🎯',
-    desc: 'Deep focus, no distractions',
-    vibeWeights: { grind: 3, flow: 2, intense: 1 },
-    filters: { minEnergy: 35, maxEnergy: 78, maxValence: 55 },
-    contextSignals: { hours: [9,10,11,12,13,14,15,16] },
-    discoveryRatio: 0.25,
-  },
-  {
-    key: 'full_send',
-    name: 'Full Send',
-    emoji: '🚀',
-    desc: 'Maximum energy, full hype',
-    vibeWeights: { hype: 3, drive: 2, good_vibes: 1 },
-    filters: { minEnergy: 70 },
-    contextSignals: { hours: [17,18,19,20,21,22] },
-    discoveryRatio: 0.35,
-  },
-  {
-    key: 'in_the_flow',
-    name: 'In The Flow',
-    emoji: '🌊',
-    desc: 'Smooth and productive',
-    vibeWeights: { flow: 3, good_vibes: 2, chill: 1 },
-    filters: { minEnergy: 30, maxEnergy: 65 },
-    contextSignals: { hours: [10,11,12,13,14,15] },
-    discoveryRatio: 0.20,
-  },
-  {
-    key: 'late_one',
-    name: 'Late One',
-    emoji: '🌙',
-    desc: 'Deep in the night',
-    vibeWeights: { t_latenight: 3, melancholy: 2, ease: 1 },
-    filters: { maxEnergy: 55 },
-    contextSignals: { hours: [0,1,2,3,23] },
-    discoveryRatio: 0.20,
-  },
-  {
-    key: 'the_feels',
-    name: 'The Feels',
-    emoji: '💭',
-    desc: 'Emotional and introspective',
-    vibeWeights: { melancholy: 3, ease: 2, t_latenight: 1 },
-    filters: { maxEnergy: 52, maxValence: 50 },
-    contextSignals: {},
-    discoveryRatio: 0.20,
-  },
-  {
-    key: 'slow_start',
-    name: 'Slow Start',
-    emoji: '☀️',
-    desc: 'Gentle morning energy',
-    vibeWeights: { chill: 3, t_morning: 2, ease: 1 },
-    filters: { maxEnergy: 55, minValence: 35 },
-    contextSignals: { hours: [6,7,8,9] },
-    discoveryRatio: 0.15,
-  },
-  {
-    key: 'on_the_road',
-    name: 'On The Road',
-    emoji: '🛣️',
-    desc: 'Driving, windows down',
-    vibeWeights: { drive: 3, good_vibes: 2, hype: 1 },
-    filters: { minEnergy: 50, minValence: 35 },
-    contextSignals: {},
-    discoveryRatio: 0.25,
-  },
-  {
-    key: 'going_hard',
-    name: 'Going Hard',
-    emoji: '💪',
-    desc: 'Workout, push through it',
-    vibeWeights: { intense: 3, hype: 2, drive: 1 },
-    filters: { minEnergy: 68 },
-    contextSignals: { hours: [6,7,8,17,18,19] },
-    discoveryRatio: 0.30,
-  },
-  {
-    key: 'big_night',
-    name: 'Big Night',
-    emoji: '✨',
-    desc: 'Pre-game, going out',
-    vibeWeights: { hype: 3, good_vibes: 2, drive: 1 },
-    filters: { minEnergy: 62, minValence: 52 },
-    contextSignals: { hours: [20,21,22,23], dow: [4,5,6] },
-    discoveryRatio: 0.35,
-  },
-  {
-    key: 'cooling_off',
-    name: 'Cooling Off',
-    emoji: '🛋️',
-    desc: 'Wind down, decompress',
-    vibeWeights: { chill: 3, ease: 2, t_evening: 1 },
-    filters: { maxEnergy: 52, minValence: 30 },
-    contextSignals: { hours: [21,22,23,0] },
-    discoveryRatio: 0.15,
-  },
-];
 
 const FEELING_DEFS = {
   sad:       { emoji: '😔', label: 'Sad',       energy: [0,  45],  valence: [0,  38] },
@@ -1639,6 +1578,55 @@ const FEELING_DEFS = {
   hype:      { emoji: '🔥', label: 'Hype',      energy: [70, 100], valence: [55, 100] },
   angsty:    { emoji: '😤', label: 'Angsty',    energy: [55, 100], valence: [0,  42] },
 };
+
+// Build a mood's hard feature filter straight from its feeling's ranges.
+function _filtersForFeeling(feelingKey) {
+  const def = FEELING_DEFS[feelingKey];
+  return { minEnergy: def.energy[0], maxEnergy: def.energy[1], minValence: def.valence[0], maxValence: def.valence[1] };
+}
+
+const MOOD_STATES = [
+  {
+    key: 'in_my_feelings', name: 'In My Feelings', emoji: '🥀',
+    desc: 'For when you\'re feeling sad', feeling: 'sad',
+    contextSignals: { hours: [0,1,2,3,23] }, discoveryRatio: 0.20,
+  },
+  {
+    key: 'cruise', name: 'Cruise', emoji: '🧘',
+    desc: 'For when you\'re feeling chill', feeling: 'chill',
+    contextSignals: { hours: [21,22,23] }, discoveryRatio: 0.20,
+  },
+  {
+    key: 'lock_in', name: 'Lock In', emoji: '🎯',
+    desc: 'For when you\'re feeling focused', feeling: 'focused',
+    contextSignals: { hours: [9,10,11,12,13,14,15,16] }, discoveryRatio: 0.25,
+  },
+  {
+    key: 'sunshine', name: 'Sunshine', emoji: '😊',
+    desc: 'For when you\'re feeling happy', feeling: 'happy',
+    contextSignals: { hours: [7,8,9,10] }, discoveryRatio: 0.25,
+  },
+  {
+    key: 'charged_up', name: 'Charged Up', emoji: '⚡',
+    desc: 'For when you\'re feeling energetic', feeling: 'energetic',
+    contextSignals: { hours: [6,7,8,17,18,19] }, discoveryRatio: 0.30,
+  },
+  {
+    key: 'full_send', name: 'Full Send', emoji: '🔥',
+    desc: 'For when you\'re feeling hype', feeling: 'hype',
+    contextSignals: { hours: [20,21,22,23], dow: [4,5,6] }, discoveryRatio: 0.35,
+  },
+  {
+    key: 'going_hard', name: 'Going Hard', emoji: '😤',
+    desc: 'For when you\'re feeling angsty', feeling: 'angsty',
+    contextSignals: { hours: [17,18,19] }, discoveryRatio: 0.30,
+  },
+].map(m => ({ ...m, filters: _filtersForFeeling(m.feeling) }));
+
+// The single mood profile that corresponds to a given feeling.
+function moodForFeeling(feelingKey) {
+  return MOOD_STATES.find(m => m.feeling === feelingKey) || null;
+}
 
 // ---------------------------------------------------------------------------
 // Playlist builders
@@ -1669,42 +1657,12 @@ async function buildMoodPlaylist(moodKey, limit = 25) {
   const mood = MOOD_STATES.find(m => m.key === moodKey);
   if (!mood) return [];
 
-  const all = combinedHistory();
-  const withFeatures = all.filter(e => e.energy != null && e.uri);
-  const f = mood.filters || {};
-  const maxVibeW = Math.max(...Object.values(mood.vibeWeights));
-
-  const scored = [];
-  const seen = new Set();
-  for (const e of withFeatures) {
-    if (seen.has(e.id)) continue;
-    seen.add(e.id);
-    // Hard feature filters
-    if (f.minEnergy != null && e.energy < f.minEnergy) continue;
-    if (f.maxEnergy != null && e.energy > f.maxEnergy) continue;
-    if (f.minValence != null && e.valence < f.minValence) continue;
-    if (f.maxValence != null && e.valence > f.maxValence) continue;
-    if (f.minBpm != null && e.bpm && e.bpm < f.minBpm) continue;
-    if (f.maxBpm != null && e.bpm && e.bpm > f.maxBpm) continue;
-    const vibeKey = getVibeKey(e);
-    const vibeScore = (mood.vibeWeights[vibeKey] || 0) / maxVibeW;
-    scored.push({ ...e, _vs: vibeScore });
-  }
-
-  // Sort by vibe score with slight randomness so repeated calls return different results
-  scored.sort((a, b) => (b._vs - a._vs) + (Math.random() - 0.5) * 0.5);
-
-  const discoveryCount = Math.min(Math.floor(limit * (mood.discoveryRatio || 0.25)), 8);
-  const baseCount = limit - discoveryCount;
-  const base = scored.slice(0, baseCount);
-
-  // Discovery: find similar tracks to top-scoring tracks
-  const seedIds = base.slice(0, 3).map(t => t.id).filter(Boolean);
-  const similar = await getSimilarTracks(seedIds, [], discoveryCount + 5).catch(() => []);
-  const discovery = similar.slice(0, discoveryCount);
-
-  const combined = [...base, ...discovery];
-  return _flowMode ? flowOrder(combined) : combined.sort(() => Math.random() - 0.5);
+  // Each mood maps 1:1 to a feeling — build through the same feeling engine so the
+  // Mood tab and the check-in produce consistent results. If a check-in confirmed
+  // this same feeling, pass its session cluster so the result is centred on it.
+  const sessionTracks = (_activeFeeling && _activeFeeling.key === mood.feeling)
+    ? (_activeFeeling.clusterTracks || []) : [];
+  return buildFeelingPlaylist(mood.feeling, sessionTracks, limit);
 }
 
 async function buildFeelingPlaylist(feelingKey, sessionTracks = [], limit = 20) {
@@ -1837,6 +1795,7 @@ function _emitIntelligenceState() {
   _io.emit('spotify:intelligence_state', {
     activeFeeling:  _activeFeeling ? { key: _activeFeeling.key, label: _activeFeeling.label, emoji: _activeFeeling.emoji } : null,
     activeMoodKey:  _activeMoodKey,
+    activeMoodName: _activeMoodKey ? (MOOD_STATES.find(m => m.key === _activeMoodKey)?.name || null) : null,
     activeVibeKey:  _activeVibeKey,
     clusterSize:    _currentCluster.length,
     clusterCentroid: _currentCentroid,
@@ -2846,7 +2805,7 @@ function init(io) {
         flowMode:      _flowMode,
         activeMoodKey: _activeMoodKey,
         activeVibeKey: _activeVibeKey,
-        moods: MOOD_STATES.map(({ key, name, emoji, desc }) => ({ key, name, emoji, desc })),
+        moods: MOOD_STATES.map(({ key, name, emoji, desc, feeling }) => ({ key, name, emoji, desc, feeling })),
         context: detectCurrentContext(),
       });
     });
@@ -2869,6 +2828,7 @@ function init(io) {
         }
         _activeVibeKey = key;
         _activeMoodKey = null;
+        _activeFeeling = null;
         let queued = 0;
         for (const t of tracks) {
           try {
@@ -2897,6 +2857,7 @@ function init(io) {
         }
         _activeMoodKey = key;
         _activeVibeKey = null;
+        _activeFeeling = null;
         let queued = 0;
         for (const t of tracks) {
           try {
@@ -2966,13 +2927,16 @@ function init(io) {
       };
       _pendingCheckIn = null;
 
-      // Stop any running mood/vibe — feeling takes over
-      _activeMoodKey = null;
+      // A feeling maps 1:1 to a mood profile — activate that mood so the Mood tab
+      // reflects it. The feeling drives the (cluster-aware) playback.
+      const mappedMood = moodForFeeling(feeling);
+      _activeMoodKey = mappedMood ? mappedMood.key : null;
       _activeVibeKey = null;
 
       _emitIntelligenceState();
-      _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: null });
-      socket.emit('spotify:insights_action', { ok: true, msg: `Got it · "${def.label}" · building your playlist…` });
+      _io.emit('spotify:continuous_state', { activeMoodKey: _activeMoodKey, activeVibeKey: null });
+      const moodLabel = mappedMood ? ` · ${mappedMood.emoji} ${mappedMood.name}` : '';
+      socket.emit('spotify:insights_action', { ok: true, msg: `Got it · "${def.label}"${moodLabel} · building your playlist…` });
 
       // Queue feeling playlist
       try {
@@ -3027,7 +2991,7 @@ function init(io) {
     socket.on('spotify:get_moods', () => {
       const context = detectCurrentContext();
       socket.emit('spotify:moods', {
-        moods: MOOD_STATES.map(({ key, name, emoji, desc }) => ({ key, name, emoji, desc })),
+        moods: MOOD_STATES.map(({ key, name, emoji, desc, feeling }) => ({ key, name, emoji, desc, feeling })),
         activeMoodKey: _activeMoodKey,
         activeVibeKey: _activeVibeKey,
         context,
@@ -3047,6 +3011,7 @@ function init(io) {
         // Use the vibe key from right-now to enable continuous mode
         _activeVibeKey = rn.vibeKey || null;
         _activeMoodKey = null;
+        _activeFeeling = null;
         let pool = [...rn.topTracks].sort(() => Math.random() - 0.5).slice(0, 25);
         if (_flowMode) pool = flowOrder(pool);
         let queued = 0;
