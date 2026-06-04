@@ -24,6 +24,8 @@ import {
   playNow,
   playFilter,
   getFilterCount,
+  setSpotifyAutoplay,
+  setSpotifySmartShuffle,
 } from './spotify-client.js';
 import { socket } from './socket.js';
 
@@ -661,11 +663,11 @@ function renderSpotifyPlayer(ctrl) {
 
   function _applyAutoplayState() {
     autoplayBtn.classList.toggle('active', _autoplay);
-    spotifyCmd('set_autoplay', { enabled: _autoplay });
+    setSpotifyAutoplay(_autoplay);
   }
   function _applySmartShuffleState() {
     smartShuffleBtn.classList.toggle('active', _smartShuffle);
-    spotifyCmd('set_smart_shuffle', { enabled: _smartShuffle });
+    setSpotifySmartShuffle(_smartShuffle);
   }
 
   // Sync state to server on card init and on every reconnect

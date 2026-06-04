@@ -291,8 +291,9 @@ def get_output_devices():
         return []
 
 
-# Track active soundboard streams so we can stop them
-_active_streams: list = []
+# Track active soundboard playback so we can stop them.
+# Each entry is a threading.Event; the write loop checks it and exits early when set.
+_active_stop_events: list = []
 _active_streams_lock = threading.Lock()
 
 def _find_device_index(device: str):
@@ -344,23 +345,37 @@ def play_sound(file_path: str, device=None, volume: float = 1.0):
 
     device_idx = _find_device_index(device) if device else None
 
+    stop_event = threading.Event()
+
     def _run():
-        stream = sd.OutputStream(
-            samplerate=samplerate,
-            channels=data.shape[1],
-            dtype='float32',
-            device=device_idx,
-        )
-        with _active_streams_lock:
-            _active_streams.append(stream)
+        try:
+            stream = sd.OutputStream(
+                samplerate=samplerate,
+                channels=data.shape[1],
+                dtype='float32',
+                device=device_idx,
+            )
+        except Exception as e:
+            log.error("Soundboard: failed to open OutputStream: %s", e)
+            with _active_streams_lock:
+                try: _active_stop_events.remove(stop_event)
+                except ValueError: pass
+            return
+
         try:
             stream.start()
             chunk = 1024
             offset = 0
-            while offset < len(data):
+            while offset < len(data) and not stop_event.is_set():
                 block = data[offset:offset + chunk]
-                stream.write(block)
+                try:
+                    stream.write(block)
+                except Exception as e:
+                    log.warning("Soundboard: stream write error (stopping): %s", e)
+                    break
                 offset += chunk
+        except Exception as e:
+            log.warning("Soundboard: playback error: %s", e)
         finally:
             try:
                 stream.stop()
@@ -368,26 +383,21 @@ def play_sound(file_path: str, device=None, volume: float = 1.0):
             except Exception:
                 pass
             with _active_streams_lock:
-                try:
-                    _active_streams.remove(stream)
-                except ValueError:
-                    pass
+                try: _active_stop_events.remove(stop_event)
+                except ValueError: pass
+
+    with _active_streams_lock:
+        _active_stop_events.append(stop_event)
 
     threading.Thread(target=_run, daemon=True).start()
 
 
 def stop_all_sounds():
-    """Stop all currently playing soundboard streams."""
+    """Stop all currently playing soundboard sounds."""
     with _active_streams_lock:
-        streams = list(_active_streams)
-    for stream in streams:
-        try:
-            stream.abort()
-            stream.close()
-        except Exception:
-            pass
-    with _active_streams_lock:
-        _active_streams.clear()
+        events = list(_active_stop_events)
+    for ev in events:
+        ev.set()
 
 
 def resolve_desktop_icon(target: str):
