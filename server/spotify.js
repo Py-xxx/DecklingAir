@@ -55,7 +55,11 @@ const TRACK_FEATURES_FILE = path.join(__dirname, 'data', 'track-features.json');
 const LIVE_STATE_FILE    = path.join(__dirname, 'data', 'live-session.json');
 
 const SESSION_PRUNE_DAYS       = 90;
-const CONTINUOUS_REFILL_THRESHOLD = 3;  // refill queue when fewer than this many tracks remain
+// Unified queue cap: every auto-queue feature (mood, vibe, feeling, autoplay,
+// smart shuffle) keeps at most this many tracks staged upcoming. We top the
+// queue back up to this target whenever it drops below it.
+const QUEUE_TARGET                = 5;  // max upcoming tracks staged at any time
+const CONTINUOUS_REFILL_THRESHOLD = QUEUE_TARGET; // refill queue when fewer than this many tracks remain
 const CHECKIN_SEED_COUNT          = 8;  // initial kickstart queue right after a check-in is answered
 
 // ── Engagement / adaptive listening ──────────────────────────────────────────
@@ -144,6 +148,7 @@ let _lastProgress   = null;
 let _reconcileTimer = null;
 let _statsBroadcastTick = 0; // counter to throttle periodic stats broadcasts
 let _liveSaveTick       = 0; // counter to throttle live-session snapshots to disk
+let _queueCheckTick     = 0; // counter to throttle mid-song queue top-up checks
 
 let _history        = [];   // all-time log entries, loaded from file on start
 let _seededHistory  = [];   // in-memory only: entries seeded from Spotify API
@@ -1054,6 +1059,57 @@ async function _queueTrack(t) {
   return true;
 }
 
+// Clear whatever is currently queued and start fresh playback with `tracks`.
+// Spotify has no clear-queue endpoint, so starting a new uris context is the
+// reliable way to discard the old (now-irrelevant) queue. Used when switching
+// vibe / mood / "right now" — the previous queue no longer applies.
+async function playFresh(tracks) {
+  let list = (tracks || []).filter(t => t && (t.uri || t.id));
+  if (!list.length) return 0;
+  // Stage the first track to play now + up to QUEUE_TARGET upcoming, so the
+  // queue never starts out longer than the cap. Refill tops it up later.
+  list = list.slice(0, QUEUE_TARGET + 1);
+  const uris = list.map(t => t.uri || `spotify:track:${t.id}`);
+  await play({ uris });
+  for (const t of list) {
+    const id = t.id || (t.uri && t.uri.startsWith('spotify:track:') ? t.uri.split(':').pop() : null);
+    if (id) _sessionTrackIds.add(id);
+  }
+  return list.length;
+}
+
+// Put a track at the TOP of the queue (i.e. play it next, right after the
+// current song). Spotify's /queue endpoint only appends to the end and there's
+// no reorder API, so we rebuild the upcoming queue with the new track first and
+// re-issue playback — resuming the current track at its current position.
+async function queueOnTop(uri) {
+  if (!uri) return false;
+  let currentUri = null, progressMs = 0, upcoming = [];
+  try {
+    const st = await getPlaybackState();
+    currentUri = st?.item?.uri || null;
+    progressMs = st?.progress_ms || 0;
+  } catch { /* no active playback */ }
+  try {
+    const q = await getQueue();
+    upcoming = (q?.queue || []).map(t => t && t.uri).filter(Boolean);
+  } catch { /* queue unavailable */ }
+
+  // Avoid duplicating the track if it's already somewhere downstream
+  upcoming = upcoming.filter(u => u !== uri && u !== currentUri);
+
+  if (currentUri) {
+    // Keep the current song playing where it is, slot the new track in next.
+    await play({ uris: [currentUri, uri, ...upcoming], positionMs: progressMs });
+  } else {
+    // Nothing playing — just start with the new track at the front.
+    await play({ uris: [uri, ...upcoming] });
+  }
+  const id = uri.startsWith('spotify:track:') ? uri.split(':').pop() : null;
+  if (id) _sessionTrackIds.add(id);
+  return true;
+}
+
 // Drop any tracks already played or queued during this session.
 function _excludePlayed(tracks) {
   return (tracks || []).filter(t => t && t.id && !_sessionTrackIds.has(t.id));
@@ -1797,18 +1853,31 @@ function isAuthed() {
 
 async function maybeQueueRecommendations(state) {
   if (!_autoplayEnabled) return;
-  if (_autoQueueCount >= AUTOPLAY_MIN_QUEUE) return;
   if (!state || !state.track) return;
+  // Don't double up with a mood/vibe/feeling refill — that path owns the queue.
+  if (_activeMoodKey || _activeVibeKey || _activeFeeling) return;
+
+  // Only top the queue up to the shared cap (never overshoot QUEUE_TARGET).
+  let queueLength = 0;
+  try {
+    const queueData = await getQueue();
+    queueLength = queueData?.queue?.length || 0;
+  } catch { /* queue unavailable — assume empty */ }
+  const gap = QUEUE_TARGET - queueLength;
+  if (gap <= 0) return;
 
   const seedTracks  = [state.track.id].filter(Boolean);
   const seedArtists = (state.track.artistIds || []).slice(0, 2);
 
   try {
-    const tracks = _excludePlayed(await getSimilarTracks(seedTracks, seedArtists, 8));
-    for (const track of tracks.slice(0, 5)) {
+    const tracks = _excludePlayed(await getSimilarTracks(seedTracks, seedArtists, gap + 3));
+    let added = 0;
+    for (const track of tracks) {
+      if (added >= gap) break;
       try {
         await _queueTrack(track);
         _autoQueueCount++;
+        added++;
       } catch (err) {
         console.error('[Spotify] Failed to queue autoplay track:', err.message);
       }
@@ -2444,9 +2513,10 @@ async function maybeRefillContinuousQueue(state) {
   try {
     const queueData = await getQueue();
     const queueLength = queueData?.queue?.length || 0;
-    if (queueLength >= CONTINUOUS_REFILL_THRESHOLD) return;
+    if (queueLength >= QUEUE_TARGET) return;
 
-    const refillCount = _tLookahead();
+    // Only add enough to reach the cap (never overshoot QUEUE_TARGET).
+    const refillCount = QUEUE_TARGET - queueLength;
     let tracks;
     if (_activeFeeling) {
       // Feeling is the baseline, but go with the flow: blend in the tracks the user is
@@ -2463,6 +2533,7 @@ async function maybeRefillContinuousQueue(state) {
 
     let added = 0;
     for (const t of _excludeDisliked(_excludePlayed(tracks))) {
+      if (added >= refillCount) break; // never push past the cap
       try {
         await _queueTrack(t);
         added++;
@@ -2878,6 +2949,29 @@ async function poll() {
       saveLiveState();
     }
 
+    // Mid-song queue maintenance: roughly twice per song (every 8 polls = 40 s)
+    // re-check the queue depth and top it back up to QUEUE_TARGET if it has
+    // drained — covers mood/vibe/feeling refills and autoplay alike. Both
+    // helpers are gap-based and early-return when their mode is inactive or the
+    // queue is already full, so this is cheap when nothing needs topping up.
+    if (state?.isPlaying && (_activeMoodKey || _activeVibeKey || _activeFeeling || _autoplayEnabled)) {
+      _queueCheckTick++;
+      if (_queueCheckTick >= 8) { // 8 × 5 s = 40 s
+        _queueCheckTick = 0;
+        if (_activeMoodKey || _activeVibeKey || _activeFeeling) {
+          maybeRefillContinuousQueue(state).catch((err) =>
+            console.error('[Spotify] Queue top-up error:', err.message)
+          );
+        } else if (_autoplayEnabled) {
+          maybeQueueRecommendations(state).catch((err) =>
+            console.error('[Spotify] Autoplay top-up error:', err.message)
+          );
+        }
+      }
+    } else {
+      _queueCheckTick = 0;
+    }
+
     if (_io) {
       _io.emit('spotify:state', state);
       // Broadcast updated stats every ~30 s while playing so the time tiles stay fresh
@@ -3052,8 +3146,10 @@ function init(io) {
             break;
 
           case 'queue_add':
-            // Manual add — honour it, but record it so auto-queue methods don't duplicate it
-            await _queueTrack({ uri: args.uri, id: typeof args.uri === 'string' && args.uri.startsWith('spotify:track:') ? args.uri.split(':').pop() : undefined });
+            // Manual add from search — put it at the TOP (play next), not buried
+            // behind auto-queued tracks. _sessionTrackIds is updated inside.
+            await queueOnTop(args.uri);
+            setTimeout(emitQueue, 1500);
             break;
 
           case 'like':
@@ -3401,7 +3497,7 @@ function init(io) {
     // ----- spotify:play_vibe -----
     socket.on('spotify:play_vibe', async ({ key } = {}) => {
       try {
-        const tracks = await buildVibePlaylist(key, 25);
+        const tracks = await buildVibePlaylist(key, QUEUE_TARGET + 3);
         if (!tracks.length) {
           socket.emit('spotify:insights_action', { ok: false, msg: 'Not enough data for this vibe' });
           return;
@@ -3409,17 +3505,12 @@ function init(io) {
         _activeVibeKey = key;
         _activeMoodKey = null;
         _activeFeeling = null;
-        let queued = 0;
-        for (const t of tracks) {
-          try {
-            await _queueTrack(t);
-            queued++;
-            await new Promise(r => setTimeout(r, 120));
-          } catch { /* skip unplayable */ }
-        }
+        // Old queue no longer applies — clear it and start the vibe fresh.
+        const queued = await playFresh(tracks);
         const label = getVibeName(key);
-        socket.emit('spotify:insights_action', { ok: true, msg: `Queued ${queued} tracks · "${label}" · keeps going ∞` });
+        socket.emit('spotify:insights_action', { ok: true, msg: `Playing ${queued} tracks · "${label}" · keeps going ∞` });
         _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: key });
+        setTimeout(emitQueue, 1500);
       } catch (err) {
         socket.emit('spotify:insights_action', { ok: false, msg: err.message });
       }
@@ -3430,7 +3521,7 @@ function init(io) {
       try {
         const mood = MOOD_STATES.find(m => m.key === key);
         if (!mood) return;
-        const tracks = await buildMoodPlaylist(key, 25);
+        const tracks = await buildMoodPlaylist(key, QUEUE_TARGET + 3);
         if (!tracks.length) {
           socket.emit('spotify:insights_action', { ok: false, msg: 'Not enough history for this mood yet' });
           return;
@@ -3438,16 +3529,11 @@ function init(io) {
         _activeMoodKey = key;
         _activeVibeKey = null;
         _activeFeeling = null;
-        let queued = 0;
-        for (const t of tracks) {
-          try {
-            await _queueTrack(t);
-            queued++;
-            await new Promise(r => setTimeout(r, 120));
-          } catch { /* skip unplayable */ }
-        }
-        socket.emit('spotify:insights_action', { ok: true, msg: `Queued ${queued} tracks · "${mood.name}" · keeps going ∞` });
+        // Old queue no longer applies — clear it and start the mood fresh.
+        const queued = await playFresh(tracks);
+        socket.emit('spotify:insights_action', { ok: true, msg: `Playing ${queued} tracks · "${mood.name}" · keeps going ∞` });
         _io.emit('spotify:continuous_state', { activeMoodKey: key, activeVibeKey: null });
+        setTimeout(emitQueue, 1500);
       } catch (err) {
         socket.emit('spotify:insights_action', { ok: false, msg: err.message });
       }
@@ -3598,15 +3684,13 @@ function init(io) {
         _activeVibeKey = rn.vibeKey || null;
         _activeMoodKey = null;
         _activeFeeling = null;
-        let pool = _excludePlayed([...rn.topTracks]).sort(() => Math.random() - 0.5).slice(0, 25);
+        let pool = _excludePlayed([...rn.topTracks]).sort(() => Math.random() - 0.5).slice(0, QUEUE_TARGET + 3);
         if (_tFlowOn()) pool = flowOrder(pool);
-        let queued = 0;
-        for (const t of pool) {
-          try { await _queueTrack(t); queued++; await new Promise(r => setTimeout(r, 120)); }
-          catch { /* skip */ }
-        }
-        socket.emit('spotify:insights_action', { ok: true, msg: `Queued ${queued} tracks for right now · keeps going ∞` });
+        // Old queue no longer applies — clear it and start "right now" fresh.
+        const queued = await playFresh(pool);
+        socket.emit('spotify:insights_action', { ok: true, msg: `Playing ${queued} tracks for right now · keeps going ∞` });
         _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: _activeVibeKey });
+        setTimeout(emitQueue, 1500);
       } catch (err) {
         socket.emit('spotify:insights_action', { ok: false, msg: err.message });
       }
