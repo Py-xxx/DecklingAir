@@ -201,6 +201,7 @@ function _markPlayed(id) {
 // refill, and rebuildUpcoming drops anything not in here — so autoplay can't masquerade as
 // a full queue and starve the refill, and its picks get evicted on the next rebuild.
 let _stagedUris = new Set();
+let _refillFullLoggedAt = 0; // throttle for the "queue full" refill log
 function _setStaged(uris) { _stagedUris = new Set((uris || []).filter(Boolean)); }
 function _addStaged(uris) { for (const u of (uris || [])) if (u) _stagedUris.add(u); }
 
@@ -1064,7 +1065,11 @@ async function api(method, endpoint, opts = {}) {
 
   const body = opts.body ? JSON.stringify(opts.body) : undefined;
 
-  console.log(`[Spotify] ${method} ${urlStr.replace(SPOTIFY_API, '')}`);
+  // Quiet the two endpoints the 5 s poll hits every cycle — they otherwise bury
+  // every meaningful log (refill decisions, queue rebuilds, discovery) in noise.
+  const _short = urlStr.replace(SPOTIFY_API, '');
+  const _noisy = method === 'GET' && (_short === '/me/player' || _short.startsWith('/me/player/queue'));
+  if (!_noisy) console.log(`[Spotify] ${method} ${_short}`);
 
   return httpsRequest(method, urlStr, { headers, body });
 }
@@ -2969,19 +2974,34 @@ function _updateCluster(histEntry) {
 
 async function maybeRefillContinuousQueue(state) {
   if (!_activeMoodKey && !_activeVibeKey && !_activeFeeling) return;
+  const label = _activeFeeling?.label || _activeMoodKey || _activeVibeKey;
   try {
     const queueData = await getQueue();
+    const rawLen = queueData?.queue?.length || 0;
     // Count only the tracks WE staged. Spotify Autoplay quietly appends its own
-    // recommendations to our finite uris-context, so the raw queue length stays
+    // recommendations to our finite uris-context, so the raw queue length can stay
     // ≥ QUEUE_TARGET forever and would permanently short-circuit the refill (the
     // user then hears autoplay's picks, not the vibe, and the cluster — fed by our
     // feature-bearing tracks — appears frozen). Gating on OUR upcoming count fixes both.
     const ours = (queueData?.queue || []).filter(t => t?.uri && _stagedUris.has(t.uri)).length;
-    if (ours >= QUEUE_TARGET) return;
+    if (ours >= QUEUE_TARGET) {
+      // Already full of our tracks — nothing to do. Log occasionally (≤ every 30 s) so
+      // a "stuck full" state is visible without spamming.
+      const now = Date.now();
+      if (now - _refillFullLoggedAt > 30000) {
+        _refillFullLoggedAt = now;
+        console.log(`[Spotify] Refill: queue full — ${ours}/${QUEUE_TARGET} ours (raw=${rawLen}, staged=${_stagedUris.size}) (${label})`);
+      }
+      return;
+    }
 
-    // Build a small over-fetch; rebuildUpcoming() only stages enough to reach
-    // the cap and skips dupes. Over-fetch covers disliked/already-played drops.
-    const refillCount = (QUEUE_TARGET - ours) + 3;
+    const need = QUEUE_TARGET - ours;
+    console.log(`[Spotify] Refill: ${ours}/${QUEUE_TARGET} ours in queue (raw=${rawLen}, staged=${_stagedUris.size}) — need ${need} more (${label})`);
+
+    // Over-fetch so disliked/already-played drops still leave enough to reach the cap.
+    const refillCount = need + 3;
+
+    // 1) Primary source: the active vibe / mood / feeling pool.
     let tracks;
     if (_activeFeeling) {
       // Feeling is the baseline, but go with the flow: blend in the tracks the user is
@@ -2995,25 +3015,35 @@ async function maybeRefillContinuousQueue(state) {
     } else {
       tracks = await buildVibePlaylist(_activeVibeKey, refillCount);
     }
+    tracks = tracks || [];
 
-    // buildXPlaylist already drops session-played tracks internally, so in a
-    // long session it can come back empty. Fall back to similar tracks (and
-    // ultimately the user's top tracks) so the queue never runs dry.
-    if (!tracks || !tracks.length) {
+    // 2) Prefer genuinely fresh (unplayed, undisliked) tracks.
+    let fresh = _excludeDisliked(_excludePlayed(tracks));
+
+    // 3) If the vibe pool can't supply enough NEW tracks — a small or already-exhausted
+    //    cluster will keep returning the same played songs — pull from similar / the
+    //    user's top tracks so the queue still reaches the cap with new material. (The old
+    //    code only did this when the builder returned *empty*; an exhausted cluster
+    //    returns played replays instead, so we never got here and the queue starved.)
+    if (fresh.length < need) {
       const seed = state?.track?.id ? [state.track.id] : [];
-      tracks = await getSimilarTracks(seed, [], refillCount + 5).catch(() => []);
+      const more = await getSimilarTracks(seed, [], need + 8).catch(() => []);
+      const moreFresh = _excludeDisliked(_excludePlayed(more));
+      const seen = new Set(fresh.map(t => t && t.id).filter(Boolean));
+      for (const t of moreFresh) {
+        if (t && t.id && !seen.has(t.id)) { fresh.push(t); seen.add(t.id); }
+      }
     }
 
-    // Prefer fresh, undisliked tracks; but never starve the queue. If exclusions
-    // empty the pool (long session, top-tracks fallback exhausted), relax them
-    // step by step so the music keeps going rather than stopping dead.
-    let fresh = _excludeDisliked(_excludePlayed(tracks));
-    if (!fresh.length) fresh = _excludeDisliked(tracks); // allow replays, still avoid disliked
-    if (!fresh.length) fresh = tracks;                   // last resort: anything playable
+    // 4) Never starve: if everything's been played, relax step by step so the music
+    //    keeps going (allow replays, then anything playable) rather than stopping dead.
+    if (!fresh.length) fresh = _excludeDisliked(tracks);
+    if (!fresh.length) fresh = tracks;
+
     // Stage via context rebuild (no addToQueue) so the queue stays clearable.
     const added = await rebuildUpcoming(fresh);
-    const label = _activeFeeling?.label || _activeMoodKey || _activeVibeKey;
-    if (added > 0) console.log(`[Spotify] Continuous refill +${added} tracks (${label})`);
+    if (added > 0) console.log(`[Spotify] Continuous refill +${added} tracks (${label}) → queue now full`);
+    else console.log(`[Spotify] Refill: nothing new to stage — pool exhausted for ${label} (had ${fresh.length} candidates, all already queued/played)`);
   } catch (err) {
     console.error('[Spotify] Continuous refill error:', err.message);
   }
