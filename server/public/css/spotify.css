@@ -2622,6 +2622,18 @@
   font-weight: 600;
   color: var(--text, #fff);
 }
+.sp-intel-autoprofile {
+  margin-top: 3px;
+  font-size: 10px;
+  line-height: 1.35;
+  color: var(--text-3, #888);
+  text-transform: none;
+  letter-spacing: 0;
+}
+.sp-intel-autoprofile strong {
+  color: var(--text-2, #bbb);
+  font-weight: 600;
+}
 .sp-intel-cluster {
   display: flex;
   flex-direction: column;

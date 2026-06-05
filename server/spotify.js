@@ -219,6 +219,17 @@ let _recentLikes   = [];
 let _artistTaste   = new Map();
 let _trackDislikes = new Map();
 
+// ── Transition learning (Feature 6) ───────────────────────────────────────────
+// _transitions: "fromId>toId" → net score. A transition that survives (the next
+// track gets an engaged listen) nudges the pair positive; a skip nudges it
+// negative. flowOrder reads this so sequencing learns the user's actual taste in
+// what-follows-what, not just harmonic mixing. PERSISTED across sessions.
+let _transitions     = new Map();
+let _transitionPrevId = null;    // id of the track that played immediately before the current one
+const TRANSITION_KEY = (from, to) => `${from}>${to}`;
+const TRANSITION_CLAMP = 5;      // bound each pair so one outlier can't dominate
+const TRANSITION_WEIGHT = 0.20;  // how much a learned transition can shift a flow score
+
 // ── Cluster & feeling detection ───────────────────────────────────────────────
 let _currentCluster    = [];     // tracks in the current emerging cluster (with features)
 let _currentCentroid   = null;   // { energy, valence, bpm } mean of _currentCluster
@@ -330,7 +341,10 @@ function loadTasteProfile() {
     for (const [k, v] of Object.entries(obj.trackDislikes || {})) {
       if (typeof v === 'number') _trackDislikes.set(k, v);
     }
-    console.log(`[Spotify] Loaded taste profile — ${_artistTaste.size} artists, ${_trackDislikes.size} disliked tracks`);
+    for (const [k, v] of Object.entries(obj.transitions || {})) {
+      if (typeof v === 'number') _transitions.set(k, v);
+    }
+    console.log(`[Spotify] Loaded taste profile — ${_artistTaste.size} artists, ${_trackDislikes.size} disliked tracks, ${_transitions.size} transitions`);
   } catch (err) {
     console.error('[Spotify] loadTasteProfile error:', err.message);
   }
@@ -343,6 +357,7 @@ function saveTasteProfile() {
     const obj = {
       artistScores:  Object.fromEntries(_artistTaste),
       trackDislikes: Object.fromEntries(_trackDislikes),
+      transitions:   Object.fromEntries(_transitions),
     };
     fs.writeFileSync(TASTE_PROFILE_FILE, JSON.stringify(obj, null, 2));
   } catch (err) {
@@ -664,6 +679,7 @@ function resetSessionState() {
   _sessionTrackIds  = new Set();
   _recentLikes      = [];
   _stagedUris       = new Set();
+  _transitionPrevId = null;   // new session = no prior track to chain a transition from
   // Durable taste (artist scores + track dislikes) intentionally survives a reset —
   // it's a long-term profile, not session state.
   // Stop any running continuous engine — otherwise it keeps refilling from the old
@@ -1341,7 +1357,19 @@ async function rebuildUpcoming(freshTracks) {
   // recommendations to our finite uris-context; if we preserved them they'd
   // perpetuate (and crowd out the vibe). Dropping them here means the rebuilt
   // context replaces autoplay's tail with our tracks.
-  upcoming = upcoming.filter(u => _stagedUris.has(u));
+  // Keep only DISTINCT staged tracks. `_stagedUris` already excludes anything
+  // consumed (a track is dropped from it the moment it becomes current — see
+  // poll), so this preserves just the genuinely-upcoming staged tracks while
+  // collapsing the duplicates Spotify's looped look-ahead introduces.
+  {
+    const kept = [], seen = new Set();
+    for (const u of upcoming) {
+      if (!u || !_stagedUris.has(u) || seen.has(u)) continue;
+      seen.add(u);
+      kept.push(u);
+    }
+    upcoming = kept;
+  }
   // Only keep as many existing upcoming as the cap allows.
   upcoming = upcoming.slice(0, QUEUE_TARGET);
 
@@ -1444,6 +1472,26 @@ function _pushRecentLike(t) {
 //                            (artist only avoided once net hits a strong pattern)
 //   • 15–50%               → didn't fit the vibe → neutral (no like, no penalty)
 //   • 50–80%               → heard most of it → mild like
+// Record how a song→song transition fared. delta > 0 = the landing track earned
+// an engaged listen (the transition "survived"); delta < 0 = it got skipped.
+function _recordTransition(fromId, toId, delta) {
+  if (!fromId || !toId || fromId === toId) return;
+  const key = TRANSITION_KEY(fromId, toId);
+  const next = Math.max(-TRANSITION_CLAMP, Math.min(TRANSITION_CLAMP, (_transitions.get(key) || 0) + delta));
+  if (next === 0) _transitions.delete(key);
+  else _transitions.set(key, next);
+  _scheduleTasteSave();
+}
+
+// Learned bias for placing track b right after track a: maps the clamped net
+// score into roughly [-1, 1] so it can shift a flow score by ±TRANSITION_WEIGHT.
+function _transitionBias(a, b) {
+  if (!a || !b || !a.id || !b.id) return 0;
+  const v = _transitions.get(TRANSITION_KEY(a.id, b.id));
+  if (!v) return 0;
+  return v / TRANSITION_CLAMP;
+}
+
 function _evaluateEngagement(prev) {
   if (!prev || !prev.track || !prev.track.id || !prev.isPlaying) return;
   const dur = prev.track.duration;
@@ -1458,15 +1506,21 @@ function _evaluateEngagement(prev) {
     energy: feat.energy, valence: feat.valence, bpm: feat.bpm,
   } : null;
 
+  // The previous-to-this transition survived/failed based on how this track fared.
+  const _prevId = _transitionPrevId;
+  _transitionPrevId = prev.track.id;
+
   if (finished || frac >= _tSkipSoft()) {
     if (likeRec) _pushRecentLike(likeRec);
     _adjustArtistScore(prev.track.artist, +1);   // engaged listen recovers the artist
     _recoverTrackDislike(prev.track.id);          // a full listen forgives a past skip
+    _recordTransition(_prevId, prev.track.id, +1); // this sequencing worked — reinforce it
     return;
   }
   if (frac < _tSkipStrong()) {
     _bumpTrackDislike(prev.track.id);            // repeated skips → durable soft-ban
     _adjustArtistScore(prev.track.artist, -1);
+    _recordTransition(_prevId, prev.track.id, -1); // landing here got skipped — avoid the sequence
     const banned  = _trackSoftBanned(prev.track.id);
     const avoided = _artistAvoided(prev.track.artist);
     console.log(`[Spotify] Engagement: strong dislike (${Math.round(frac * 100)}%) "${prev.track.title}"${banned ? ' — now soft-banned' : ''}${avoided ? ` — pattern detected, now avoiding ${prev.track.artist}` : ''}`);
@@ -1961,6 +2015,95 @@ function _knownTrackIdSet() {
 // batch from turning into "5 songs by the same guy in a row".
 const DISCOVERY_MAX_PER_ARTIST = 2;
 
+// ── Artist deep cuts via discography ─────────────────────────────────────────
+// The old approach searched artist:"X" with a random offset, which only ever
+// surfaces whatever Spotify's relevance ranking floats up — usually still the
+// hits, and capped at offset ~950. Walking the artist's actual discography
+// (/artists/{id}/albums → /albums/{id}/tracks) gives genuine deep cuts: album
+// tracks, B-sides, and — via include_groups=appears_on — guest features you'd
+// never reach from a track search.
+const _artistIdCache = new Map();   // lowercase name → { id, ts }
+const _artistAlbumCache = new Map(); // artistId → { albumIds, ts }
+const ARTIST_CACHE_TTL = 24 * 60 * 60 * 1000; // discographies barely change — cache a day
+
+async function _resolveArtistId(name) {
+  const key = (name || '').toLowerCase().trim();
+  if (!key) return null;
+  const cached = _artistIdCache.get(key);
+  if (cached && Date.now() - cached.ts < ARTIST_CACHE_TTL) return cached.id;
+  let id = null;
+  try {
+    const res = await search(`artist:"${key.replace(/"/g, '')}"`, 'artist', 1);
+    const items = res?.artists?.items || [];
+    // Prefer an exact name match; fall back to the top hit.
+    const exact = items.find(a => (a?.name || '').toLowerCase() === key);
+    id = (exact || items[0])?.id || null;
+  } catch { /* search miss */ }
+  _artistIdCache.set(key, { id, ts: Date.now() });
+  return id;
+}
+
+async function _getArtistAlbumIds(artistId) {
+  if (!artistId) return [];
+  const cached = _artistAlbumCache.get(artistId);
+  if (cached && Date.now() - cached.ts < ARTIST_CACHE_TTL) return cached.albumIds;
+  const albumIds = [];
+  try {
+    // include_groups: full albums + singles for deep cuts/B-sides, plus appears_on
+    // for guest features. Compilations skipped — they're mostly the hits.
+    let url = '/artists/' + artistId + '/albums';
+    let params = { include_groups: 'album,single,appears_on', limit: 50 };
+    for (let page = 0; page < 4; page++) { // up to 200 albums — plenty
+      const data = await api('GET', url, { params });
+      for (const al of (data?.items || [])) if (al?.id) albumIds.push(al.id);
+      if (!data?.next) break;
+      params = { ...params, offset: albumIds.length };
+    }
+  } catch { /* artist albums unavailable */ }
+  _artistAlbumCache.set(artistId, { albumIds, ts: Date.now() });
+  return albumIds;
+}
+
+// Pull genuine deep cuts for one artist by walking their discography. Returns
+// serialized tracks (by this artist), excluding anything in excludeIds, capped
+// per-album so one record doesn't dominate, shuffled so picks vary run to run.
+async function getArtistDeepCuts(artistName, excludeIds = new Set(), limit = 6) {
+  const primary = (artistName || '').split(',')[0].trim();
+  const artistId = await _resolveArtistId(primary);
+  if (!artistId) return [];
+  const albumIds = await _getArtistAlbumIds(artistId);
+  if (!albumIds.length) return [];
+
+  const _shuffle = (a) => a.map(x => [Math.random(), x]).sort((p, q) => p[0] - q[0]).map(([, x]) => x);
+  const out  = [];
+  const seen = new Set(excludeIds);
+  const wantName = primary.toLowerCase();
+
+  // Visit a random handful of albums; take a couple of tracks from each.
+  for (const albumId of _shuffle(albumIds).slice(0, 8)) {
+    if (out.length >= limit) break;
+    let items = [];
+    try {
+      const data = await api('GET', `/albums/${albumId}/tracks`, { params: { limit: 50 } });
+      items = data?.items || [];
+    } catch { continue; }
+    let takenFromAlbum = 0;
+    for (const raw of _shuffle(items)) {
+      if (out.length >= limit || takenFromAlbum >= 2) break;
+      const t = serializeTrack(raw);
+      if (!t || !t.id || seen.has(t.id)) continue;
+      // appears_on albums contain other artists' tracks — keep only those the
+      // seed artist is actually credited on (deep features), drop the rest.
+      const credited = (raw.artists || []).some(a => (a?.name || '').toLowerCase() === wantName);
+      if (!credited) continue;
+      seen.add(t.id);
+      out.push(t);
+      takenFromAlbum++;
+    }
+  }
+  return out.slice(0, limit);
+}
+
 // Find tracks the user almost certainly hasn't heard, via search.
 //   seedArtistNames — artist names from what they're currently enjoying
 //   excludeIds      — ids to skip (known history + session-played)
@@ -1985,16 +2128,25 @@ async function getDiscoveryTracks(seedArtistNames = [], excludeIds = new Set(), 
     }
   };
 
-  // 1) Deeper cuts from artists the user is into (songs they likely don't own/save).
-  //    A random search offset surfaces less-obvious tracks and varies the picks
-  //    from session to session instead of always returning the same top hits.
+  // 1) Genuine deep cuts from artists the user is into — walk their actual
+  //    discography (albums → album tracks → guest features) instead of a hits
+  //    search. Surfaces B-sides and features a relevance-ranked track search
+  //    would never reach. pushNew already serializes, so feed it raw items.
   const artists = _shuffle([...new Set(seedArtistNames.filter(Boolean))]).slice(0, 3);
   for (const name of artists) {
     if (out.length >= limit) break;
     try {
-      const offset = Math.floor(Math.random() * 30); // dig past the obvious hits
-      const res = await search(`artist:"${name.replace(/"/g, '')}"`, 'track', 10, offset);
-      pushNew(res?.tracks?.items || []);
+      const cuts = await getArtistDeepCuts(name, seen, limit - out.length);
+      // getArtistDeepCuts returns already-serialized tracks; merge respecting caps.
+      for (const t of cuts) {
+        if (out.length >= limit) break;
+        if (!t || !t.id || seen.has(t.id)) continue;
+        const ak = _artistKey(t);
+        if ((artistCount.get(ak) || 0) >= DISCOVERY_MAX_PER_ARTIST) continue;
+        seen.add(t.id);
+        artistCount.set(ak, (artistCount.get(ak) || 0) + 1);
+        out.push(t);
+      }
     } catch { /* keep going */ }
   }
 
@@ -2285,6 +2437,10 @@ async function maybeQueueRecommendations(state) {
     // queue run dry and playback stop.
     let tracks = _excludePlayed(raw);
     if (!tracks.length) tracks = raw;
+    // Nothing is explicitly chosen here, so lean into the current time-of-day's
+    // learned profile: drift candidates that match this slot's typical energy/valence
+    // to the front before staging.
+    tracks = _applyContextBias(tracks);
     // Stage via context rebuild (no addToQueue) so the queue stays clearable.
     const added = await rebuildUpcoming(tracks);
     _autoQueueCount += added;
@@ -2483,9 +2639,14 @@ function _energyScore(eA, eB) {
 }
 
 function _trackFlowScore(a, b) {
-  return _camelotScore(a._cam, b._cam) * 0.35 +
-         _bpmScore(a.bpm, b.bpm)        * 0.35 +
-         _energyScore(a.energy, b.energy) * 0.30;
+  // Harmonic/BPM/energy smoothness, then nudged by what we've learned actually
+  // survives in sequence (Feature 6). The transition term can only shift the
+  // base score by ±TRANSITION_WEIGHT, so learning refines but never overrides
+  // harmonic mixing.
+  const base = _camelotScore(a._cam, b._cam) * 0.35 +
+               _bpmScore(a.bpm, b.bpm)        * 0.35 +
+               _energyScore(a.energy, b.energy) * 0.30;
+  return base + _transitionBias(a, b) * TRANSITION_WEIGHT;
 }
 
 // Greedy nearest-neighbour ordering for harmonic, BPM-smooth, energy-smooth playlists.
@@ -2729,19 +2890,95 @@ async function _buildDiscovery(seedIds, seedArtists, count) {
 // Context detection & mood suggestion
 // ---------------------------------------------------------------------------
 
+// Map an hour-of-day to a named slot. Shared by detectCurrentContext and the
+// per-context profile builder so the buckets always line up.
+function _timeSlotFor(h) {
+  if      (h >= 0  && h < 4)  return 'latenight';
+  else if (h >= 4  && h < 8)  return 'earlyam';
+  else if (h >= 8  && h < 11) return 'morning';
+  else if (h >= 11 && h < 14) return 'midday';
+  else if (h >= 14 && h < 18) return 'afternoon';
+  else if (h >= 18 && h < 21) return 'evening';
+  return 'night';
+}
+
+const SLOT_LABELS = {
+  latenight: 'late nights', earlyam: 'early mornings', morning: 'mornings',
+  midday: 'middays', afternoon: 'afternoons', evening: 'evenings', night: 'nights',
+};
+
+// ── Context-aware auto-profiles ──────────────────────────────────────────────
+// The history is timestamped (hour + day-of-week), so we can learn what each
+// time-of-day actually sounds like — "weekday mornings = chill", "Friday nights
+// = hype" — and lean recommendations toward the current slot when nothing is
+// explicitly chosen. Profiles are bucketed by (weekday|weekend)+slot, with a
+// slot-only fallback for thin data, and cached briefly since history grows slowly.
+const CONTEXT_PROFILE_TTL = 10 * 60 * 1000;
+const CONTEXT_MIN_SAMPLES = 6; // need a few plays before a slot has a real signal
+let _contextProfiles   = null;
+let _contextProfilesAt = 0;
+
+function _computeContextProfiles() {
+  if (_contextProfiles && Date.now() - _contextProfilesAt < CONTEXT_PROFILE_TTL) return _contextProfiles;
+  const buckets = new Map(); // key → { entries:[], artists:Map }
+  const add = (key, e) => {
+    let b = buckets.get(key);
+    if (!b) { b = { entries: [], artists: new Map() }; buckets.set(key, b); }
+    b.entries.push(e);
+    if (e.artist) b.artists.set(e.artist, (b.artists.get(e.artist) || 0) + 1);
+  };
+  // Only real listening history carries trustworthy timestamps + features.
+  for (const e of _history) {
+    if (e.h == null || e.energy == null) continue;
+    const weekend = (e.dow === 0 || e.dow === 6);
+    const slot = _timeSlotFor(e.h);
+    add(`${weekend ? 'weekend' : 'weekday'}:${slot}`, e); // composite (preferred)
+    add(`slot:${slot}`, e);                                // slot-only fallback
+  }
+  const profiles = {};
+  for (const [key, b] of buckets) {
+    if (b.entries.length < CONTEXT_MIN_SAMPLES) continue;
+    const centroid = _computeCentroid(b.entries);
+    if (!centroid) continue;
+    const topArtists = [...b.artists.entries()]
+      .sort((a, c) => c[1] - a[1]).slice(0, 5).map(([name, count]) => ({ name, count }));
+    profiles[key] = { centroid, count: b.entries.length, topArtists };
+  }
+  _contextProfiles = profiles;
+  _contextProfilesAt = Date.now();
+  return profiles;
+}
+
+// Best profile for the current moment: composite (weekday/weekend + slot) first,
+// then slot-only, else null when there isn't enough history yet.
+function _currentContextProfile() {
+  const profiles = _computeContextProfiles();
+  const now = new Date();
+  const weekend = (now.getDay() === 0 || now.getDay() === 6);
+  const slot = _timeSlotFor(now.getHours());
+  return profiles[`${weekend ? 'weekend' : 'weekday'}:${slot}`] || profiles[`slot:${slot}`] || null;
+}
+
+// Stable re-rank that drifts tracks closest to the current slot's learned centroid
+// toward the front (ties keep their order), so an unguided/autoplay pool leans into
+// what this time-of-day usually sounds like — without hard-overriding the pool.
+function _applyContextBias(tracks) {
+  if (!tracks || tracks.length < 2) return tracks || [];
+  const prof = _currentContextProfile();
+  if (!prof || !prof.centroid) return tracks;
+  const c = prof.centroid;
+  return tracks
+    .map((t, i) => ({ t, i, d: (t.energy != null && t.valence != null) ? _clusterDist(c, t) : 1 }))
+    .sort((a, b) => (a.d - b.d) || (a.i - b.i))
+    .map(x => x.t);
+}
+
 function detectCurrentContext() {
   const now  = new Date();
   const h    = now.getHours();
   const dow  = now.getDay();
 
-  let timeSlot;
-  if      (h >= 0  && h < 4)  timeSlot = 'latenight';
-  else if (h >= 4  && h < 8)  timeSlot = 'earlyam';
-  else if (h >= 8  && h < 11) timeSlot = 'morning';
-  else if (h >= 11 && h < 14) timeSlot = 'midday';
-  else if (h >= 14 && h < 18) timeSlot = 'afternoon';
-  else if (h >= 18 && h < 21) timeSlot = 'evening';
-  else                          timeSlot = 'night';
+  const timeSlot = _timeSlotFor(h);
 
   const isWeekend = dow === 0 || dow === 6;
 
@@ -2774,8 +3011,30 @@ function detectCurrentContext() {
   }
 
   const suggestedMood = MOOD_STATES.find(m => m.key === suggestedMoodKey);
+
+  // Learned auto-profile for this exact slot (what this time-of-day usually sounds
+  // like). Surfaced for the UI and used to bias unguided recommendations.
+  const prof = _currentContextProfile();
+  let contextProfile = null;
+  if (prof && prof.centroid) {
+    const feelingKey = _guessFeeling(prof.centroid);
+    const def = FEELING_DEFS[feelingKey];
+    contextProfile = {
+      label: `${isWeekend ? 'Weekend' : 'Weekday'} ${SLOT_LABELS[timeSlot] || timeSlot}`,
+      feeling: feelingKey,
+      feelingLabel: def?.label || feelingKey,
+      emoji: def?.emoji || '',
+      energy: Math.round(prof.centroid.energy),
+      valence: Math.round(prof.centroid.valence),
+      bpm: prof.centroid.bpm ? Math.round(prof.centroid.bpm) : null,
+      samples: prof.count,
+      topArtists: prof.topArtists,
+    };
+  }
+
   return { hour: h, dow, timeSlot, isWeekend, recentEnergy, suggestedMoodKey,
-           suggestedMoodName: suggestedMood?.name, suggestedMoodEmoji: suggestedMood?.emoji };
+           suggestedMoodName: suggestedMood?.name, suggestedMoodEmoji: suggestedMood?.emoji,
+           contextProfile };
 }
 
 // ---------------------------------------------------------------------------
@@ -2983,7 +3242,19 @@ async function maybeRefillContinuousQueue(state) {
     // ≥ QUEUE_TARGET forever and would permanently short-circuit the refill (the
     // user then hears autoplay's picks, not the vibe, and the cluster — fed by our
     // feature-bearing tracks — appears frozen). Gating on OUR upcoming count fixes both.
-    const ours = (queueData?.queue || []).filter(t => t?.uri && _stagedUris.has(t.uri)).length;
+    // Count DISTINCT staged tracks still in the look-ahead. Spotify loops our
+    // finite uris-context, so the same staged URI shows up many times (raw=17 for
+    // 6 staged); counting occurrences pinned `ours` above QUEUE_TARGET forever and
+    // the refill never fired. `_stagedUris` only ever holds not-yet-played upcoming
+    // (each track is removed the moment it becomes the current track — see poll),
+    // so a distinct count here is the true number of fresh slots ahead, draining
+    // toward 0 as songs play.
+    const _seenUris = new Set();
+    for (const t of (queueData?.queue || [])) {
+      const uri = t?.uri;
+      if (uri && _stagedUris.has(uri)) _seenUris.add(uri);
+    }
+    const ours = _seenUris.size;
     if (ours >= QUEUE_TARGET) {
       // Already full of our tracks — nothing to do. Log occasionally (≤ every 30 s) so
       // a "stuck full" state is visible without spamming.
@@ -3321,6 +3592,11 @@ async function poll() {
 
       // Reset progress cursor on track change to avoid a spurious delta
       if (trackChanged) {
+        // The track now playing is consumed: drop it from our staged set so the
+        // refill gate sees one fewer fresh slot ahead. Without this, Spotify's
+        // looped look-ahead keeps the played track "upcoming" and the queue never
+        // drains below QUEUE_TARGET, so the refill never fires.
+        if (state.track?.uri) _stagedUris.delete(state.track.uri);
         // Judge engagement with the outgoing track (skip vs finish) before we move on
         _evaluateEngagement(_lastState);
         _lastProgress = null;
@@ -3910,6 +4186,8 @@ function init(io) {
       resetSessionState();
       _io.emit('spotify:stats', buildStats());
       _emitIntelligenceState();
+      // Explicit success ack so the UI can confirm the refresh with a toast.
+      _io.emit('spotify:session_reset', { ok: true, msg: 'Music intelligence refreshed' });
     });
 
     // ----- spotify:save_session_playlist -----

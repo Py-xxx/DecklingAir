@@ -2871,6 +2871,7 @@ export function renderSpotifyIntelligence(ctrl) {
       <div class="sp-intel-context">
         <div class="sp-intel-context-label">Predicted mood <span class="sp-intel-context-hint">· a guess from your patterns</span></div>
         <div class="sp-intel-context-value">—</div>
+        <div class="sp-intel-autoprofile" style="display:none"></div>
       </div>
 
       <div class="sp-intel-cluster">
@@ -2912,6 +2913,7 @@ export function renderSpotifyIntelligence(ctrl) {
   const feelingLabel = card.querySelector('.sp-intel-feeling-label');
   const vibeLabelEl  = card.querySelector('.sp-intel-vibe-label');
   const contextVal   = card.querySelector('.sp-intel-context-value');
+  const autoProfile  = card.querySelector('.sp-intel-autoprofile');
   const clusterBar   = card.querySelector('.sp-intel-cluster-bar');
   const clusterSize  = card.querySelector('.sp-intel-cluster-size');
   const autoCheck    = card.querySelector('.sp-intel-auto-check');
@@ -2950,6 +2952,21 @@ export function renderSpotifyIntelligence(ctrl) {
       contextVal.textContent = `${context.suggestedMoodEmoji || ''} Maybe ${context.suggestedMoodName}`;
     } else {
       contextVal.textContent = 'Not sure yet';
+    }
+
+    // Learned auto-profile for this slot (e.g. "Weekday mornings usually 🧘 Chill").
+    if (autoProfile) {
+      const cp = context?.contextProfile;
+      if (cp && cp.feelingLabel) {
+        const artists = (cp.topArtists || []).slice(0, 2).map(a => a.name).join(', ');
+        autoProfile.innerHTML = `<span class="sp-intel-autoprofile-text">${_esc(cp.label)} usually `
+          + `${cp.emoji || ''} <strong>${_esc(cp.feelingLabel)}</strong>`
+          + (artists ? ` · ${_esc(artists)}` : '')
+          + `</span>`;
+        autoProfile.style.display = '';
+      } else {
+        autoProfile.style.display = 'none';
+      }
     }
 
     // Cluster bar (confidence indicator, max display = 20 tracks)
@@ -3045,11 +3062,13 @@ export function renderSpotifyIntelligence(ctrl) {
     _renderState({ ...data, clusterSize: _currentClusterSizeCache });
   };
   const _onCheckinAuto = ({ enabled }) => { autoCheck.checked = enabled; };
+  const _onSessionReset = (data = {}) => _spToast(data.msg || 'Music intelligence refreshed', data.ok === false);
 
   socket.on('spotify:intelligence_state', _onIntelState);
   socket.on('spotify:feeling_expired',    _onFeelingExp);
   socket.on('spotify:continuous_state',   _onContState);
   socket.on('spotify:checkin_auto',       _onCheckinAuto);
+  socket.on('spotify:session_reset',      _onSessionReset);
 
   // Cleanup
   const _cleanObs = new MutationObserver(() => {
@@ -3058,6 +3077,7 @@ export function renderSpotifyIntelligence(ctrl) {
       socket.off('spotify:feeling_expired',    _onFeelingExp);
       socket.off('spotify:continuous_state',   _onContState);
       socket.off('spotify:checkin_auto',       _onCheckinAuto);
+      socket.off('spotify:session_reset',      _onSessionReset);
       _cleanObs.disconnect();
     }
   });
