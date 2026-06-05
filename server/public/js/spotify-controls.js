@@ -2883,16 +2883,21 @@ export function renderSpotifyIntelligence(ctrl) {
 
       <div class="sp-intel-divider"></div>
 
-      <button class="sp-intel-checkin-btn">
-        <svg class="sp-intel-checkin-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="10"/>
-          <circle cx="9" cy="10" r="0.8" fill="currentColor" stroke="none"/>
-          <circle cx="15" cy="10" r="0.8" fill="currentColor" stroke="none"/>
-          <path d="M8.5 15.5c1 1.5 2.5 2 3.5 2s2.5-.5 3.5-2"/>
-          <path d="M19 3l1.5-1.5M19 3l-1.5-1.5M19 3v-2" style="opacity:0.5"/>
-        </svg>
-        How am I feeling?
-      </button>
+      <div class="sp-intel-checkin-row">
+        <button class="sp-intel-checkin-btn">
+          <svg class="sp-intel-checkin-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/>
+            <circle cx="9" cy="10" r="0.8" fill="currentColor" stroke="none"/>
+            <circle cx="15" cy="10" r="0.8" fill="currentColor" stroke="none"/>
+            <path d="M8.5 15.5c1 1.5 2.5 2 3.5 2s2.5-.5 3.5-2"/>
+            <path d="M19 3l1.5-1.5M19 3l-1.5-1.5M19 3v-2" style="opacity:0.5"/>
+          </svg>
+          How am I feeling?
+        </button>
+        <button class="sp-intel-reset-btn" title="Reset session — start a fresh listening session">
+          ${SP_ICON.reset}
+        </button>
+      </div>
     </div>
   `;
 
@@ -2911,6 +2916,7 @@ export function renderSpotifyIntelligence(ctrl) {
   const clusterSize  = card.querySelector('.sp-intel-cluster-size');
   const autoCheck    = card.querySelector('.sp-intel-auto-check');
   const checkinBtn   = card.querySelector('.sp-intel-checkin-btn');
+  const resetBtn     = card.querySelector('.sp-intel-reset-btn');
 
   let _currentClusterSizeCache = 0;
 
@@ -2997,6 +3003,32 @@ export function renderSpotifyIntelligence(ctrl) {
       }
     });
   });
+
+  // Reset session button — two-tap confirm to avoid accidental wipes
+  let _resetArmed = false;
+  let _resetTimer = null;
+  if (resetBtn) {
+    resetBtn.addEventListener('pointerup', () => {
+      if (isEditMode()) return;
+      if (!_resetArmed) {
+        _resetArmed = true;
+        resetBtn.classList.add('armed');
+        resetBtn.title = 'Tap again to reset the session';
+        clearTimeout(_resetTimer);
+        _resetTimer = setTimeout(() => {
+          _resetArmed = false;
+          resetBtn.classList.remove('armed');
+          resetBtn.title = 'Reset session — start a fresh listening session';
+        }, 3000);
+        return;
+      }
+      clearTimeout(_resetTimer);
+      _resetArmed = false;
+      resetBtn.classList.remove('armed');
+      resetBtn.title = 'Reset session — start a fresh listening session';
+      resetSpotifySession();
+    });
+  }
 
   // Auto check-in toggle
   autoCheck.addEventListener('change', () => {

@@ -52,6 +52,7 @@ const VIBE_NAMES_FILE    = path.join(__dirname, 'data', 'vibe-names.json');
 const VIBE_ARCHIVE_FILE  = path.join(__dirname, 'data', 'vibe-archive.ndjson');
 const USER_PREFS_FILE    = path.join(__dirname, 'data', 'user-prefs.json');
 const TRACK_FEATURES_FILE = path.join(__dirname, 'data', 'track-features.json');
+const LIVE_STATE_FILE    = path.join(__dirname, 'data', 'live-session.json');
 
 const SESSION_PRUNE_DAYS       = 90;
 const CONTINUOUS_REFILL_THRESHOLD = 3;  // refill queue when fewer than this many tracks remain
@@ -142,6 +143,7 @@ let _activeSession  = null;  // { id, startTime, lastActivityTime, listenedMs, t
 let _lastProgress   = null;
 let _reconcileTimer = null;
 let _statsBroadcastTick = 0; // counter to throttle periodic stats broadcasts
+let _liveSaveTick       = 0; // counter to throttle live-session snapshots to disk
 
 let _history        = [];   // all-time log entries, loaded from file on start
 let _seededHistory  = [];   // in-memory only: entries seeded from Spotify API
@@ -447,7 +449,134 @@ function closeActiveSession() {
   };
   _sessions.push(record);
   appendSession(record);
+  clearLiveState(); // session genuinely over — drop the resume snapshot
   console.log(`[Spotify] Session closed — ${Math.round(record.listenedMs / 60000)} min listened, ${record.trackCount} tracks`);
+}
+
+// ── Live session persistence ───────────────────────────────────────────────
+// The active session + its derived "intelligence" (emerging cluster, adaptive
+// artist scores, recent likes, active feeling, UI session stats) live only in
+// memory, so a `pm2 restart` would wipe them mid-session. We snapshot them to
+// disk periodically and restore on boot — but only if the gap since the last
+// activity is within SESSION_GAP_MS. A longer gap means the session genuinely
+// ended while the server was down, so we finalize it as a closed session.
+function saveLiveState() {
+  try {
+    if (!_activeSession) { clearLiveState(); return; }
+    const snap = {
+      savedAt:          Date.now(),
+      sessionStats:     _sessionStats,
+      activeSession:    _activeSession,
+      sessionTrackIds:  [..._sessionTrackIds],
+      recentLikes:      _recentLikes,
+      dislikedTrackIds: [..._dislikedTrackIds],
+      artistScores:     [..._artistScores],
+      currentCluster:   _currentCluster,
+      currentCentroid:  _currentCentroid,
+      driftBuffer:      _driftBuffer,
+      activeFeeling:    _activeFeeling,
+      pendingCheckIn:   _pendingCheckIn,
+      lastCheckInAt:    _lastCheckInAt,
+      lastTrackId:      _lastTrackId,
+    };
+    fs.mkdirSync(path.dirname(LIVE_STATE_FILE), { recursive: true });
+    fs.writeFileSync(LIVE_STATE_FILE, JSON.stringify(snap));
+  } catch (err) {
+    console.error('[Spotify] saveLiveState error:', err.message);
+  }
+}
+
+function clearLiveState() {
+  try { if (fs.existsSync(LIVE_STATE_FILE)) fs.unlinkSync(LIVE_STATE_FILE); }
+  catch (err) { console.error('[Spotify] clearLiveState error:', err.message); }
+}
+
+function loadLiveState() {
+  try {
+    if (!fs.existsSync(LIVE_STATE_FILE)) return;
+    const snap = JSON.parse(fs.readFileSync(LIVE_STATE_FILE, 'utf8'));
+    const sess = snap.activeSession;
+    if (!sess) { clearLiveState(); return; }
+    const lastActivity = sess.lastActivityTime || snap.savedAt || 0;
+    const gap = Date.now() - lastActivity;
+
+    if (gap <= SESSION_GAP_MS) {
+      // Same session — restore everything so the UI + intelligence continue seamlessly
+      _sessionStats     = snap.sessionStats     || _sessionStats;
+      _activeSession    = sess;
+      _sessionTrackIds  = new Set(snap.sessionTrackIds  || []);
+      _recentLikes      = snap.recentLikes      || [];
+      _dislikedTrackIds = new Set(snap.dislikedTrackIds || []);
+      _artistScores     = new Map(snap.artistScores     || []);
+      _currentCluster   = snap.currentCluster   || [];
+      _currentCentroid  = snap.currentCentroid  || null;
+      _driftBuffer      = snap.driftBuffer      || [];
+      _activeFeeling    = snap.activeFeeling     || null;
+      _pendingCheckIn   = snap.pendingCheckIn    || null;
+      _lastCheckInAt    = snap.lastCheckInAt     || 0;
+      _lastTrackId      = snap.lastTrackId       || null;
+      const mins = Math.round((_activeSession.listenedMs || 0) / 60000);
+      console.log(`[Spotify] Restored live session — ${mins} min, ${_activeSession.trackCount} tracks, cluster=${_currentCluster.length} (gap ${Math.round(gap / 1000)}s)`);
+    } else {
+      // Session ended while the server was down — finalize it as a closed session
+      if ((sess.listenedMs || 0) >= SESSION_MIN_MS && !_sessions.some(s => s.id === sess.id)) {
+        const record = {
+          id:         sess.id,
+          startTime:  sess.startTime,
+          endTime:    lastActivity,
+          listenedMs: sess.listenedMs,
+          trackCount: sess.trackCount,
+          trackIds:   sess.trackIds || [],
+          source:     'live',
+        };
+        _sessions.push(record);
+        appendSession(record);
+        console.log(`[Spotify] Finalized stale session from before restart — ${Math.round(record.listenedMs / 60000)} min (gap ${Math.round(gap / 60000)} min)`);
+      }
+      clearLiveState();
+    }
+  } catch (err) {
+    console.error('[Spotify] loadLiveState error:', err.message);
+  }
+}
+
+// Manual full reset: archive the current session (if worth keeping) to history,
+// then wipe ALL live session + intelligence state for a clean fresh start.
+// Used by the "reset session" buttons in the UI.
+function resetSessionState() {
+  if (_activeSession && (_activeSession.listenedMs || 0) >= SESSION_MIN_MS &&
+      !_sessions.some(s => s.id === _activeSession.id)) {
+    const session = _activeSession;
+    const record = {
+      id:         session.id,
+      startTime:  session.startTime,
+      endTime:    Date.now(),
+      listenedMs: session.listenedMs,
+      trackCount: session.trackCount,
+      trackIds:   session.trackIds || [],
+      source:     'live',
+    };
+    _sessions.push(record);
+    appendSession(record);
+  }
+  _activeSession    = null;
+  _lastProgress     = null;
+  _currentCluster   = [];
+  _currentCentroid  = null;
+  _driftBuffer      = [];
+  _pendingCheckIn   = null;
+  _lastCheckInAt    = 0;
+  _sessionTrackIds  = new Set();
+  _recentLikes      = [];
+  _dislikedTrackIds = new Set();
+  _artistScores     = new Map();
+  if (_activeFeeling) {
+    _activeFeeling = null;
+    if (_io) _io.emit('spotify:feeling_expired');
+  }
+  _sessionStats = { startTime: Date.now(), tracksPlayed: [] };
+  clearLiveState();
+  console.log('[Spotify] Session manually reset — fresh session started');
 }
 
 // ── Away-listening reconciliation ─────────────────────────────────────────────
@@ -2740,6 +2869,15 @@ async function poll() {
 
     _lastState = state;
 
+    // Periodically snapshot the live session + intelligence so a restart can
+    // resume the same session instead of resetting it. clearLiveState() runs
+    // inside saveLiveState when nothing is active.
+    _liveSaveTick++;
+    if (_liveSaveTick >= 4) { // 4 × 5 s = 20 s
+      _liveSaveTick = 0;
+      saveLiveState();
+    }
+
     if (_io) {
       _io.emit('spotify:state', state);
       // Broadcast updated stats every ~30 s while playing so the time tiles stay fresh
@@ -2837,6 +2975,7 @@ function init(io) {
   loadVibeNames();
   loadUserPrefs();
   loadFeaturesDB();
+  loadLiveState(); // after loadSessions so stale-session finalize can de-dupe
 
   // Start polling if already authed
   if (isAuthed()) {
@@ -3170,8 +3309,9 @@ function init(io) {
 
     // ----- spotify:reset_session -----
     socket.on('spotify:reset_session', () => {
-      _sessionStats = { startTime: Date.now(), tracksPlayed: [] };
+      resetSessionState();
       _io.emit('spotify:stats', buildStats());
+      _emitIntelligenceState();
     });
 
     // ----- spotify:save_session_playlist -----
