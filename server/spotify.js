@@ -580,6 +580,10 @@ function resetSessionState() {
   }
   _activeSession    = null;
   _lastProgress     = null;
+  // Forget the current track so the next poll treats the now-playing song as the
+  // first track of a brand-new session (fresh cluster + counter), exactly as if the
+  // user had stepped away past the session gap and come back.
+  _lastTrackId      = null;
   _currentCluster   = [];
   _currentCentroid  = null;
   _driftBuffer      = [];
@@ -2381,12 +2385,19 @@ async function buildVibePlaylist(vibeKey, limit = 25) {
 
   const base = [...pool].sort(() => Math.random() - 0.5).slice(0, baseCount);
 
-  // Discovery seeded from this vibe — prioritising genuinely new music
-  const seedIds = base.slice(0, 3).map(t => t.id).filter(Boolean);
-  const seedArtists = base.map(t => t.artist).filter(Boolean);
+  // Seed discovery from the FULL cluster, not just the unplayed `base`. Otherwise an
+  // actively-playing vibe (all its tracks already in _sessionTrackIds) yields no seeds,
+  // discovery comes back empty, and the vibe falsely reports "not enough data".
+  const seedSource = base.length ? base : cluster.tracks;
+  const seedIds = [...seedSource].sort(() => Math.random() - 0.5)
+    .slice(0, 3).map(t => t.id).filter(Boolean);
+  const seedArtists = seedSource.map(t => t.artist).filter(Boolean);
   const discovery = await _buildDiscovery(seedIds, seedArtists, discoveryCount);
 
-  const all = _excludeDisliked(_excludePlayed([...base, ...discovery]));
+  let all = _excludeDisliked(_excludePlayed([...base, ...discovery]));
+  // Last resort: a vibe with real history should never come back empty. If session
+  // exclusion stripped everything and discovery found nothing, replay the cluster.
+  if (!all.length) all = _excludeDisliked([...cluster.tracks]);
   return _spaceArtists(_tFlowOn() ? flowOrder(all) : all);
 }
 
