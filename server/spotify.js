@@ -160,6 +160,21 @@ let _activeMoodKey  = null;  // currently running continuous mood (null = stoppe
 // Reset when a session opens/closes.
 let _sessionTrackIds = new Set();
 
+// Rolling cap on session memory. Without this the Set grows unbounded over a long
+// session and eventually excludes every candidate the builders can find (top-tracks,
+// curated playlists, history) — starving vibes/moods/autoplay so they queue 3-5 then
+// stall. A Set keeps insertion order, so we prune oldest-first once over the cap.
+const SESSION_TRACK_MEMORY = 200;
+function _markPlayed(id) {
+  if (!id) return;
+  _sessionTrackIds.add(id);
+  const overflow = _sessionTrackIds.size - SESSION_TRACK_MEMORY;
+  if (overflow > 0) {
+    const it = _sessionTrackIds.values();
+    for (let i = 0; i < overflow; i++) _sessionTrackIds.delete(it.next().value);
+  }
+}
+
 // ── Adaptive engagement ───────────────────────────────────────────────────────
 // _recentLikes:      rolling features of tracks the user actually engaged with
 //                    (finished / heard most of) — steers refills toward the flow.
@@ -574,9 +589,17 @@ function resetSessionState() {
   _recentLikes      = [];
   _dislikedTrackIds = new Set();
   _artistScores     = new Map();
-  if (_activeFeeling) {
-    _activeFeeling = null;
-    if (_io) _io.emit('spotify:feeling_expired');
+  // Stop any running continuous engine — otherwise it keeps refilling from the old
+  // context and the reset looks like it did nothing.
+  const hadFeeling = !!_activeFeeling;
+  const hadEngine  = !!(_activeMoodKey || _activeVibeKey || _activeFeeling);
+  _activeMoodKey  = null;
+  _activeVibeKey  = null;
+  _activeFeeling  = null;
+  _autoQueueCount = 0;
+  if (hadFeeling && _io) _io.emit('spotify:feeling_expired');
+  if (hadEngine && _io) {
+    _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: null });
   }
   _sessionStats = { startTime: Date.now(), tracksPlayed: [] };
   clearLiveState();
@@ -1054,7 +1077,7 @@ async function _queueTrack(t) {
   if (!uri) return false;
   await addToQueue(uri);
   const id = (t && t.id) || (uri.startsWith('spotify:track:') ? uri.split(':').pop() : null);
-  if (id) _sessionTrackIds.add(id);
+  _markPlayed(id);
   return true;
 }
 
@@ -1072,7 +1095,7 @@ async function playFresh(tracks) {
   await play({ uris });
   for (const t of list) {
     const id = t.id || (t.uri && t.uri.startsWith('spotify:track:') ? t.uri.split(':').pop() : null);
-    if (id) _sessionTrackIds.add(id);
+    _markPlayed(id);
   }
   return list.length;
 }
@@ -1105,7 +1128,7 @@ async function queueOnTop(uri) {
     await play({ uris: [uri, ...upcoming] });
   }
   const id = uri.startsWith('spotify:track:') ? uri.split(':').pop() : null;
-  if (id) _sessionTrackIds.add(id);
+  _markPlayed(id);
   return true;
 }
 
@@ -1154,7 +1177,7 @@ async function rebuildUpcoming(freshTracks) {
 
   for (const u of nextUris) {
     const id = u.startsWith('spotify:track:') ? u.split(':').pop() : null;
-    if (id) _sessionTrackIds.add(id);
+    _markPlayed(id);
   }
   return freshUris.length;
 }
@@ -1767,6 +1790,89 @@ async function getDiscoveryTracks(seedArtistNames = [], excludeIds = new Set(), 
   return out.slice(0, limit);
 }
 
+// ── Borrowed collaborative filtering ─────────────────────────────────────────
+// Our engine is N=1 — it only knows THIS user's history, so it can't do the
+// cross-user "people like you also loved…" magic that drives Spotify's recs.
+// But Spotify's own editorial/algorithmic playlists ("This Is {Artist}",
+// "{Genre} Mix") ARE that CF output, distilled from hundreds of millions of
+// listeners. They're readable for free via /search + playlist items, so we mine
+// them to inject genuine cross-user intelligence into our discovery pool.
+const CURATED_MAX_PER_ARTIST = 2;
+const CURATED_PL_TTL = 6 * 60 * 60 * 1000; // cache resolved playlist IDs for 6h
+const _curatedPlaylistCache = new Map();   // search query → { ids:[...], ts }
+
+// Resolve a curated-playlist search to its best matching playlist IDs, favouring
+// Spotify-owned (editorial/algorithmic) playlists — those are the CF ones.
+async function _findCuratedPlaylists(query) {
+  const cached = _curatedPlaylistCache.get(query);
+  if (cached && Date.now() - cached.ts < CURATED_PL_TTL) return cached.ids;
+  let ids = [];
+  try {
+    const res = await search(query, 'playlist', 5);
+    const items = (res?.playlists?.items || []).filter(Boolean);
+    const spotifyOwned = items.filter(p => p?.owner?.id === 'spotify');
+    ids = (spotifyOwned.length ? spotifyOwned : items).map(p => p.id).filter(Boolean);
+  } catch { /* search miss — cache the empty result so we don't retry hard */ }
+  _curatedPlaylistCache.set(query, { ids, ts: Date.now() });
+  return ids;
+}
+
+// Pull genuinely-new tracks out of Spotify's curated playlists for the given
+// seed artists + genres. excludeIds keeps results unfamiliar (known + played).
+async function getCuratedTracks(seedArtistNames = [], seedGenres = [], excludeIds = new Set(), limit = 6) {
+  const out  = [];
+  const seen = new Set(excludeIds);
+  const artistCount = new Map();
+  const _artistKey = (t) => (t.artistIds && t.artistIds[0]) || (t.artist || '').toLowerCase();
+  const _shuffle = (a) => a.map(x => [Math.random(), x]).sort((p, q) => p[0] - q[0]).map(([, x]) => x);
+
+  // Fetch one playlist's items and add new, artist-capped tracks (shuffled so a
+  // popular playlist doesn't always surface the same top entries).
+  const pullFrom = async (playlistIds) => {
+    for (const pid of playlistIds) {
+      if (out.length >= limit) break;
+      let items = [];
+      try {
+        const data = await getPlaylistTracks(pid, 50);
+        items = (data?.items || []).map(i => i.item).filter(Boolean);
+      } catch { continue; }
+      for (const raw of _shuffle(items)) {
+        if (out.length >= limit) break;
+        const t = serializeTrack(raw);
+        if (!t || !t.id || seen.has(t.id)) continue;
+        const ak = _artistKey(t);
+        if ((artistCount.get(ak) || 0) >= CURATED_MAX_PER_ARTIST) continue;
+        seen.add(t.id);
+        artistCount.set(ak, (artistCount.get(ak) || 0) + 1);
+        out.push(t);
+      }
+    }
+  };
+
+  // 1) "This Is {Artist}" — Spotify's official per-artist CF playlist. Use the
+  //    PRIMARY artist (history names can be comma-joined collabs).
+  const artists = _shuffle([...new Set(
+    seedArtistNames.map(n => (n || '').split(',')[0].trim()).filter(Boolean)
+  )]).slice(0, 2);
+  for (const name of artists) {
+    if (out.length >= limit) break;
+    const ids = await _findCuratedPlaylists(`This Is ${name}`);
+    await pullFrom(ids.slice(0, 1));
+  }
+
+  // 2) "{Genre} Mix" — Spotify's algorithmic genre playlists (surfaces new artists).
+  if (out.length < limit) {
+    const genres = _shuffle([...new Set(seedGenres.filter(Boolean))]).slice(0, 2);
+    for (const g of genres) {
+      if (out.length >= limit) break;
+      const ids = await _findCuratedPlaylists(`${g} mix`);
+      await pullFrom(ids.slice(0, 1));
+    }
+  }
+
+  return out.slice(0, limit);
+}
+
 async function getUserProfile() {
   if (_userProfile) return _userProfile;
   _userProfile = await api('GET', '/me');
@@ -2348,22 +2454,30 @@ async function buildFeelingPlaylist(feelingKey, sessionTracks = [], limit = 20) 
   return _spaceArtists(_tFlowOn() ? flowOrder(combined) : combined.sort(() => Math.random() - 0.5));
 }
 
-// Assemble a discovery set that prioritises genuinely NEW music. Fresh search-based
-// finds come first; anything the user already knows is only used as a last-resort
-// filler so the queue never starves.
+// Assemble a discovery set that prioritises genuinely NEW music. Spotify's own
+// curated playlists (borrowed collaborative filtering) come first, then fresh
+// search finds; anything the user already knows is only last-resort filler so
+// the queue never starves.
 async function _buildDiscovery(seedIds, seedArtists, count) {
   if (count <= 0) return [];
   const known = _knownTrackIdSet();
   const excludeIds = new Set([...known, ..._sessionTrackIds]);
+  const topGenres = await _getTopGenres();
 
-  const [similar, fresh] = await Promise.all([
+  const [curated, similar, fresh] = await Promise.all([
+    getCuratedTracks(seedArtists, topGenres, excludeIds, count + 4).catch(() => []),
     getSimilarTracks(seedIds, [], count + 5).catch(() => []),
     getDiscoveryTracks(seedArtists, excludeIds, count + 4).catch(() => []),
   ]);
 
-  // Prefer fresh (unfamiliar) tracks, then similar tracks the user hasn't heard.
+  // Curated (Spotify CF) first — strongest cross-user signal — then fresh search
+  // finds, then unfamiliar similar. Keep only genuinely new (unknown) tracks.
+  const newCurated = _excludePlayed(curated).filter(t => t.id && !known.has(t.id));
   const newSimilar = _excludePlayed(similar).filter(t => t.id && !known.has(t.id));
-  let discovery = _excludeDisliked([...fresh, ...newSimilar]).slice(0, count);
+  let discovery = _excludeDisliked([...newCurated, ...fresh, ...newSimilar]);
+  // De-dupe by id, preserving the priority order above.
+  const seenIds = new Set();
+  discovery = discovery.filter(t => t.id && !seenIds.has(t.id) && seenIds.add(t.id)).slice(0, count);
 
   // Top up with known-but-unplayed similar so a batch is never short.
   if (discovery.length < count) {
@@ -2887,7 +3001,7 @@ async function poll() {
         if (!_activeSession) openActiveSession();
 
         // Remember the current track so no auto-queue method repeats it this session
-        if (state.track.id) _sessionTrackIds.add(state.track.id);
+        if (state.track.id) _markPlayed(state.track.id);
 
         const sameTrack = state.track.id === _lastTrackId;
         if (sameTrack && _lastProgress != null) {
