@@ -2711,10 +2711,16 @@ export function renderSpotifyInsights(ctrl) {
       socket.off('spotify:vibe_renamed',    _onVibeRenamed);
       socket.off('spotify:tuning',          _onTuning);
       socket.off('spotify:continuous_state', _onContinuousState);
+      socket.off('spotify:insights',        _onInsights);
       _cleanObs.disconnect();
     }
   });
   _cleanObs.observe(document.body, { childList: true, subtree: true });
+
+  // Persistent listener so a background reseed (second emit from the server)
+  // refreshes the panel without a manual reload. Guards against blank payloads.
+  const _onInsights = (data) => { if (data && !data.error) _loadAll(data); };
+  socket.on('spotify:insights', _onInsights);
 
   getSpotifyInsights().then(_loadAll);
 

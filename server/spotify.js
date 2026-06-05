@@ -2437,6 +2437,26 @@ function computeRightNow() {
   };
 }
 
+// Build the full insights payload from current in-memory state (no network).
+// Each section is computed defensively so one failing analysis can't blank the
+// entire panel — a bad vibe calc shouldn't wipe Profile/Patterns/etc.
+function buildInsightsPayload() {
+  const safe = (fn, fallback) => { try { return fn(); } catch (e) { console.error('[Spotify] insights section failed:', e.message); return fallback; } };
+  return {
+    profile:  safe(computeProfile,  { ready: false, total: 0 }),
+    patterns: safe(computePatterns, { ready: false }),
+    vibes:    safe(computeVibes,    { ready: false }),
+    rightNow: safe(computeRightNow, { ready: false }),
+    total:    safe(() => combinedHistory().length, 0),
+    ownTotal: _history.length,
+    tuning:        { ..._tuning },
+    activeMoodKey: _activeMoodKey,
+    activeVibeKey: _activeVibeKey,
+    moods: MOOD_STATES.map(({ key, name, emoji, desc, feeling }) => ({ key, name, emoji, desc, feeling })),
+    context: safe(detectCurrentContext, null),
+  };
+}
+
 function buildStats() {
   const tracks = _sessionStats.tracksPlayed;
 
@@ -3156,28 +3176,20 @@ function init(io) {
     });
 
     // ----- spotify:get_insights -----
-    socket.on('spotify:get_insights', async () => {
+    socket.on('spotify:get_insights', () => {
       try {
-        // Re-seed from Spotify if never seeded or stale (> 1 hour)
+        // Serve whatever we have RIGHT NOW so the panel restores instantly on a
+        // page refresh — never block the response on a slow Spotify round-trip.
+        socket.emit('spotify:insights', buildInsightsPayload());
+
+        // If the seed cache is empty or stale (> 1 hour), refresh it in the
+        // background and re-emit once it lands. The client has a persistent
+        // 'spotify:insights' listener that picks up this second payload.
         if (Date.now() - _seedTimestamp > 3600000) {
-          await seedFromSpotify();
+          seedFromSpotify()
+            .then(() => socket.emit('spotify:insights', buildInsightsPayload()))
+            .catch((e) => console.error('[Spotify] background reseed failed:', e.message));
         }
-        // Each section is computed defensively so one failing analysis can't blank
-        // the entire panel — a bad vibe calc shouldn't wipe Profile/Patterns/etc.
-        const safe = (fn, fallback) => { try { return fn(); } catch (e) { console.error('[Spotify] insights section failed:', e.message); return fallback; } };
-        socket.emit('spotify:insights', {
-          profile:  safe(computeProfile,  { ready: false, total: 0 }),
-          patterns: safe(computePatterns, { ready: false }),
-          vibes:    safe(computeVibes,    { ready: false }),
-          rightNow: safe(computeRightNow, { ready: false }),
-          total:    safe(() => combinedHistory().length, 0),
-          ownTotal: _history.length,
-          tuning:        { ..._tuning },
-          activeMoodKey: _activeMoodKey,
-          activeVibeKey: _activeVibeKey,
-          moods: MOOD_STATES.map(({ key, name, emoji, desc, feeling }) => ({ key, name, emoji, desc, feeling })),
-          context: safe(detectCurrentContext, null),
-        });
       } catch (err) {
         console.error('[Spotify] get_insights error:', err.message);
         socket.emit('spotify:insights', { error: err.message });
