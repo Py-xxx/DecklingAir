@@ -1240,9 +1240,14 @@ async function playWithContinuation(uri) {
   // getSimilarTracks already has a multi-tier fallback; just unwrap URIs.
   // Skip anything already played/queued this session so continuation doesn't repeat.
   try {
-    const similar = _excludePlayed(await getSimilarTracks([trackId], [], QUEUE_TARGET + 3));
+    const similar = await getSimilarTracks([trackId], [], QUEUE_TARGET + 10);
+    // Prefer tracks not yet played this session; but if /recommendations is dead
+    // and the top-tracks fallback is all already-played, replay rather than stop
+    // dead — a queue that keeps going beats silence.
+    let pool = _excludePlayed(similar);
+    if (!pool.length) pool = similar;
     // Cap to QUEUE_TARGET upcoming so a search-play doesn't stage a huge queue.
-    continuationUris = similar.map(t => t.uri).filter(u => u !== uri).slice(0, QUEUE_TARGET);
+    continuationUris = pool.map(t => t.uri).filter(u => u && u !== uri).slice(0, QUEUE_TARGET);
     if (continuationUris.length) console.log(`[Spotify] Continuation: ${continuationUris.length} similar tracks`);
   } catch (e) {
     console.warn('[Spotify] Continuation tracks unavailable:', e.message);
@@ -1566,10 +1571,12 @@ async function getDevices() {
   return api('GET', '/me/player/devices');
 }
 
-async function search(query, types = 'track', limit = 10) {
+async function search(query, types = 'track', limit = 10, offset = 0) {
   // Feb 2026: search limit reduced from max 50 to max 10
   const safeLimit = Math.min(limit, 10);
-  return api('GET', '/search', { params: { q: query, type: types, limit: String(safeLimit) } });
+  const params = { q: query, type: types, limit: String(safeLimit) };
+  if (offset > 0) params.offset = String(Math.min(offset, 950)); // Spotify caps offset at ~1000
+  return api('GET', '/search', { params });
 }
 
 async function getQueue() {
@@ -1700,39 +1707,58 @@ function _knownTrackIdSet() {
   return s;
 }
 
+// Max tracks any single artist may contribute to one discovery batch — keeps a
+// batch from turning into "5 songs by the same guy in a row".
+const DISCOVERY_MAX_PER_ARTIST = 2;
+
 // Find tracks the user almost certainly hasn't heard, via search.
 //   seedArtistNames — artist names from what they're currently enjoying
 //   excludeIds      — ids to skip (known history + session-played)
 async function getDiscoveryTracks(seedArtistNames = [], excludeIds = new Set(), limit = 6) {
   const out  = [];
   const seen = new Set(excludeIds);
+  const artistCount = new Map(); // primary artistId/name → how many already taken
+  const _shuffle = (a) => a.map(x => [Math.random(), x]).sort((p, q) => p[0] - q[0]).map(([, x]) => x);
+  const _artistKey = (t) => (t.artistIds && t.artistIds[0]) || (t.artist || '').toLowerCase();
+
+  // Add candidates, shuffled, respecting the per-artist cap so no single artist
+  // dominates the batch.
   const pushNew = (rawTracks) => {
-    for (const raw of rawTracks || []) {
+    for (const raw of _shuffle(rawTracks || [])) {
       const t = serializeTrack(raw);
       if (!t || !t.id || seen.has(t.id)) continue;
+      const ak = _artistKey(t);
+      if ((artistCount.get(ak) || 0) >= DISCOVERY_MAX_PER_ARTIST) continue;
       seen.add(t.id);
+      artistCount.set(ak, (artistCount.get(ak) || 0) + 1);
       out.push(t);
     }
   };
 
-  // 1) Deeper cuts from artists the user is into (songs they likely don't own/save)
-  const artists = [...new Set(seedArtistNames.filter(Boolean))].slice(0, 2);
+  // 1) Deeper cuts from artists the user is into (songs they likely don't own/save).
+  //    A random search offset surfaces less-obvious tracks and varies the picks
+  //    from session to session instead of always returning the same top hits.
+  const artists = _shuffle([...new Set(seedArtistNames.filter(Boolean))]).slice(0, 3);
   for (const name of artists) {
     if (out.length >= limit) break;
     try {
-      const res = await search(`artist:"${name.replace(/"/g, '')}"`, 'track', 10);
+      const offset = Math.floor(Math.random() * 30); // dig past the obvious hits
+      const res = await search(`artist:"${name.replace(/"/g, '')}"`, 'track', 10, offset);
       pushNew(res?.tracks?.items || []);
     } catch { /* keep going */ }
   }
 
-  // 2) Fresh, recent tracks in the user's favourite genres (surfaces NEW artists)
+  // 2) Fresh, recent tracks in the user's favourite genres (surfaces NEW artists).
+  //    Shuffle which genres get searched + a random offset so discovery doesn't
+  //    keep landing on the same handful of songs.
   if (out.length < limit) {
-    const genres = await _getTopGenres();
+    const genres = _shuffle(await _getTopGenres());
     const yr = new Date().getFullYear();
     for (const g of genres.slice(0, _tDiscoveryGenres())) {
       if (out.length >= limit) break;
       try {
-        const res = await search(`genre:"${g}" year:${yr - 2}-${yr}`, 'track', 10);
+        const offset = Math.floor(Math.random() * 40);
+        const res = await search(`genre:"${g}" year:${yr - 2}-${yr}`, 'track', 10, offset);
         pushNew(res?.tracks?.items || []);
       } catch { /* keep going */ }
     }
@@ -1920,7 +1946,12 @@ async function maybeQueueRecommendations(state) {
   const seedArtists = (state.track.artistIds || []).slice(0, 2);
 
   try {
-    const tracks = _excludePlayed(await getSimilarTracks(seedTracks, seedArtists, gap + 3));
+    const raw = await getSimilarTracks(seedTracks, seedArtists, gap + 8);
+    // Prefer unplayed, but never starve: if all candidates were already played
+    // this session (top-tracks fallback exhausted), replay rather than let the
+    // queue run dry and playback stop.
+    let tracks = _excludePlayed(raw);
+    if (!tracks.length) tracks = raw;
     // Stage via context rebuild (no addToQueue) so the queue stays clearable.
     const added = await rebuildUpcoming(tracks);
     _autoQueueCount += added;
@@ -2144,6 +2175,27 @@ function flowOrder(tracks) {
   return ordered.map(({ _cam, ...t }) => t);
 }
 
+// Greedy reorder so consecutive tracks don't share a primary artist when it can
+// be avoided. Preserves the incoming order as much as possible — it only defers
+// a track when placing it next would clump it against the previous artist. This
+// runs as the final pass (after flow ordering) so it nudges same-artist runs
+// apart without otherwise disturbing the sequence.
+function _spaceArtists(tracks) {
+  if (!tracks || tracks.length <= 2) return tracks || [];
+  const artistOf = (t) => (t.artistIds && t.artistIds[0]) || (t.artist || '').toLowerCase();
+  const remaining = [...tracks];
+  const out = [];
+  let lastArtist = null;
+  while (remaining.length) {
+    let idx = remaining.findIndex((t) => artistOf(t) !== lastArtist);
+    if (idx === -1) idx = 0; // every track left is the same artist — unavoidable
+    const [picked] = remaining.splice(idx, 1);
+    out.push(picked);
+    lastArtist = artistOf(picked);
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Feelings & moods
 //
@@ -2229,7 +2281,7 @@ async function buildVibePlaylist(vibeKey, limit = 25) {
   const discovery = await _buildDiscovery(seedIds, seedArtists, discoveryCount);
 
   const all = _excludeDisliked(_excludePlayed([...base, ...discovery]));
-  return _tFlowOn() ? flowOrder(all) : all;
+  return _spaceArtists(_tFlowOn() ? flowOrder(all) : all);
 }
 
 async function buildMoodPlaylist(moodKey, limit = 25) {
@@ -2293,7 +2345,7 @@ async function buildFeelingPlaylist(feelingKey, sessionTracks = [], limit = 20) 
 
   // Final guard: nothing already played/queued, and nothing by a hard-skipped artist
   const combined = _excludeDisliked(_excludePlayed([...sessionSample, ...base, ...discovery]));
-  return _tFlowOn() ? flowOrder(combined) : combined.sort(() => Math.random() - 0.5);
+  return _spaceArtists(_tFlowOn() ? flowOrder(combined) : combined.sort(() => Math.random() - 0.5));
 }
 
 // Assemble a discovery set that prioritises genuinely NEW music. Fresh search-based
@@ -2574,8 +2626,21 @@ async function maybeRefillContinuousQueue(state) {
       tracks = await buildVibePlaylist(_activeVibeKey, refillCount);
     }
 
+    // buildXPlaylist already drops session-played tracks internally, so in a
+    // long session it can come back empty. Fall back to similar tracks (and
+    // ultimately the user's top tracks) so the queue never runs dry.
+    if (!tracks || !tracks.length) {
+      const seed = state?.track?.id ? [state.track.id] : [];
+      tracks = await getSimilarTracks(seed, [], refillCount + 5).catch(() => []);
+    }
+
+    // Prefer fresh, undisliked tracks; but never starve the queue. If exclusions
+    // empty the pool (long session, top-tracks fallback exhausted), relax them
+    // step by step so the music keeps going rather than stopping dead.
+    let fresh = _excludeDisliked(_excludePlayed(tracks));
+    if (!fresh.length) fresh = _excludeDisliked(tracks); // allow replays, still avoid disliked
+    if (!fresh.length) fresh = tracks;                   // last resort: anything playable
     // Stage via context rebuild (no addToQueue) so the queue stays clearable.
-    const fresh = _excludeDisliked(_excludePlayed(tracks));
     const added = await rebuildUpcoming(fresh);
     const label = _activeFeeling?.label || _activeMoodKey || _activeVibeKey;
     if (added > 0) console.log(`[Spotify] Continuous refill +${added} tracks (${label})`);
