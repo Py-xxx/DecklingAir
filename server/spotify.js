@@ -148,7 +148,6 @@ let _lastProgress   = null;
 let _reconcileTimer = null;
 let _statsBroadcastTick = 0; // counter to throttle periodic stats broadcasts
 let _liveSaveTick       = 0; // counter to throttle live-session snapshots to disk
-let _queueCheckTick     = 0; // counter to throttle mid-song queue top-up checks
 
 let _history        = [];   // all-time log entries, loaded from file on start
 let _seededHistory  = [];   // in-memory only: entries seeded from Spotify API
@@ -1110,6 +1109,56 @@ async function queueOnTop(uri) {
   return true;
 }
 
+// Top the upcoming queue up to QUEUE_TARGET WITHOUT polluting Spotify's
+// user-added queue. Spotify's "Next in queue" (anything added via addToQueue)
+// can't be cleared through the API, so switching vibe/mood via play({uris})
+// leaves stale songs behind. To avoid that entirely we never addToQueue for
+// auto-features — instead we rebuild the playback context: keep the current
+// track playing (re-seeking to its position) and stage the existing upcoming
+// tracks plus enough fresh ones to reach the cap. The brief re-buffer this
+// causes lands on a track change, so it's barely noticeable.
+// Returns the number of NEW tracks staged (0 if nothing needed adding).
+async function rebuildUpcoming(freshTracks) {
+  let currentUri = null, progressMs = 0;
+  try {
+    const st = await getPlaybackState();
+    currentUri = st?.item?.uri || null;
+    progressMs = st?.progress_ms || 0;
+  } catch { /* no active playback */ }
+
+  // Existing upcoming = context tracks we previously staged (no user-queue,
+  // since we never addToQueue any more).
+  let upcoming = [];
+  try {
+    const q = await getQueue();
+    upcoming = (q?.queue || []).map(t => t && t.uri).filter(Boolean);
+  } catch { /* queue unavailable */ }
+  // Only keep as many existing upcoming as the cap allows.
+  upcoming = upcoming.slice(0, QUEUE_TARGET);
+
+  const need = QUEUE_TARGET - upcoming.length;
+  if (need <= 0) return 0; // already full — nothing to do, no rebuild/blip
+
+  const have = new Set([currentUri, ...upcoming].filter(Boolean));
+  const freshUris = [];
+  for (const t of (freshTracks || [])) {
+    const u = t.uri || (t.id ? `spotify:track:${t.id}` : null);
+    if (u && !have.has(u)) { freshUris.push(u); have.add(u); }
+    if (freshUris.length >= need) break;
+  }
+  if (!freshUris.length) return 0; // nothing new to add — skip the rebuild/blip
+
+  const nextUris = [...upcoming, ...freshUris]; // ≤ QUEUE_TARGET
+  if (currentUri) await play({ uris: [currentUri, ...nextUris], positionMs: progressMs });
+  else            await play({ uris: nextUris });
+
+  for (const u of nextUris) {
+    const id = u.startsWith('spotify:track:') ? u.split(':').pop() : null;
+    if (id) _sessionTrackIds.add(id);
+  }
+  return freshUris.length;
+}
+
 // Drop any tracks already played or queued during this session.
 function _excludePlayed(tracks) {
   return (tracks || []).filter(t => t && t.id && !_sessionTrackIds.has(t.id));
@@ -1191,8 +1240,9 @@ async function playWithContinuation(uri) {
   // getSimilarTracks already has a multi-tier fallback; just unwrap URIs.
   // Skip anything already played/queued this session so continuation doesn't repeat.
   try {
-    const similar = _excludePlayed(await getSimilarTracks([trackId], [], 30));
-    continuationUris = similar.map(t => t.uri).filter(u => u !== uri);
+    const similar = _excludePlayed(await getSimilarTracks([trackId], [], QUEUE_TARGET + 3));
+    // Cap to QUEUE_TARGET upcoming so a search-play doesn't stage a huge queue.
+    continuationUris = similar.map(t => t.uri).filter(u => u !== uri).slice(0, QUEUE_TARGET);
     if (continuationUris.length) console.log(`[Spotify] Continuation: ${continuationUris.length} similar tracks`);
   } catch (e) {
     console.warn('[Spotify] Continuation tracks unavailable:', e.message);
@@ -1871,17 +1921,9 @@ async function maybeQueueRecommendations(state) {
 
   try {
     const tracks = _excludePlayed(await getSimilarTracks(seedTracks, seedArtists, gap + 3));
-    let added = 0;
-    for (const track of tracks) {
-      if (added >= gap) break;
-      try {
-        await _queueTrack(track);
-        _autoQueueCount++;
-        added++;
-      } catch (err) {
-        console.error('[Spotify] Failed to queue autoplay track:', err.message);
-      }
-    }
+    // Stage via context rebuild (no addToQueue) so the queue stays clearable.
+    const added = await rebuildUpcoming(tracks);
+    _autoQueueCount += added;
   } catch (err) {
     console.error('[Spotify] Autoplay fetch failed:', err.message);
   }
@@ -2515,8 +2557,9 @@ async function maybeRefillContinuousQueue(state) {
     const queueLength = queueData?.queue?.length || 0;
     if (queueLength >= QUEUE_TARGET) return;
 
-    // Only add enough to reach the cap (never overshoot QUEUE_TARGET).
-    const refillCount = QUEUE_TARGET - queueLength;
+    // Build a small over-fetch; rebuildUpcoming() only stages enough to reach
+    // the cap and skips dupes. Over-fetch covers disliked/already-played drops.
+    const refillCount = (QUEUE_TARGET - queueLength) + 3;
     let tracks;
     if (_activeFeeling) {
       // Feeling is the baseline, but go with the flow: blend in the tracks the user is
@@ -2531,15 +2574,9 @@ async function maybeRefillContinuousQueue(state) {
       tracks = await buildVibePlaylist(_activeVibeKey, refillCount);
     }
 
-    let added = 0;
-    for (const t of _excludeDisliked(_excludePlayed(tracks))) {
-      if (added >= refillCount) break; // never push past the cap
-      try {
-        await _queueTrack(t);
-        added++;
-        await new Promise(r => setTimeout(r, 100));
-      } catch { /* skip unplayable */ }
-    }
+    // Stage via context rebuild (no addToQueue) so the queue stays clearable.
+    const fresh = _excludeDisliked(_excludePlayed(tracks));
+    const added = await rebuildUpcoming(fresh);
     const label = _activeFeeling?.label || _activeMoodKey || _activeVibeKey;
     if (added > 0) console.log(`[Spotify] Continuous refill +${added} tracks (${label})`);
   } catch (err) {
@@ -2947,29 +2984,6 @@ async function poll() {
     if (_liveSaveTick >= 4) { // 4 × 5 s = 20 s
       _liveSaveTick = 0;
       saveLiveState();
-    }
-
-    // Mid-song queue maintenance: roughly twice per song (every 8 polls = 40 s)
-    // re-check the queue depth and top it back up to QUEUE_TARGET if it has
-    // drained — covers mood/vibe/feeling refills and autoplay alike. Both
-    // helpers are gap-based and early-return when their mode is inactive or the
-    // queue is already full, so this is cheap when nothing needs topping up.
-    if (state?.isPlaying && (_activeMoodKey || _activeVibeKey || _activeFeeling || _autoplayEnabled)) {
-      _queueCheckTick++;
-      if (_queueCheckTick >= 8) { // 8 × 5 s = 40 s
-        _queueCheckTick = 0;
-        if (_activeMoodKey || _activeVibeKey || _activeFeeling) {
-          maybeRefillContinuousQueue(state).catch((err) =>
-            console.error('[Spotify] Queue top-up error:', err.message)
-          );
-        } else if (_autoplayEnabled) {
-          maybeQueueRecommendations(state).catch((err) =>
-            console.error('[Spotify] Autoplay top-up error:', err.message)
-          );
-        }
-      }
-    } else {
-      _queueCheckTick = 0;
     }
 
     if (_io) {
@@ -3604,18 +3618,13 @@ function init(io) {
       const moodLabel = mappedMood ? ` · ${mappedMood.emoji} ${mappedMood.name}` : '';
       socket.emit('spotify:insights_action', { ok: true, msg: `Got it · "${def.label}"${moodLabel} · building your playlist…` });
 
-      // Queue feeling playlist
+      // Play feeling playlist fresh — clears the old (now-irrelevant) queue and
+      // caps to QUEUE_TARGET. Continuous refill keeps it topped up afterwards.
       try {
-        const tracks = await buildFeelingPlaylist(feeling, _activeFeeling.clusterTracks, CHECKIN_SEED_COUNT);
-        let queued = 0;
-        for (const t of tracks) {
-          try {
-            await _queueTrack(t);
-            queued++;
-            await new Promise(r => setTimeout(r, 100));
-          } catch { }
-        }
-        if (queued > 0) console.log(`[Spotify] Feeling "${feeling}" queued ${queued} tracks`);
+        const tracks = await buildFeelingPlaylist(feeling, _activeFeeling.clusterTracks, QUEUE_TARGET + 3);
+        const queued = await playFresh(tracks);
+        if (queued > 0) console.log(`[Spotify] Feeling "${feeling}" playing ${queued} tracks`);
+        setTimeout(emitQueue, 1500);
       } catch (err) {
         console.error('[Spotify] Feeling playlist error:', err.message);
       }
