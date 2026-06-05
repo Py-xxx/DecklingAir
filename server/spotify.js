@@ -53,6 +53,15 @@ const VIBE_ARCHIVE_FILE  = path.join(__dirname, 'data', 'vibe-archive.ndjson');
 const USER_PREFS_FILE    = path.join(__dirname, 'data', 'user-prefs.json');
 const TRACK_FEATURES_FILE = path.join(__dirname, 'data', 'track-features.json');
 const LIVE_STATE_FILE    = path.join(__dirname, 'data', 'live-session.json');
+const TASTE_PROFILE_FILE = path.join(__dirname, 'data', 'taste-profile.json');
+
+// ── Background feature warming ────────────────────────────────────────────────
+// An idle-time job that fetches audio features for the WHOLE saved library + top
+// tracks (not just songs replayed live), so energy/valence mood & vibe matching
+// can draw from the entire library instead of only recent history.
+const FEATURE_WARM_START_DELAY = 2 * 60 * 1000;      // first run 2 min after startup
+const FEATURE_WARM_INTERVAL    = 6 * 60 * 60 * 1000; // re-scan every 6h for newly-liked songs
+const FEATURE_WARM_DELAY_MS    = 1200;               // gentle pause between each ReccoBeats fetch
 
 const SESSION_PRUNE_DAYS       = 90;
 // Unified queue cap: every auto-queue feature (mood, vibe, feeling, autoplay,
@@ -71,6 +80,12 @@ const CHECKIN_SEED_COUNT          = 8;  // initial kickstart queue right after a
 const FINISH_FRAC      = 0.80;  // heard ≥80% → engaged / liked
 const ADAPTIVE_LIKES_MAX = 8;   // rolling window of recently-engaged tracks that steer refills
 const ARTIST_DISLIKE_SCORE = -3; // net (skips − engaged listens) at/below this → avoid the artist
+// Durable cross-session taste profile (persisted to disk). Artist scores are clamped
+// so taste can always recover, and a track is only soft-banned once it's been hard-
+// skipped repeatedly (not on a single wrong-vibe skip).
+const ARTIST_TASTE_MIN    = -8;
+const ARTIST_TASTE_MAX    =  8;
+const TRACK_SOFTBAN_COUNT =  2;  // net hard-skips before a track is durably soft-banned
 
 // ── Global tuning profile ─────────────────────────────────────────────────────
 // Six user-adjustable sliders (0–100, except lookahead) that shape EVERY Spotify
@@ -125,6 +140,7 @@ const PROGRESS_DELTA_MAX  = POLL_INTERVAL * 2.5; // sanity cap on progress delta
 
 let _io = null;
 let _pollTimer = null;
+let _featureWarmTimer = null;
 let _lastState = null;
 let _lastTrackId = null;
 let _autoQueueCount = 0;
@@ -152,6 +168,9 @@ let _liveSaveTick       = 0; // counter to throttle live-session snapshots to di
 let _history        = [];   // all-time log entries, loaded from file on start
 let _seededHistory  = [];   // in-memory only: entries seeded from Spotify API
 let _seedTimestamp  = 0;    // when _seededHistory was last populated
+let _librarySeeds   = [];   // whole saved library + top tracks, feature-warmed in the
+                            // background so mood/vibe matching draws from the full library
+let _libraryWarmedAt = 0;   // when _librarySeeds was last (re)built
 let _vibeNames      = {};   // { vibeKey: 'Custom Name' }
 let _activeVibeKey  = null;  // currently running continuous vibe (null = stopped)
 let _activeMoodKey  = null;  // currently running continuous mood (null = stopped)
@@ -176,16 +195,18 @@ function _markPlayed(id) {
 }
 
 // ── Adaptive engagement ───────────────────────────────────────────────────────
-// _recentLikes:      rolling features of tracks the user actually engaged with
-//                    (finished / heard most of) — steers refills toward the flow.
-// _dislikedTrackIds: specific songs the user skipped hard — only THOSE songs are
-//                    avoided, not the whole artist.
-// _artistScores:     lowercase artist → net score. Each hard skip −1, each engaged
-//                    listen +1. An artist is only avoided once the net drops to
-//                    ARTIST_DISLIKE_SCORE (a strong pattern); later listens recover it.
-let _recentLikes      = [];
-let _dislikedTrackIds = new Set();
-let _artistScores     = new Map();
+// _recentLikes:  rolling features of tracks the user actually engaged with
+//                (finished / heard most of) — steers refills toward the flow.
+//                Session-scoped: reset when a session opens/closes.
+// _artistTaste:  lowercase artist → durable net score, PERSISTED across sessions.
+//                Each hard skip −1, each engaged listen +1 (clamped). An artist is
+//                avoided once the net hits ARTIST_DISLIKE_SCORE; later listens recover it.
+// _trackDislikes: trackId → durable hard-skip count, PERSISTED across sessions. A track
+//                is soft-banned once skipped TRACK_SOFTBAN_COUNT times; a full listen
+//                decays the count back down (recovery).
+let _recentLikes   = [];
+let _artistTaste   = new Map();
+let _trackDislikes = new Map();
 
 // ── Cluster & feeling detection ───────────────────────────────────────────────
 let _currentCluster    = [];     // tracks in the current emerging cluster (with features)
@@ -279,6 +300,53 @@ function saveVibeNames() {
     fs.mkdirSync(path.dirname(VIBE_NAMES_FILE), { recursive: true });
     fs.writeFileSync(VIBE_NAMES_FILE, JSON.stringify(_vibeNames, null, 2));
   } catch (err) { console.error('[Spotify] Failed to save vibe names:', err.message); }
+}
+
+// ── Persistent cross-session taste profile ───────────────────────────────────
+// _artistTaste + _trackDislikes are durable: the signals we already compute from
+// listening engagement (skips / finishes) are written through to disk so taste
+// carries across sessions instead of resetting each time.
+let _tasteSaveTimer = null;
+let _tasteDirty = false;
+
+function loadTasteProfile() {
+  try {
+    if (!fs.existsSync(TASTE_PROFILE_FILE)) return;
+    const obj = JSON.parse(fs.readFileSync(TASTE_PROFILE_FILE, 'utf8'));
+    for (const [k, v] of Object.entries(obj.artistScores || {})) {
+      if (typeof v === 'number') _artistTaste.set(k, v);
+    }
+    for (const [k, v] of Object.entries(obj.trackDislikes || {})) {
+      if (typeof v === 'number') _trackDislikes.set(k, v);
+    }
+    console.log(`[Spotify] Loaded taste profile — ${_artistTaste.size} artists, ${_trackDislikes.size} disliked tracks`);
+  } catch (err) {
+    console.error('[Spotify] loadTasteProfile error:', err.message);
+  }
+}
+
+function saveTasteProfile() {
+  _tasteDirty = false;
+  try {
+    fs.mkdirSync(path.dirname(TASTE_PROFILE_FILE), { recursive: true });
+    const obj = {
+      artistScores:  Object.fromEntries(_artistTaste),
+      trackDislikes: Object.fromEntries(_trackDislikes),
+    };
+    fs.writeFileSync(TASTE_PROFILE_FILE, JSON.stringify(obj, null, 2));
+  } catch (err) {
+    console.error('[Spotify] saveTasteProfile error:', err.message);
+  }
+}
+
+// Debounced so a burst of engagement updates collapses into one disk write.
+function _scheduleTasteSave() {
+  _tasteDirty = true;
+  if (_tasteSaveTimer) return;
+  _tasteSaveTimer = setTimeout(() => {
+    _tasteSaveTimer = null;
+    if (_tasteDirty) saveTasteProfile();
+  }, 3000);
 }
 
 function loadUserPrefs() {
@@ -427,11 +495,10 @@ function openActiveSession() {
     trackCount:       0,
     trackIds:         [],
   };
-  // Fresh session → fresh no-repeat memory and adaptive signals
+  // Fresh session → fresh no-repeat memory and short-term flow signal.
+  // (Artist taste + track dislikes are durable now — they live in the taste profile.)
   _sessionTrackIds  = new Set();
   _recentLikes      = [];
-  _dislikedTrackIds = new Set();
-  _artistScores     = new Map();
 }
 
 function closeActiveSession() {
@@ -448,8 +515,6 @@ function closeActiveSession() {
   _lastCheckInAt   = 0;
   _sessionTrackIds  = new Set();
   _recentLikes      = [];
-  _dislikedTrackIds = new Set();
-  _artistScores     = new Map();
   if (_activeFeeling) {
     _activeFeeling = null;
     if (_io) _io.emit('spotify:feeling_expired');
@@ -488,8 +553,6 @@ function saveLiveState() {
       activeSession:    _activeSession,
       sessionTrackIds:  [..._sessionTrackIds],
       recentLikes:      _recentLikes,
-      dislikedTrackIds: [..._dislikedTrackIds],
-      artistScores:     [..._artistScores],
       currentCluster:   _currentCluster,
       currentCentroid:  _currentCentroid,
       driftBuffer:      _driftBuffer,
@@ -525,8 +588,6 @@ function loadLiveState() {
       _activeSession    = sess;
       _sessionTrackIds  = new Set(snap.sessionTrackIds  || []);
       _recentLikes      = snap.recentLikes      || [];
-      _dislikedTrackIds = new Set(snap.dislikedTrackIds || []);
-      _artistScores     = new Map(snap.artistScores     || []);
       _currentCluster   = snap.currentCluster   || [];
       _currentCentroid  = snap.currentCentroid  || null;
       _driftBuffer      = snap.driftBuffer      || [];
@@ -591,8 +652,8 @@ function resetSessionState() {
   _lastCheckInAt    = 0;
   _sessionTrackIds  = new Set();
   _recentLikes      = [];
-  _dislikedTrackIds = new Set();
-  _artistScores     = new Map();
+  // Durable taste (artist scores + track dislikes) intentionally survives a reset —
+  // it's a long-term profile, not session state.
   // Stop any running continuous engine — otherwise it keeps refilling from the old
   // context and the reset looks like it did nothing.
   const hadFeeling = !!_activeFeeling;
@@ -698,7 +759,7 @@ function combinedHistory() {
   const ownIds = new Set(_history.map(e => e.id));
   const seen   = new Set();
   const extra  = [];
-  for (const e of _seededHistory) {
+  for (const e of [..._seededHistory, ..._librarySeeds]) {
     if (e.ts) {
       // Recently-played: real play event — include as-is (already deduped vs _history at seed time)
       extra.push(e);
@@ -799,6 +860,101 @@ async function seedFromSpotify() {
     console.log(`[Spotify] Seed complete — ${_seededHistory.length} total seeded entries`);
   } catch (err) {
     console.error('[Spotify] seedFromSpotify error:', err.message);
+  }
+}
+
+// Build a feature-bearing seed entry (no timestamp) from a raw Spotify track object.
+function _libSeedFromTrack(t, source) {
+  return {
+    id: t.id, uri: t.uri,
+    title: t.name,
+    artist: t.artists?.map(a => a.name).join(', ') || '',
+    album: t.album?.name || '',
+    seeded: true, source,
+  };
+}
+
+// Copy a raw feature object (energy/valence 0-1) onto a seed entry on the 0-100 scale
+// the rest of the engine (vibe clustering, feeling bands) expects.
+function _applyFeatToSeed(seed, f) {
+  if (!seed || !f) return;
+  seed.bpm      = Math.round(f.tempo || 0);
+  seed.energy   = Math.round((f.energy           || 0) * 100);
+  seed.valence  = Math.round((f.valence          || 0) * 100);
+  seed.dance    = Math.round((f.danceability     || 0) * 100);
+  seed.acoustic = Math.round((f.acousticness     || 0) * 100);
+  seed.inst     = Math.round((f.instrumentalness || 0) * 100);
+}
+
+let _featureWarmRunning = false;
+
+/**
+ * Background-warm the audio-features DB for the WHOLE saved library + top tracks,
+ * then publish them as `_librarySeeds` so mood / vibe / feeling matching can draw
+ * from the entire library instead of only songs that happened to be replayed live.
+ *
+ * Idempotent & resumable: features already on disk are reused instantly, only the
+ * genuinely-missing ones hit ReccoBeats (throttled + an extra gentle delay so it
+ * never competes with live playback fetches). Safe to re-run periodically to pick
+ * up newly-liked songs.
+ */
+async function warmFeatureLibrary() {
+  if (_featureWarmRunning || !isAuthed()) return;
+  _featureWarmRunning = true;
+  try {
+    // 1. Gather library + top-track metadata (deduped by id)
+    const byId = new Map();
+    try {
+      const liked = await getAllLikedSongs();
+      for (const entry of liked) {
+        const t = entry.item || entry.track;
+        if (t?.id && !byId.has(t.id)) byId.set(t.id, _libSeedFromTrack(t, 'liked_library'));
+      }
+    } catch (e) {
+      console.warn('[Spotify] Feature warm: liked-library fetch failed:', e.message);
+    }
+    for (const range of ['short_term', 'medium_term', 'long_term']) {
+      try {
+        const tt = await api('GET', '/me/top/tracks', { params: { time_range: range, limit: 50 } });
+        for (const t of (tt?.items || [])) {
+          if (t?.id && !byId.has(t.id)) byId.set(t.id, _libSeedFromTrack(t, 'top_' + range));
+        }
+      } catch { /* non-fatal */ }
+    }
+    if (!byId.size) { console.log('[Spotify] Feature warm: no library tracks found'); return; }
+
+    // 2. Attach already-cached features; queue up whatever's still missing
+    const missing = [];
+    for (const [id, seed] of byId) {
+      const feat = _audioFeaturesCache.get(id);
+      if (feat) _applyFeatToSeed(seed, feat);
+      else if (!_negCached(id)) missing.push(id);
+    }
+    // Publish immediately so the already-warm portion is usable right away
+    _librarySeeds = [...byId.values()];
+    _libraryWarmedAt = Date.now();
+    const have = byId.size - missing.length;
+    console.log(`[Spotify] Feature warm: ${byId.size} library tracks (${have} already featured, ${missing.length} to fetch)`);
+
+    // 3. Gently fetch the missing features one at a time
+    let got = 0, done = 0;
+    for (const id of missing) {
+      if (!isAuthed() || !_pollTimer) break; // auth lost / shutting down — stop cleanly
+      if (_audioFeaturesCache.has(id)) { _applyFeatToSeed(byId.get(id), _audioFeaturesCache.get(id)); done++; continue; }
+      try {
+        const recco = await getReccoBeatsFeatures(id);
+        if (recco) { _cacheFeatures(id, recco); _applyFeatToSeed(byId.get(id), recco); got++; }
+        else _audioFeaturesNegCache.set(id, Date.now());
+      } catch { /* transient — leave for the next run */ }
+      done++;
+      if (done % 25 === 0) console.log(`[Spotify] Feature warm: ${done}/${missing.length} fetched (${got} new)`);
+      await new Promise(r => setTimeout(r, FEATURE_WARM_DELAY_MS));
+    }
+    console.log(`[Spotify] Feature warm complete — ${got} new features (${byId.size} library tracks now pooled for matching)`);
+  } catch (err) {
+    console.error('[Spotify] warmFeatureLibrary error:', err.message);
+  } finally {
+    _featureWarmRunning = false;
   }
 }
 
@@ -1191,23 +1347,58 @@ function _excludePlayed(tracks) {
   return (tracks || []).filter(t => t && t.id && !_sessionTrackIds.has(t.id));
 }
 
-// Net engagement score for an artist (each hard skip −1, each engaged listen +1).
+// Durable net engagement score for an artist (each hard skip −1, each engaged listen
+// +1), clamped so taste can always recover. Persisted across sessions.
 function _adjustArtistScore(artist, delta) {
   if (!artist) return;
   const key = artist.toLowerCase();
-  _artistScores.set(key, (_artistScores.get(key) || 0) + delta);
+  const next = Math.max(ARTIST_TASTE_MIN, Math.min(ARTIST_TASTE_MAX, (_artistTaste.get(key) || 0) + delta));
+  _artistTaste.set(key, next);
+  _scheduleTasteSave();
 }
 function _artistAvoided(artist) {
   if (!artist) return false;
-  return (_artistScores.get(artist.toLowerCase()) || 0) <= ARTIST_DISLIKE_SCORE;
+  return (_artistTaste.get(artist.toLowerCase()) || 0) <= ARTIST_DISLIKE_SCORE;
+}
+// Positive taste signal for an artist (0 = neutral/disliked) — used to bias selection.
+function _artistBoost(artist) {
+  if (!artist) return 0;
+  return Math.max(0, _artistTaste.get(artist.toLowerCase()) || 0);
 }
 
-// Drop the specific songs the user skipped hard, plus any artist whose net score
+// Durable per-track dislike count. A hard skip bumps it; a full listen decays it.
+function _bumpTrackDislike(id) {
+  if (!id) return;
+  _trackDislikes.set(id, (_trackDislikes.get(id) || 0) + 1);
+  _scheduleTasteSave();
+}
+function _recoverTrackDislike(id) {
+  if (!id || !_trackDislikes.has(id)) return;
+  const n = (_trackDislikes.get(id) || 0) - 1;
+  if (n <= 0) _trackDislikes.delete(id); else _trackDislikes.set(id, n);
+  _scheduleTasteSave();
+}
+function _trackSoftBanned(id) {
+  return !!id && (_trackDislikes.get(id) || 0) >= TRACK_SOFTBAN_COUNT;
+}
+
+// Drop tracks the user has repeatedly skipped, plus any artist whose durable score
 // has fallen to a strong-dislike pattern (engaged listens since then recover it).
 function _excludeDisliked(tracks) {
-  if (!_dislikedTrackIds.size && !_artistScores.size) return tracks || [];
+  if (!_trackDislikes.size && !_artistTaste.size) return tracks || [];
   return (tracks || []).filter(t =>
-    t && !(t.id && _dislikedTrackIds.has(t.id)) && !_artistAvoided(t.artist));
+    t && !_trackSoftBanned(t.id) && !_artistAvoided(t.artist));
+}
+
+// Stable re-rank that drifts tracks by durably-boosted artists toward the front, so
+// they're favoured when a candidate pool is truncated — without hard-overriding the
+// existing order (equal-boost tracks keep their relative position).
+function _applyTasteBias(tracks) {
+  if (!_artistTaste.size || !tracks || tracks.length < 2) return tracks || [];
+  return tracks
+    .map((t, i) => ({ t, i, b: _artistBoost(t.artist) }))
+    .sort((a, b) => (b.b - a.b) || (a.i - b.i))
+    .map(x => x.t);
 }
 
 // Remember a track the user engaged with so the next refills lean toward it.
@@ -1242,13 +1433,15 @@ function _evaluateEngagement(prev) {
   if (finished || frac >= _tSkipSoft()) {
     if (likeRec) _pushRecentLike(likeRec);
     _adjustArtistScore(prev.track.artist, +1);   // engaged listen recovers the artist
+    _recoverTrackDislike(prev.track.id);          // a full listen forgives a past skip
     return;
   }
   if (frac < _tSkipStrong()) {
-    _dislikedTrackIds.add(prev.track.id);        // avoid only this specific song
+    _bumpTrackDislike(prev.track.id);            // repeated skips → durable soft-ban
     _adjustArtistScore(prev.track.artist, -1);
+    const banned  = _trackSoftBanned(prev.track.id);
     const avoided = _artistAvoided(prev.track.artist);
-    console.log(`[Spotify] Engagement: strong dislike (${Math.round(frac * 100)}%) "${prev.track.title}"${avoided ? ` — pattern detected, now avoiding ${prev.track.artist}` : ''}`);
+    console.log(`[Spotify] Engagement: strong dislike (${Math.round(frac * 100)}%) "${prev.track.title}"${banned ? ' — now soft-banned' : ''}${avoided ? ` — pattern detected, now avoiding ${prev.track.artist}` : ''}`);
     return;
   }
   // Between the two thresholds: just didn't fit the current vibe — note it, but don't penalize.
@@ -2383,7 +2576,9 @@ async function buildVibePlaylist(vibeKey, limit = 25) {
   const discoveryCount = Math.min(Math.ceil(limit * _tDiscoveryRatio()), 10);
   const baseCount = Math.max(1, limit - discoveryCount);
 
-  const base = [...pool].sort(() => Math.random() - 0.5).slice(0, baseCount);
+  // Taste-bias the shuffle so durably-loved artists are favoured when the pool is
+  // truncated, while keeping randomness among equally-scored tracks.
+  const base = _applyTasteBias([...pool].sort(() => Math.random() - 0.5)).slice(0, baseCount);
 
   // Seed discovery from the FULL cluster, not just the unplayed `base`. Otherwise an
   // actively-playing vibe (all its tracks already in _sessionTrackIds) yields no seeds,
@@ -2443,8 +2638,9 @@ async function buildFeelingPlaylist(feelingKey, sessionTracks = [], limit = 20) 
   if (sessionCentroid) {
     pool.sort((a, b) => _clusterDist(sessionCentroid, a) - _clusterDist(sessionCentroid, b));
   } else {
-    // Shuffle if no centroid
-    pool.sort(() => Math.random() - 0.5);
+    // No centroid to steer by — order by durable artist taste, breaking ties randomly,
+    // so loved artists surface first while everything else stays shuffled.
+    pool.sort((a, b) => (_artistBoost(b.artist) - _artistBoost(a.artist)) || (Math.random() - 0.5));
   }
 
   const discoveryCount = Math.min(Math.ceil(limit * _tDiscoveryRatio()), 10);
@@ -2637,7 +2833,7 @@ function _findStoredFeatures(trackId) {
 
   let seededMatch = null;
   let seededMatchNoFeatures = null;
-  for (const e of _seededHistory) {
+  for (const e of [..._seededHistory, ..._librarySeeds]) {
     if (e.id === trackId) {
       if (e.energy != null) { seededMatch = e; break; }
       else if (!seededMatchNoFeatures) seededMatchNoFeatures = e;
@@ -3197,6 +3393,13 @@ function startPolling() {
   _pollTimer = setInterval(poll, POLL_INTERVAL);
   // Seed history from Spotify in the background (non-blocking)
   if (_seedTimestamp === 0) seedFromSpotify().catch(() => {});
+  // Warm audio features for the whole library in the background (idle-time job).
+  // Delayed so it yields to the initial seed + the first live plays, then re-scans
+  // periodically for newly-liked songs.
+  if (!_featureWarmTimer) {
+    setTimeout(() => warmFeatureLibrary().catch(() => {}), FEATURE_WARM_START_DELAY);
+    _featureWarmTimer = setInterval(() => warmFeatureLibrary().catch(() => {}), FEATURE_WARM_INTERVAL);
+  }
   // Reconcile away-listening every 30 minutes
   if (!_reconcileTimer) {
     // First reconcile shortly after startup, then on the regular interval
@@ -3217,11 +3420,18 @@ function stopPolling() {
     clearInterval(_reconcileTimer);
     _reconcileTimer = null;
   }
+  if (_featureWarmTimer) {
+    clearInterval(_featureWarmTimer);
+    _featureWarmTimer = null;
+  }
   // Close any active session so time isn't lost on graceful shutdown
   closeActiveSession();
   // Flush any pending features writes so nothing fetched right before shutdown is lost
   if (_featuresDBSaveTimer) { clearTimeout(_featuresDBSaveTimer); _featuresDBSaveTimer = null; }
   if (_featuresDBDirty) saveFeaturesDB();
+  // Flush the taste profile too
+  if (_tasteSaveTimer) { clearTimeout(_tasteSaveTimer); _tasteSaveTimer = null; }
+  if (_tasteDirty) saveTasteProfile();
 }
 
 // ---------------------------------------------------------------------------
@@ -3273,6 +3483,7 @@ function init(io) {
   loadVibeNames();
   loadUserPrefs();
   loadFeaturesDB();
+  loadTasteProfile();
   loadLiveState(); // after loadSessions so stale-session finalize can de-dupe
 
   // Start polling if already authed
