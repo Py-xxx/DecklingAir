@@ -123,6 +123,11 @@ export function initEditor(state, callbacks) {
     });
   });
 
+  // Add-Control category tabs (Voicemeeter / Spotify / Other)
+  document.querySelectorAll('.type-tab').forEach(tab => {
+    tab.addEventListener('click', () => switchTypeTab(tab.dataset.tab));
+  });
+
   document.getElementById('fab-add').addEventListener('click', () => openModal(null));
   document.getElementById('btn-edit').addEventListener('click', toggleEditMode);
 
@@ -376,6 +381,15 @@ function selectType(type) {
 function highlightSelectedType(type) {
   document.querySelectorAll('.type-card').forEach(card => {
     card.classList.toggle('selected', card.dataset.type === type);
+  });
+}
+
+function switchTypeTab(tab) {
+  document.querySelectorAll('.type-tab').forEach(t => {
+    t.classList.toggle('active', t.dataset.tab === tab);
+  });
+  document.querySelectorAll('.type-tab-panel').forEach(panel => {
+    panel.style.display = panel.dataset.panel === tab ? '' : 'none';
   });
 }
 
