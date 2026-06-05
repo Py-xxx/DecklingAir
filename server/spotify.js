@@ -194,6 +194,16 @@ function _markPlayed(id) {
   }
 }
 
+// URIs WE deliberately staged into the playback context (playFresh / rebuildUpcoming /
+// queueOnTop). Spotify's own Autoplay silently appends recommended tracks to the queue
+// once our finite uris-context nears its end; those injected tracks aren't in here. The
+// continuous engine counts only OUR upcoming tracks (ignoring autoplay) to decide when to
+// refill, and rebuildUpcoming drops anything not in here — so autoplay can't masquerade as
+// a full queue and starve the refill, and its picks get evicted on the next rebuild.
+let _stagedUris = new Set();
+function _setStaged(uris) { _stagedUris = new Set((uris || []).filter(Boolean)); }
+function _addStaged(uris) { for (const u of (uris || [])) if (u) _stagedUris.add(u); }
+
 // ── Adaptive engagement ───────────────────────────────────────────────────────
 // _recentLikes:  rolling features of tracks the user actually engaged with
 //                (finished / heard most of) — steers refills toward the flow.
@@ -652,6 +662,7 @@ function resetSessionState() {
   _lastCheckInAt    = 0;
   _sessionTrackIds  = new Set();
   _recentLikes      = [];
+  _stagedUris       = new Set();
   // Durable taste (artist scores + track dislikes) intentionally survives a reset —
   // it's a long-term profile, not session state.
   // Stop any running continuous engine — otherwise it keeps refilling from the old
@@ -1253,6 +1264,9 @@ async function playFresh(tracks) {
   list = list.slice(0, QUEUE_TARGET + 1);
   const uris = list.map(t => t.uri || `spotify:track:${t.id}`);
   await play({ uris });
+  // This uris-context is now the authoritative queue; forget any previous staging
+  // (and any Spotify-autoplay tracks that may have been appended to the old context).
+  _setStaged(uris);
   for (const t of list) {
     const id = t.id || (t.uri && t.uri.startsWith('spotify:track:') ? t.uri.split(':').pop() : null);
     _markPlayed(id);
@@ -1283,9 +1297,11 @@ async function queueOnTop(uri) {
   if (currentUri) {
     // Keep the current song playing where it is, slot the new track in next.
     await play({ uris: [currentUri, uri, ...upcoming], positionMs: progressMs });
+    _setStaged([currentUri, uri, ...upcoming]);
   } else {
     // Nothing playing — just start with the new track at the front.
     await play({ uris: [uri, ...upcoming] });
+    _setStaged([uri, ...upcoming]);
   }
   const id = uri.startsWith('spotify:track:') ? uri.split(':').pop() : null;
   _markPlayed(id);
@@ -1316,6 +1332,11 @@ async function rebuildUpcoming(freshTracks) {
     const q = await getQueue();
     upcoming = (q?.queue || []).map(t => t && t.uri).filter(Boolean);
   } catch { /* queue unavailable */ }
+  // Keep ONLY the upcoming tracks WE staged. Spotify Autoplay appends its own
+  // recommendations to our finite uris-context; if we preserved them they'd
+  // perpetuate (and crowd out the vibe). Dropping them here means the rebuilt
+  // context replaces autoplay's tail with our tracks.
+  upcoming = upcoming.filter(u => _stagedUris.has(u));
   // Only keep as many existing upcoming as the cap allows.
   upcoming = upcoming.slice(0, QUEUE_TARGET);
 
@@ -1335,6 +1356,8 @@ async function rebuildUpcoming(freshTracks) {
   if (currentUri) await play({ uris: [currentUri, ...nextUris], positionMs: progressMs });
   else            await play({ uris: nextUris });
 
+  // This rebuilt context is now authoritative: current + the tracks we just staged.
+  _setStaged([currentUri, ...nextUris]);
   for (const u of nextUris) {
     const id = u.startsWith('spotify:track:') ? u.split(':').pop() : null;
     _markPlayed(id);
@@ -1477,9 +1500,11 @@ async function playWithContinuation(uri) {
   // the same call so Spotify treats it as a playlist context
   if (continuationUris.length) {
     await play({ uris: [uri, ...continuationUris] });
+    _setStaged([uri, ...continuationUris]);
   } else {
     console.warn('[Spotify] No continuation tracks found — playing single track');
     await play({ uris: [uri] });
+    _setStaged([uri]);
   }
 }
 
@@ -2841,6 +2866,25 @@ function _findStoredFeatures(trackId) {
   }
   if (seededMatch) return seededMatch;
 
+  // Final fallback: the raw audio-features cache (track-features.json). Discovery
+  // tracks fetched via ReccoBeats land here but aren't added to history/seeds, so
+  // without this their cluster updates were silently skipped. Convert the raw 0-1
+  // shape to the 0-100 entry shape the cluster/centroid math expects.
+  const raw = _audioFeaturesCache.get(trackId);
+  if (raw && (raw.energy != null || raw.valence != null)) {
+    return {
+      id: trackId,
+      bpm:      Math.round(raw.tempo || 0),
+      energy:   Math.round((raw.energy           || 0) * 100),
+      valence:  Math.round((raw.valence          || 0) * 100),
+      dance:    Math.round((raw.danceability     || 0) * 100),
+      acoustic: Math.round((raw.acousticness     || 0) * 100),
+      inst:     Math.round((raw.instrumentalness || 0) * 100),
+      key:      raw.key != null && raw.key >= 0 ? PITCH_CLASSES[raw.key] : null,
+      mode:     raw.mode === 1 ? 'Maj' : raw.mode === 0 ? 'Min' : null,
+    };
+  }
+
   // Log why we couldn't find it
   if (historyMatchNoFeatures) {
     console.log(`[Spotify] Features: found in history but energy=null for id=${trackId} — keys: ${Object.keys(historyMatchNoFeatures).join(',')}`);
@@ -2927,12 +2971,17 @@ async function maybeRefillContinuousQueue(state) {
   if (!_activeMoodKey && !_activeVibeKey && !_activeFeeling) return;
   try {
     const queueData = await getQueue();
-    const queueLength = queueData?.queue?.length || 0;
-    if (queueLength >= QUEUE_TARGET) return;
+    // Count only the tracks WE staged. Spotify Autoplay quietly appends its own
+    // recommendations to our finite uris-context, so the raw queue length stays
+    // ≥ QUEUE_TARGET forever and would permanently short-circuit the refill (the
+    // user then hears autoplay's picks, not the vibe, and the cluster — fed by our
+    // feature-bearing tracks — appears frozen). Gating on OUR upcoming count fixes both.
+    const ours = (queueData?.queue || []).filter(t => t?.uri && _stagedUris.has(t.uri)).length;
+    if (ours >= QUEUE_TARGET) return;
 
     // Build a small over-fetch; rebuildUpcoming() only stages enough to reach
     // the cap and skips dupes. Over-fetch covers disliked/already-played drops.
-    const refillCount = (QUEUE_TARGET - queueLength) + 3;
+    const refillCount = (QUEUE_TARGET - ours) + 3;
     let tracks;
     if (_activeFeeling) {
       // Feeling is the baseline, but go with the flow: blend in the tracks the user is
@@ -3328,9 +3377,6 @@ async function poll() {
           maybeSmartShuffle(state).catch((err) =>
             console.error('[Spotify] Smart shuffle error:', err.message)
           );
-          maybeRefillContinuousQueue(state).catch((err) =>
-            console.error('[Spotify] Continuous refill error:', err.message)
-          );
         }
         // Emit audio features on first track load too (not just track changes)
         if (!_lastTrackId) {
@@ -3352,6 +3398,17 @@ async function poll() {
       }
 
       _lastTrackId = state.track.id;
+
+      // Keep the continuous queue topped up on EVERY poll (not just on track
+      // changes) so the queue can never run dry — if a change is missed or the
+      // context drains, the next poll (≤5 s) refills it. The function's own
+      // "ours >= QUEUE_TARGET" gate makes this a cheap no-op when already full,
+      // so there's no extra re-buffering versus the per-track-change call.
+      if (state.isPlaying && (_activeMoodKey || _activeVibeKey || _activeFeeling)) {
+        maybeRefillContinuousQueue(state).catch((err) =>
+          console.error('[Spotify] Continuous refill error:', err.message)
+        );
+      }
     } else {
       // No track / no state — reset progress, check session gap
       _lastProgress = null;
