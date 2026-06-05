@@ -51,6 +51,7 @@ const SESSIONS_FILE      = path.join(__dirname, 'data', 'sessions.ndjson');
 const VIBE_NAMES_FILE    = path.join(__dirname, 'data', 'vibe-names.json');
 const VIBE_ARCHIVE_FILE  = path.join(__dirname, 'data', 'vibe-archive.ndjson');
 const USER_PREFS_FILE    = path.join(__dirname, 'data', 'user-prefs.json');
+const TRACK_FEATURES_FILE = path.join(__dirname, 'data', 'track-features.json');
 
 const SESSION_PRUNE_DAYS       = 90;
 const CONTINUOUS_REFILL_THRESHOLD = 3;  // refill queue when fewer than this many tracks remain
@@ -1110,6 +1111,55 @@ function _negCached(trackId) {
   return true;
 }
 
+// ── Persistent audio-features database ──────────────────────────────────────
+// _audioFeaturesCache doubles as the in-memory DB; it's loaded from disk at
+// startup and written through on every genuine fetch. This means features
+// survive a restart, so we don't replay the heavily-throttled ReccoBeats
+// lookups after every `pm2 restart`. Keyed by Spotify track ID → raw feature
+// object (same shape getAudioFeatures returns: { tempo, energy 0-1, valence, … }).
+let _featuresDBSaveTimer = null;
+let _featuresDBDirty = false;
+
+function loadFeaturesDB() {
+  try {
+    if (!fs.existsSync(TRACK_FEATURES_FILE)) return;
+    const obj = JSON.parse(fs.readFileSync(TRACK_FEATURES_FILE, 'utf8'));
+    let n = 0;
+    for (const [id, feat] of Object.entries(obj || {})) {
+      if (feat && typeof feat === 'object') { _audioFeaturesCache.set(id, feat); n++; }
+    }
+    console.log(`[Spotify] Loaded ${n} cached track features from disk`);
+  } catch (err) {
+    console.error('[Spotify] loadFeaturesDB error:', err.message);
+  }
+}
+
+function saveFeaturesDB() {
+  _featuresDBDirty = false;
+  try {
+    fs.mkdirSync(path.dirname(TRACK_FEATURES_FILE), { recursive: true });
+    const obj = {};
+    for (const [id, feat] of _audioFeaturesCache) obj[id] = feat;
+    fs.writeFileSync(TRACK_FEATURES_FILE, JSON.stringify(obj));
+  } catch (err) {
+    console.error('[Spotify] saveFeaturesDB error:', err.message);
+  }
+}
+
+// Write a genuine feature object into the cache and schedule a debounced save.
+// Debounced so a burst of new tracks (e.g. batch enrichment) collapses into one
+// disk write instead of one per track.
+function _cacheFeatures(trackId, feat) {
+  if (!trackId || !feat) return;
+  _audioFeaturesCache.set(trackId, feat);
+  _featuresDBDirty = true;
+  if (_featuresDBSaveTimer) return;
+  _featuresDBSaveTimer = setTimeout(() => {
+    _featuresDBSaveTimer = null;
+    if (_featuresDBDirty) saveFeaturesDB();
+  }, 3000);
+}
+
 // ReccoBeats throttle: all requests are serialized through one promise chain with a
 // minimum gap that widens automatically on 429 and relaxes on success. Prevents the
 // request storms that were triggering HTTP 429 during seeding.
@@ -1207,7 +1257,7 @@ async function getAudioFeatures(trackId) {
     try {
       const data = await api('GET', `/audio-features/${trackId}`);
       if (data && data.tempo != null) {
-        _audioFeaturesCache.set(trackId, data);
+        _cacheFeatures(trackId, data);
         return data;
       }
     } catch {
@@ -1217,7 +1267,7 @@ async function getAudioFeatures(trackId) {
     const recco = await getReccoBeatsFeatures(trackId);
     if (recco) {
       console.log(`[Spotify] Audio features via ReccoBeats — energy=${recco.energy} valence=${recco.valence} tempo=${Math.round(recco.tempo)} id=${trackId}`);
-      _audioFeaturesCache.set(trackId, recco);
+      _cacheFeatures(trackId, recco);
       return recco;
     }
     console.warn('[Spotify] Audio features unavailable (Spotify + ReccoBeats) for', trackId);
@@ -1242,7 +1292,7 @@ async function getBatchAudioFeatures(trackIds) {
       const ids = toFetch.slice(0, 100).join(',');
       const data = await api('GET', '/audio-features', { params: { ids } });
       const features = (data && data.audio_features) ? data.audio_features : [];
-      features.forEach(f => { if (f && f.id) _audioFeaturesCache.set(f.id, f); });
+      features.forEach(f => { if (f && f.id) _cacheFeatures(f.id, f); });
     } catch {
       // expected — fall through to ReccoBeats
     }
@@ -1256,7 +1306,7 @@ async function getBatchAudioFeatures(trackIds) {
       let got = 0;
       for (const id of stillMissing) {
         const recco = await getReccoBeatsFeatures(id);
-        if (recco) { _audioFeaturesCache.set(id, recco); got++; }
+        if (recco) { _cacheFeatures(id, recco); got++; }
         else _audioFeaturesNegCache.set(id, Date.now());
       }
       console.log(`[Spotify] Batch features via ReccoBeats: ${got}/${stillMissing.length} enriched`);
@@ -2733,6 +2783,9 @@ function stopPolling() {
   }
   // Close any active session so time isn't lost on graceful shutdown
   closeActiveSession();
+  // Flush any pending features writes so nothing fetched right before shutdown is lost
+  if (_featuresDBSaveTimer) { clearTimeout(_featuresDBSaveTimer); _featuresDBSaveTimer = null; }
+  if (_featuresDBDirty) saveFeaturesDB();
 }
 
 // ---------------------------------------------------------------------------
@@ -2783,6 +2836,7 @@ function init(io) {
   loadSessions();
   loadVibeNames();
   loadUserPrefs();
+  loadFeaturesDB();
 
   // Start polling if already authed
   if (isAuthed()) {
