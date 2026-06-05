@@ -15,6 +15,8 @@ import {
   getSpotifyStats,
   resetSpotifySession,
   saveSessionAsPlaylist,
+  getSessionTracks,
+  queueSession,
   getSpotifyQueue,
   getSpotifyDevices,
   addToPlaylist,
@@ -35,6 +37,24 @@ import {
   stopFeeling,
 } from './spotify-client.js';
 import { socket } from './socket.js';
+
+// ---------------------------------------------------------------------------
+// Shared inline SVG icons (consistent line-icon set across the Spotify cards)
+// ---------------------------------------------------------------------------
+
+const _svg = (paths, size = 14) =>
+  `<svg class="sp-icon" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${paths}</svg>`;
+
+const SP_ICON = {
+  // List with a plus — "add to playlist"
+  playlistAdd: _svg('<path d="M3 6h12M3 12h9M3 18h7"/><path d="M18 14v6M15 17h6"/>'),
+  // Circular refresh arrow — "reset"
+  reset: _svg('<path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>'),
+  // Filled play triangle — "queue all / play"
+  play: _svg('<path d="M6 4l14 8-14 8V4z" fill="currentColor" stroke="none"/>'),
+  // Chevron — expand/collapse
+  chevron: _svg('<path d="M6 9l6 6 6-6"/>', 13),
+};
 
 // ---------------------------------------------------------------------------
 // Minimal local helpers (no import from controls.js to avoid circular deps)
@@ -1754,59 +1774,64 @@ function renderSpotifyStats(ctrl) {
       <div class="sp-section-header">
         <span class="sp-section-title">Session</span>
         <span class="sp-stats-since"></span>
-        <button class="sp-stats-reset-btn" aria-label="Reset session" title="Reset session">↺</button>
+        <button class="sp-stats-reset-btn" aria-label="Reset session" title="Reset session">${SP_ICON.reset}</button>
       </div>
-      <div class="sp-stats-grid">
-        <div class="sp-stat-tile">
-          <div class="sp-stat-value sp-stat-tracks">—</div>
-          <div class="sp-stat-label">Tracks</div>
-        </div>
-        <div class="sp-stat-tile">
-          <div class="sp-stat-value sp-stat-time">—</div>
-          <div class="sp-stat-label">This Session</div>
-        </div>
+      <div class="sp-stats-tabbar">
+        <button class="sp-stats-tab active" data-tab="current">Current</button>
+        <button class="sp-stats-tab" data-tab="history">History</button>
       </div>
-      <div class="sp-stats-time-row">
-        <div class="sp-time-tile">
-          <div class="sp-time-value sp-stat-today">—</div>
-          <div class="sp-time-label">Today</div>
-        </div>
-        <div class="sp-time-tile">
-          <div class="sp-time-value sp-stat-week">—</div>
-          <div class="sp-time-label">This Week</div>
-        </div>
-        <div class="sp-time-tile">
-          <div class="sp-time-value sp-stat-total">—</div>
-          <div class="sp-time-label">All Time</div>
-        </div>
-      </div>
-      <div class="sp-stats-artists">
-        <div class="sp-stats-artists-title">Top Artists</div>
-        <div class="sp-stats-artists-list"></div>
-      </div>
-      <div class="sp-stats-recent">
-        <div class="sp-stats-recent-title">Recently Played</div>
-        <div class="sp-stats-recent-list"></div>
-      </div>
-      <!-- Save as playlist -->
-      <div class="sp-save-session">
-        <button class="sp-save-session-btn">💾 Save as Playlist</button>
-        <div class="sp-save-session-form" style="display:none">
-          <input class="sp-save-session-input" type="text" placeholder="Playlist name…" maxlength="100">
-          <div class="sp-save-session-actions">
-            <button class="sp-save-session-confirm">Save</button>
-            <button class="sp-save-session-cancel">Cancel</button>
+
+      <!-- CURRENT -->
+      <div class="sp-stats-panel" data-panel="current">
+        <div class="sp-stats-grid">
+          <div class="sp-stat-tile">
+            <div class="sp-stat-value sp-stat-tracks">—</div>
+            <div class="sp-stat-label">Tracks</div>
+          </div>
+          <div class="sp-stat-tile">
+            <div class="sp-stat-value sp-stat-time">—</div>
+            <div class="sp-stat-label">This Session</div>
           </div>
         </div>
-        <div class="sp-save-session-feedback" style="display:none"></div>
+        <div class="sp-stats-time-row">
+          <div class="sp-time-tile">
+            <div class="sp-time-value sp-stat-today">—</div>
+            <div class="sp-time-label">Today</div>
+          </div>
+          <div class="sp-time-tile">
+            <div class="sp-time-value sp-stat-week">—</div>
+            <div class="sp-time-label">This Week</div>
+          </div>
+          <div class="sp-time-tile">
+            <div class="sp-time-value sp-stat-total">—</div>
+            <div class="sp-time-label">All Time</div>
+          </div>
+        </div>
+        <div class="sp-stats-artists">
+          <div class="sp-stats-artists-title">Top Artists</div>
+          <div class="sp-stats-artists-list"></div>
+        </div>
+        <div class="sp-stats-recent">
+          <div class="sp-stats-recent-title">Recently Played</div>
+          <div class="sp-stats-recent-list"></div>
+        </div>
+        <!-- Save as playlist -->
+        <div class="sp-save-session">
+          <button class="sp-save-session-btn">${SP_ICON.playlistAdd}<span>Save as Playlist</span></button>
+          <div class="sp-save-session-form" style="display:none">
+            <input class="sp-save-session-input" type="text" placeholder="Playlist name…" maxlength="100">
+            <div class="sp-save-session-actions">
+              <button class="sp-save-session-confirm">Save</button>
+              <button class="sp-save-session-cancel">Cancel</button>
+            </div>
+          </div>
+          <div class="sp-save-session-feedback" style="display:none"></div>
+        </div>
       </div>
-      <!-- Past Sessions -->
-      <div class="sp-session-history">
-        <button class="sp-history-toggle">
-          <span class="sp-history-toggle-label">Past Sessions</span>
-          <span class="sp-history-caret">▼</span>
-        </button>
-        <div class="sp-history-list" style="display:none"></div>
+
+      <!-- HISTORY -->
+      <div class="sp-stats-panel" data-panel="history" style="display:none">
+        <div class="sp-history-list"></div>
       </div>
     </div>
   `;
@@ -1830,9 +1855,9 @@ function renderSpotifyStats(ctrl) {
   const saveConfirm   = card.querySelector('.sp-save-session-confirm');
   const saveCancel    = card.querySelector('.sp-save-session-cancel');
   const saveFeedback  = card.querySelector('.sp-save-session-feedback');
-  const historyToggle = card.querySelector('.sp-history-toggle');
+  const statsTabBar   = card.querySelector('.sp-stats-tabbar');
+  const statsPanels   = card.querySelectorAll('.sp-stats-panel');
   const historyList   = card.querySelector('.sp-history-list');
-  const historyCaret  = card.querySelector('.sp-history-caret');
 
   // ── Listen-time display ─────────────────────────────────────────────────
   // The server tracks real listened time via progress_ms delta.
@@ -1977,9 +2002,18 @@ function renderSpotifyStats(ctrl) {
 
   _statsCardUpdaters.add(_render);
 
-  // ── Past Sessions toggle ───────────────────────────────────────────────────
-  let _historyOpen    = false;
-  let _historyLoaded  = false;
+  // ── Past Sessions (History tab) ─────────────────────────────────────────────
+  let _historyLoaded   = false;
+  const _trackCache    = new Map(); // sessionId → tracks[] (lazy, cached per expand)
+
+  // Vibe → accent colour for the per-session badge.
+  const VIBE_COLORS = {
+    hype: '#ff5c5c', intense: '#e0612e', drive: '#f59e0b', good_vibes: '#fbbf24',
+    grind: '#a16207', flow: '#10b981', chill: '#38bdf8', melancholy: '#6366f1', ease: '#22d3ee',
+    t_morning: '#fcd34d', t_midday: '#fbbf24', t_afternoon: '#fb923c',
+    t_evening: '#a78bfa', t_night: '#6366f1', t_latenight: '#4338ca',
+  };
+  const _vibeColor = (k) => VIBE_COLORS[k] || '#1DB954';
 
   function _fmtSessionDate(ts) {
     const d = new Date(ts);
@@ -1999,25 +2033,109 @@ function renderSpotifyStats(ctrl) {
       historyList.innerHTML = '<div class="sp-queue-empty">No past sessions yet</div>';
       return;
     }
+    const maxMs = Math.max(...sessions.map(s => s.listenedMs || 0), 1);
     sessions.forEach(s => {
       const row = document.createElement('div');
       row.className = 'sp-history-row';
+      row.dataset.id = s.id;
       const sourceClass = s.source === 'away' ? 'sp-history-badge--away' : 'sp-history-badge--live';
       const sourceLabel = s.source === 'away' ? 'Away' : 'Live';
       const trackCount  = s.trackIds ? s.trackIds.length : (s.trackCount ?? 0);
+      const sparkPct    = Math.round(((s.listenedMs || 0) / maxMs) * 100);
+      const vibeChip    = s.vibeName
+        ? `<span class="sp-history-vibe" style="--vibe:${_vibeColor(s.vibeKey)}">${_esc(s.vibeName)}</span>`
+        : '';
       row.innerHTML = `
-        <div class="sp-history-meta">
-          <span class="sp-history-date">${_fmtSessionDate(s.startTime)}</span>
-          <span class="sp-history-badge ${sourceClass}">${sourceLabel}</span>
-        </div>
-        <div class="sp-history-detail">
-          <span class="sp-history-dur">${fmtDuration(s.listenedMs ?? 0)}</span>
-          <span class="sp-history-tracks">${trackCount} track${trackCount !== 1 ? 's' : ''}</span>
-        </div>
+        <button class="sp-history-head">
+          <span class="sp-history-chevron">${SP_ICON.chevron}</span>
+          <div class="sp-history-meta">
+            <div class="sp-history-meta-top">
+              <span class="sp-history-date">${_fmtSessionDate(s.startTime)}</span>
+              <span class="sp-history-badge ${sourceClass}">${sourceLabel}</span>
+              ${vibeChip}
+            </div>
+            <div class="sp-history-spark"><div class="sp-history-spark-fill" style="width:${sparkPct}%"></div></div>
+          </div>
+          <div class="sp-history-detail">
+            <span class="sp-history-dur">${fmtDuration(s.listenedMs ?? 0)}</span>
+            <span class="sp-history-tracks">${trackCount} track${trackCount !== 1 ? 's' : ''}</span>
+          </div>
+        </button>
+        <div class="sp-history-body" style="display:none"></div>
       `;
       historyList.appendChild(row);
     });
   }
+
+  async function _expandSession(row) {
+    const id   = row.dataset.id;
+    const body = row.querySelector('.sp-history-body');
+    const open = row.classList.toggle('expanded');
+    if (!open) { body.style.display = 'none'; return; }
+    body.style.display = '';
+
+    if (!_trackCache.has(id)) {
+      body.innerHTML = '<div class="sp-queue-empty">Loading songs…</div>';
+      const { tracks } = await getSessionTracks(id);
+      _trackCache.set(id, tracks || []);
+    }
+    const tracks = _trackCache.get(id) || [];
+    const list = tracks.length
+      ? tracks.map(t => `
+          <div class="sp-history-track">
+            <span class="sp-history-track-title">${_esc(t.title || 'Unknown')}</span>
+            <span class="sp-history-track-artist">${_esc(t.artist || '')}</span>
+          </div>`).join('')
+      : '<div class="sp-queue-empty">No songs recorded for this session</div>';
+    body.innerHTML = `
+      <div class="sp-history-tracklist">${list}</div>
+      ${tracks.length ? `
+        <div class="sp-history-actions">
+          <button class="sp-history-act sp-history-queue">${SP_ICON.play}<span>Queue all</span></button>
+          <button class="sp-history-act sp-history-save">${SP_ICON.playlistAdd}<span>Save as playlist</span></button>
+        </div>
+        <div class="sp-history-act-feedback" style="display:none"></div>` : ''}
+    `;
+  }
+
+  function _historyActFeedback(row, msg, isError = false) {
+    const el = row.querySelector('.sp-history-act-feedback');
+    if (!el) return;
+    el.textContent = msg;
+    el.className = 'sp-history-act-feedback' + (isError ? ' sp-save-error' : ' sp-save-success');
+    el.style.display = '';
+    clearTimeout(el._timer);
+    el._timer = setTimeout(() => { el.style.display = 'none'; }, 4000);
+  }
+
+  historyList.addEventListener('pointerup', async (e) => {
+    if (isEditMode()) return;
+    const head = e.target.closest('.sp-history-head');
+    if (head) { _expandSession(head.parentElement); return; }
+
+    const row = e.target.closest('.sp-history-row');
+    if (!row) return;
+
+    const queueBtn = e.target.closest('.sp-history-queue');
+    if (queueBtn) {
+      queueBtn.disabled = true;
+      const { count } = await queueSession(row.dataset.id);
+      queueBtn.disabled = false;
+      _historyActFeedback(row, count ? `✓ Queued ${count} track${count !== 1 ? 's' : ''}` : '✗ Nothing to queue', !count);
+      return;
+    }
+
+    const saveBtn2 = e.target.closest('.sp-history-save');
+    if (saveBtn2) {
+      saveBtn2.disabled = true;
+      const name = `Session · ${_fmtSessionDate(+row.dataset.id.replace(/^\D+/, '') || Date.now())}`;
+      const result = await saveSessionAsPlaylist(name, row.dataset.id);
+      saveBtn2.disabled = false;
+      if (result && result.success) _historyActFeedback(row, `✓ Saved — ${result.trackCount} tracks`);
+      else _historyActFeedback(row, `✗ ${result?.error || 'Failed'}`, true);
+      return;
+    }
+  });
 
   function _loadHistory() {
     historyList.innerHTML = '<div class="sp-queue-empty">Loading…</div>';
@@ -2028,12 +2146,15 @@ function renderSpotifyStats(ctrl) {
     socket.emit('spotify:get_sessions');
   }
 
-  historyToggle.addEventListener('pointerup', () => {
+  // Tab switching (Current / History)
+  statsTabBar.addEventListener('pointerup', (e) => {
     if (isEditMode()) return;
-    _historyOpen = !_historyOpen;
-    historyList.style.display = _historyOpen ? '' : 'none';
-    historyCaret.textContent  = _historyOpen ? '▲' : '▼';
-    if (_historyOpen && !_historyLoaded) _loadHistory();
+    const btn = e.target.closest('.sp-stats-tab');
+    if (!btn) return;
+    const tab = btn.dataset.tab;
+    statsTabBar.querySelectorAll('.sp-stats-tab').forEach(t => t.classList.toggle('active', t === btn));
+    statsPanels.forEach(p => { p.style.display = p.dataset.panel === tab ? '' : 'none'; });
+    if (tab === 'history' && !_historyLoaded) _loadHistory();
   });
 
   const observer = new MutationObserver(() => {
@@ -2742,7 +2863,7 @@ export function renderSpotifyIntelligence(ctrl) {
       <div class="sp-intel-divider"></div>
 
       <div class="sp-intel-context">
-        <div class="sp-intel-context-label">Right now</div>
+        <div class="sp-intel-context-label">Predicted mood <span class="sp-intel-context-hint">· a guess from your patterns</span></div>
         <div class="sp-intel-context-value">—</div>
       </div>
 
@@ -2812,11 +2933,11 @@ export function renderSpotifyIntelligence(ctrl) {
       idleEl.style.display     = '';
     }
 
-    // Context suggestion
+    // Context suggestion — framed as a prediction, not the currently-playing track.
     if (context?.suggestedMoodName) {
-      contextVal.textContent = `${context.suggestedMoodEmoji || ''} ${context.suggestedMoodName}`;
+      contextVal.textContent = `${context.suggestedMoodEmoji || ''} Maybe ${context.suggestedMoodName}`;
     } else {
-      contextVal.textContent = '—';
+      contextVal.textContent = 'Not sure yet';
     }
 
     // Cluster bar (confidence indicator, max display = 20 tracks)

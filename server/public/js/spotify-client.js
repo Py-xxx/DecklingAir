@@ -160,10 +160,49 @@ export function setTuning(tuning) {
   socket.emit('spotify:set_tuning', { tuning });
 }
 
-export function saveSessionAsPlaylist(name) {
+/**
+ * Save a session as a playlist.
+ * @param {string} [name]        Optional playlist name.
+ * @param {string} [sessionId]   Optional past-session id; omit to save the live session.
+ */
+export function saveSessionAsPlaylist(name, sessionId) {
   return new Promise((resolve) => {
     socket.once('spotify:session_playlist_saved', resolve);
-    socket.emit('spotify:save_session_playlist', { name });
+    socket.emit('spotify:save_session_playlist', { name, sessionId });
+  });
+}
+
+/**
+ * Resolve the tracks of a past session. Resolves with { id, tracks }.
+ * @param {string} id  Session id.
+ */
+export function getSessionTracks(id) {
+  return new Promise((resolve) => {
+    const handler = (data) => {
+      if (data && data.id === id) {
+        socket.off('spotify:session_tracks', handler);
+        resolve(data);
+      }
+    };
+    socket.on('spotify:session_tracks', handler);
+    socket.emit('spotify:get_session_tracks', { id });
+  });
+}
+
+/**
+ * Queue all tracks of a past session. Resolves with { id, count }.
+ * @param {string} id  Session id.
+ */
+export function queueSession(id) {
+  return new Promise((resolve) => {
+    const handler = (data) => {
+      if (data && data.id === id) {
+        socket.off('spotify:session_queued', handler);
+        resolve(data);
+      }
+    };
+    socket.on('spotify:session_queued', handler);
+    socket.emit('spotify:queue_session', { id });
   });
 }
 

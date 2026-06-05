@@ -1431,9 +1431,15 @@
   font-weight: 600;
   padding: 7px 12px;
   cursor: pointer;
-  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
   transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
+
+/* Shared inline-icon sizing */
+.sp-icon { flex-shrink: 0; display: block; }
 .sp-save-session-btn:hover {
   background: rgba(29,185,84,0.1);
   border-color: rgba(29,185,84,0.4);
@@ -1512,64 +1518,85 @@
 }
 
 /* ---------------------------------------------------------------------------
-   Past Sessions
+   Session card tabs (Current / History)
    --------------------------------------------------------------------------- */
-.sp-session-history {
-  margin-top: 12px;
-  border-top: 1px solid var(--sp-border);
-  padding-top: 8px;
-}
-
-.sp-history-toggle {
+.sp-stats-tabbar {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  width: 100%;
+  gap: 4px;
+  margin: 2px 0 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--sp-border);
+}
+.sp-stats-tab {
+  flex: 1;
   background: none;
   border: none;
-  cursor: pointer;
-  color: rgba(255,255,255,0.55);
+  border-radius: 6px;
+  color: rgba(255,255,255,0.5);
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 700;
   letter-spacing: .04em;
   text-transform: uppercase;
-  padding: 4px 2px;
-  transition: color .15s;
+  padding: 6px 4px;
+  cursor: pointer;
+  transition: background .15s, color .15s;
 }
-.sp-history-toggle:hover { color: rgba(255,255,255,0.85); }
+.sp-stats-tab:hover { color: rgba(255,255,255,0.8); }
+.sp-stats-tab.active {
+  background: rgba(29,185,84,0.14);
+  color: var(--sp-green, #1DB954);
+}
 
-.sp-history-toggle-label { flex: 1; text-align: left; }
-.sp-history-caret { font-size: 9px; margin-left: 6px; }
+.sp-stats-panel { display: flex; flex-direction: column; gap: 12px; flex: 1; min-height: 0; }
+.sp-stats-panel[data-panel="history"] { gap: 0; }
 
+/* ---------------------------------------------------------------------------
+   Past Sessions list
+   --------------------------------------------------------------------------- */
 .sp-history-list {
-  margin-top: 6px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  max-height: 220px;
+  gap: 5px;
   overflow-y: auto;
+  flex: 1;
+  min-height: 0;
 }
 
 .sp-history-row {
   background: var(--sp-surface);
   border: 1px solid var(--sp-border);
-  border-radius: 6px;
-  padding: 7px 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
+  border-radius: 8px;
+  overflow: hidden;
 }
 
-.sp-history-meta {
+.sp-history-head {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 9px;
+  width: 100%;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 8px 10px;
+  text-align: left;
+  transition: background .15s;
 }
+.sp-history-head:hover { background: rgba(255,255,255,0.04); }
+
+.sp-history-chevron {
+  color: rgba(255,255,255,0.4);
+  display: flex;
+  transition: transform .2s;
+  flex-shrink: 0;
+}
+.sp-history-row.expanded .sp-history-chevron { transform: rotate(180deg); }
+
+.sp-history-meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.sp-history-meta-top { display: flex; align-items: center; gap: 7px; }
 
 .sp-history-date {
   font-size: 11px;
   color: rgba(255,255,255,0.75);
-  flex: 1;
 }
 
 .sp-history-badge {
@@ -1591,21 +1618,113 @@
   border: 1px solid rgba(255,165,0,0.3);
 }
 
-.sp-history-detail {
-  display: flex;
-  align-items: center;
-  gap: 10px;
+.sp-history-vibe {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 4px;
+  color: var(--vibe, #1DB954);
+  background: color-mix(in srgb, var(--vibe, #1DB954) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--vibe, #1DB954) 35%, transparent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 90px;
 }
 
+.sp-history-spark {
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(255,255,255,0.08);
+  overflow: hidden;
+}
+.sp-history-spark-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, rgba(29,185,84,0.5), var(--sp-green, #1DB954));
+}
+
+.sp-history-detail {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  flex-shrink: 0;
+}
 .sp-history-dur {
   font-size: 12px;
   font-weight: 600;
   color: rgba(255,255,255,0.9);
 }
-
 .sp-history-tracks {
-  font-size: 11px;
+  font-size: 10px;
   color: rgba(255,255,255,0.4);
+}
+
+/* Expanded body: track list + actions */
+.sp-history-body {
+  padding: 6px 10px 10px;
+  border-top: 1px solid var(--sp-border);
+}
+.sp-history-tracklist {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 180px;
+  overflow-y: auto;
+  margin-bottom: 8px;
+}
+.sp-history-track {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 3px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+.sp-history-track-title {
+  font-size: 11px;
+  color: rgba(255,255,255,0.85);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sp-history-track-artist {
+  font-size: 10px;
+  color: rgba(255,255,255,0.45);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+.sp-history-actions { display: flex; gap: 6px; }
+.sp-history-act {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 6px;
+  color: var(--text-2, #aaa);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 6px 8px;
+  cursor: pointer;
+  transition: background .15s, color .15s, border-color .15s;
+}
+.sp-history-act:hover {
+  background: rgba(29,185,84,0.1);
+  border-color: rgba(29,185,84,0.4);
+  color: var(--sp-green, #1DB954);
+}
+.sp-history-act:disabled { opacity: 0.5; cursor: default; }
+
+.sp-history-act-feedback {
+  margin-top: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 5px 8px;
+  border-radius: 6px;
+  text-align: center;
 }
 
 /* =============================================================================
@@ -2490,6 +2609,13 @@
   text-transform: uppercase;
   letter-spacing: 0.05em;
   margin-bottom: 2px;
+}
+.sp-intel-context-hint {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 9px;
+  color: var(--text-3, #777);
+  font-style: italic;
 }
 .sp-intel-context-value {
   font-size: 13px;

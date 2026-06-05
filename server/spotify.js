@@ -496,11 +496,12 @@ async function reconcileRecentlyPlayed() {
     for (const play of awayPlays) {
       if (!cur || (play.ts - cur.lastTs) > SESSION_GAP_MS) {
         if (cur) awaySessions.push(cur);
-        cur = { startTime: play.ts, lastTs: play.ts, listenedMs: 0, trackCount: 0 };
+        cur = { startTime: play.ts, lastTs: play.ts, listenedMs: 0, trackCount: 0, trackIds: [] };
       }
       cur.lastTs     = play.ts;
       cur.listenedMs += Math.round(play.durMs * 0.85); // ~85%: Spotify logs at 30s+ completion
       cur.trackCount += 1;
+      if (play.id) cur.trackIds.push(play.id);
     }
     if (cur) awaySessions.push(cur);
 
@@ -515,6 +516,7 @@ async function reconcileRecentlyPlayed() {
         endTime:    s.lastTs,
         listenedMs: s.listenedMs,
         trackCount: s.trackCount,
+        trackIds:   s.trackIds || [],
         source:     'away',
       };
       _sessions.push(record);
@@ -1184,30 +1186,51 @@ async function getReccoBeatsFeatures(trackId) {
   }
 }
 
+// In-flight requests, keyed by trackId. Guarantees the fetch happens exactly once
+// per track even when several callers (history path, first-load path, recommendation
+// logic) ask for the same new song in the same tick — they all await the same promise,
+// so the result is fetched AND cached before anyone reads it. Without this, concurrent
+// callers each ran the full Spotify→ReccoBeats chain, raced on the throttle, and could
+// act on data that hadn't been saved yet (the bug that only showed up on new songs).
+const _audioFeaturesInflight = new Map();
+
 async function getAudioFeatures(trackId) {
+  if (!trackId) return null;
   if (_audioFeaturesCache.has(trackId)) return _audioFeaturesCache.get(trackId);
   // Recently failed everywhere — skip the wasted 403 + log spam until the TTL lapses.
   if (_negCached(trackId)) return null;
-  // Tier 1: Spotify's own endpoint (deprecated — 403s for most apps, kept for the few it works on)
-  try {
-    const data = await api('GET', `/audio-features/${trackId}`);
-    if (data && data.tempo != null) {
-      _audioFeaturesCache.set(trackId, data);
-      return data;
+  // Already being fetched — share the one in-flight request instead of starting another.
+  if (_audioFeaturesInflight.has(trackId)) return _audioFeaturesInflight.get(trackId);
+
+  const fetchPromise = (async () => {
+    // Tier 1: Spotify's own endpoint (deprecated — 403s for most apps, kept for the few it works on)
+    try {
+      const data = await api('GET', `/audio-features/${trackId}`);
+      if (data && data.tempo != null) {
+        _audioFeaturesCache.set(trackId, data);
+        return data;
+      }
+    } catch {
+      // expected for deprecated endpoint — fall through to ReccoBeats
     }
-  } catch {
-    // expected for deprecated endpoint — fall through to ReccoBeats
+    // Tier 2: ReccoBeats fallback
+    const recco = await getReccoBeatsFeatures(trackId);
+    if (recco) {
+      console.log(`[Spotify] Audio features via ReccoBeats — energy=${recco.energy} valence=${recco.valence} tempo=${Math.round(recco.tempo)} id=${trackId}`);
+      _audioFeaturesCache.set(trackId, recco);
+      return recco;
+    }
+    console.warn('[Spotify] Audio features unavailable (Spotify + ReccoBeats) for', trackId);
+    _audioFeaturesNegCache.set(trackId, Date.now());
+    return null;
+  })();
+
+  _audioFeaturesInflight.set(trackId, fetchPromise);
+  try {
+    return await fetchPromise;
+  } finally {
+    _audioFeaturesInflight.delete(trackId);
   }
-  // Tier 2: ReccoBeats fallback
-  const recco = await getReccoBeatsFeatures(trackId);
-  if (recco) {
-    console.log(`[Spotify] Audio features via ReccoBeats — energy=${recco.energy} valence=${recco.valence} tempo=${Math.round(recco.tempo)} id=${trackId}`);
-    _audioFeaturesCache.set(trackId, recco);
-    return recco;
-  }
-  console.warn('[Spotify] Audio features unavailable (Spotify + ReccoBeats) for', trackId);
-  _audioFeaturesNegCache.set(trackId, Date.now());
-  return null;
 }
 
 async function getBatchAudioFeatures(trackIds) {
@@ -1459,6 +1482,60 @@ function serializeTrack(item) {
         : null,
     duration: item.duration_ms,
   };
+}
+
+// Resolve a list of track IDs to { id, uri, title, artist } objects. Tracks the
+// user has played are pulled straight from local history; any others are fetched
+// from Spotify's /tracks endpoint (still live) in batches of 50. Original order
+// is preserved.
+async function resolveTrackIds(ids = []) {
+  const uniq = [...new Set((ids || []).filter(Boolean))];
+  if (!uniq.length) return [];
+  const want = new Set(uniq);
+  const map  = new Map();
+
+  for (const e of combinedHistory()) {
+    if (e.id && want.has(e.id) && !map.has(e.id)) {
+      map.set(e.id, {
+        id: e.id,
+        uri: e.uri || `spotify:track:${e.id}`,
+        title: e.title || '',
+        artist: e.artist || '',
+      });
+    }
+  }
+
+  const missing = uniq.filter(id => !map.has(id));
+  for (let i = 0; i < missing.length; i += 50) {
+    const chunk = missing.slice(i, i + 50);
+    try {
+      const data = await api('GET', '/tracks', { params: { ids: chunk.join(',') } });
+      for (const item of (data?.tracks || [])) {
+        if (item && item.id) map.set(item.id, serializeTrack(item));
+      }
+    } catch (err) {
+      console.error('[Spotify] resolveTrackIds fetch failed:', err.message);
+    }
+  }
+
+  return uniq.map(id => map.get(id)).filter(Boolean);
+}
+
+// Dominant vibe of a past session, derived from its tracks' audio features.
+function sessionDominantVibe(session) {
+  const ids = (session && session.trackIds) || [];
+  if (!ids.length) return { vibeKey: null, vibeName: null };
+  const byId = new Map(combinedHistory().map(e => [e.id, e]));
+  const counts = {};
+  for (const id of ids) {
+    const e = byId.get(id);
+    if (!e) continue;
+    const k = getVibeKey(e);
+    if (k) counts[k] = (counts[k] || 0) + 1;
+  }
+  const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+  if (!top) return { vibeKey: null, vibeName: null };
+  return { vibeKey: top[0], vibeName: getVibeName(top[0]) };
 }
 
 function serializeDevice(d) {
@@ -2982,8 +3059,39 @@ function init(io) {
     socket.on('spotify:get_sessions', () => {
       const past = [..._sessions]
         .sort((a, b) => b.startTime - a.startTime)
-        .slice(0, 100);
+        .slice(0, 100)
+        .map(s => ({ ...s, ...sessionDominantVibe(s) }));
       socket.emit('spotify:sessions', { sessions: past });
+    });
+
+    // ----- spotify:get_session_tracks -----
+    socket.on('spotify:get_session_tracks', async ({ id } = {}) => {
+      const session = _sessions.find(s => s.id === id);
+      if (!session) { socket.emit('spotify:session_tracks', { id, tracks: [] }); return; }
+      try {
+        const tracks = await resolveTrackIds(session.trackIds || []);
+        socket.emit('spotify:session_tracks', { id, tracks });
+      } catch (err) {
+        console.error('[Spotify] get_session_tracks error:', err.message);
+        socket.emit('spotify:session_tracks', { id, tracks: [], error: err.message });
+      }
+    });
+
+    // ----- spotify:queue_session -----
+    socket.on('spotify:queue_session', async ({ id } = {}) => {
+      const session = _sessions.find(s => s.id === id);
+      if (!session) { socket.emit('spotify:session_queued', { id, count: 0, error: 'Session not found' }); return; }
+      try {
+        const tracks = await resolveTrackIds(session.trackIds || []);
+        let count = 0;
+        for (const t of tracks) {
+          if (await _queueTrack(t)) count++;
+        }
+        socket.emit('spotify:session_queued', { id, count });
+      } catch (err) {
+        console.error('[Spotify] queue_session error:', err.message);
+        socket.emit('spotify:session_queued', { id, count: 0, error: err.message });
+      }
     });
 
     // ----- spotify:reset_session -----
@@ -2993,11 +3101,18 @@ function init(io) {
     });
 
     // ----- spotify:save_session_playlist -----
-    socket.on('spotify:save_session_playlist', async ({ name } = {}) => {
+    socket.on('spotify:save_session_playlist', async ({ name, sessionId } = {}) => {
       try {
         if (!_userId) await getUserProfile();
 
-        const tracks = _sessionStats.tracksPlayed;
+        // A sessionId targets a past session; otherwise save the live UI session.
+        let tracks;
+        if (sessionId) {
+          const session = _sessions.find(s => s.id === sessionId);
+          tracks = session ? await resolveTrackIds(session.trackIds || []) : [];
+        } else {
+          tracks = _sessionStats.tracksPlayed;
+        }
         if (!tracks.length) {
           socket.emit('spotify:session_playlist_saved', { error: 'No tracks in this session yet.' });
           return;
@@ -3007,9 +3122,10 @@ function init(io) {
         const seen = new Set();
         const uris = [];
         for (const t of tracks) {
-          if (t.uri && !seen.has(t.uri)) {
-            seen.add(t.uri);
-            uris.push(t.uri);
+          const uri = t.uri || (t.id ? `spotify:track:${t.id}` : null);
+          if (uri && !seen.has(uri)) {
+            seen.add(uri);
+            uris.push(uri);
           }
         }
 
