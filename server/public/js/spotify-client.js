@@ -140,16 +140,6 @@ export function playNow() {
   socket.emit('spotify:play_now');
 }
 
-/** Queue tracks matching filter params. */
-export function playFilter(params) {
-  socket.emit('spotify:play_filter', params);
-}
-
-/** Get a count of tracks matching filter params (no queuing). */
-export function getFilterCount(params) {
-  socket.emit('spotify:get_filter_count', params);
-}
-
 /** Queue a mood playlist and enable continuous mode. */
 export function playMood(key) {
   socket.emit('spotify:play_mood', { key });
@@ -160,9 +150,14 @@ export function stopContinuous() {
   socket.emit('spotify:stop_continuous');
 }
 
-/** Toggle harmonic flow ordering for vibes/moods. */
-export function setFlowMode(enabled) {
-  socket.emit('spotify:set_flow_mode', { enabled });
+/** Request the current global tuning profile (server replies with spotify:tuning). */
+export function getTuning() {
+  socket.emit('spotify:get_tuning');
+}
+
+/** Update the global tuning profile. Accepts a partial { key: value } patch. */
+export function setTuning(tuning) {
+  socket.emit('spotify:set_tuning', { tuning });
 }
 
 export function saveSessionAsPlaylist(name) {

@@ -1,6 +1,6 @@
 import { VM_STRIPS, VM_BUSES, buildParamOptions } from './controls.js';
 import { vmMacro, requestSoundboardDevices, socket } from './socket.js';
-import { saveSpotifyConfig, disconnectSpotify, setSpotifyAutoplay, setSpotifySmartShuffle } from './spotify-client.js';
+import { saveSpotifyConfig, disconnectSpotify } from './spotify-client.js';
 
 const DEFAULT_SIZES = {
   fader: [1, 4],
@@ -166,12 +166,6 @@ export function initEditor(state, callbacks) {
   document.getElementById('s-spotify-disconnect').addEventListener('click', () => {
     if (!window.confirm('Disconnect Spotify? This will stop playback state updates.')) return;
     disconnectSpotify();
-  });
-  document.getElementById('s-spotify-autoplay').addEventListener('change', event => {
-    setSpotifyAutoplay(event.target.checked);
-  });
-  document.getElementById('s-spotify-smart-shuffle').addEventListener('change', event => {
-    setSpotifySmartShuffle(event.target.checked);
   });
 
   document.getElementById('settings-close').addEventListener('click', closeSettings);

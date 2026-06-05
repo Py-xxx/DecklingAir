@@ -54,6 +54,59 @@ const USER_PREFS_FILE    = path.join(__dirname, 'data', 'user-prefs.json');
 
 const SESSION_PRUNE_DAYS       = 90;
 const CONTINUOUS_REFILL_THRESHOLD = 3;  // refill queue when fewer than this many tracks remain
+const CHECKIN_SEED_COUNT          = 8;  // initial kickstart queue right after a check-in is answered
+
+// ── Engagement / adaptive listening ──────────────────────────────────────────
+// We infer how the user feels about a track from how much of it they hear before
+// it changes. Skipping early = dislike; finishing = like. This nudges the
+// continuous queue to "go with the flow" of what's actually landing.
+// The strong/soft skip thresholds are derived from the "Skip sensitivity" tuning
+// slider (see _tSkipStrong/_tSkipSoft) rather than fixed constants.
+const FINISH_FRAC      = 0.80;  // heard ≥80% → engaged / liked
+const ADAPTIVE_LIKES_MAX = 8;   // rolling window of recently-engaged tracks that steer refills
+const ARTIST_DISLIKE_SCORE = -3; // net (skips − engaged listens) at/below this → avoid the artist
+
+// ── Global tuning profile ─────────────────────────────────────────────────────
+// Six user-adjustable sliders (0–100, except lookahead) that shape EVERY Spotify
+// feature — autoplay, smart shuffle, vibes, moods, routines and check-in feelings.
+// Defaults reproduce the previous hard-coded behaviour. Persisted in user prefs.
+const TUNING_DEFAULTS = {
+  freshness:       45,  // % of each batch that is genuinely new music vs your library
+  variety:         50,  // how far it wanders from your core taste
+  fadeSmooth:      50,  // how closely consecutive tracks must match (smooth fades)
+  moodFlow:        50,  // 0 = lock to the chosen mood, 100 = go with the flow
+  skipSensitivity: 50,  // how hard an early skip steers it away / bans an artist
+  lookahead:        5,  // tracks staged per refill batch (1–10)
+};
+let _tuning = { ...TUNING_DEFAULTS };
+
+function _clampNum(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function _lerp(a, b, t) { return a + (b - a) * _clampNum(t, 0, 1); }
+
+// Derived engine knobs — every feature reads these, never the raw slider values.
+function _tDiscoveryRatio() { return _clampNum(_tuning.freshness / 100, 0, 0.9); }
+function _tVariety()        { return _clampNum(_tuning.variety / 100, 0, 1); }
+function _tBandPad()        { return Math.round(_lerp(0, 25, _tVariety())); }      // ± widen feature band
+function _tDiscoveryGenres(){ return 2 + Math.round(_tVariety() * 3); }            // 2–5 genres searched
+function _tFlowOn()         { return _tuning.fadeSmooth >= 50; }                   // harmonic flow ordering
+function _tDriftThreshold() { return _lerp(0.45, 0.20, _tuning.moodFlow / 100); } // lock → flow
+function _tFlowLikeCount()  { return Math.round((_tuning.moodFlow / 100) * ADAPTIVE_LIKES_MAX); }
+function _tSkipStrong()     { return _lerp(0.08, 0.25, _tuning.skipSensitivity / 100); }
+function _tSkipSoft()       { return _lerp(0.35, 0.60, _tuning.skipSensitivity / 100); }
+function _tLookahead()      { return _clampNum(Math.round(_tuning.lookahead), 1, 10); }
+
+// Validate + apply an incoming tuning patch, clamping each field to its range.
+function _applyTuning(patch = {}) {
+  const n = { ..._tuning };
+  if (patch.freshness       != null) n.freshness       = _clampNum(+patch.freshness,       0, 100);
+  if (patch.variety         != null) n.variety         = _clampNum(+patch.variety,         0, 100);
+  if (patch.fadeSmooth      != null) n.fadeSmooth      = _clampNum(+patch.fadeSmooth,      0, 100);
+  if (patch.moodFlow        != null) n.moodFlow        = _clampNum(+patch.moodFlow,        0, 100);
+  if (patch.skipSensitivity != null) n.skipSensitivity = _clampNum(+patch.skipSensitivity, 0, 100);
+  if (patch.lookahead       != null) n.lookahead       = _clampNum(Math.round(+patch.lookahead), 1, 10);
+  _tuning = n;
+  return _tuning;
+}
 
 const SESSION_GAP_MS      = 10 * 60 * 1000;  // 10 min silence → close session
 const SESSION_MIN_MS      = 15 * 1000;        // ignore sessions shorter than 15s
@@ -93,9 +146,24 @@ let _history        = [];   // all-time log entries, loaded from file on start
 let _seededHistory  = [];   // in-memory only: entries seeded from Spotify API
 let _seedTimestamp  = 0;    // when _seededHistory was last populated
 let _vibeNames      = {};   // { vibeKey: 'Custom Name' }
-let _flowMode       = false; // harmonic flow ordering for vibe/mood playlists
 let _activeVibeKey  = null;  // currently running continuous vibe (null = stopped)
 let _activeMoodKey  = null;  // currently running continuous mood (null = stopped)
+// Track IDs played OR auto-queued during the current session. Every automatic queueing
+// method skips tracks already in here so a song never repeats within a session.
+// Reset when a session opens/closes.
+let _sessionTrackIds = new Set();
+
+// ── Adaptive engagement ───────────────────────────────────────────────────────
+// _recentLikes:      rolling features of tracks the user actually engaged with
+//                    (finished / heard most of) — steers refills toward the flow.
+// _dislikedTrackIds: specific songs the user skipped hard — only THOSE songs are
+//                    avoided, not the whole artist.
+// _artistScores:     lowercase artist → net score. Each hard skip −1, each engaged
+//                    listen +1. An artist is only avoided once the net drops to
+//                    ARTIST_DISLIKE_SCORE (a strong pattern); later listens recover it.
+let _recentLikes      = [];
+let _dislikedTrackIds = new Set();
+let _artistScores     = new Map();
 
 // ── Cluster & feeling detection ───────────────────────────────────────────────
 let _currentCluster    = [];     // tracks in the current emerging cluster (with features)
@@ -195,8 +263,10 @@ function loadUserPrefs() {
   try {
     if (fs.existsSync(USER_PREFS_FILE)) {
       const prefs = JSON.parse(fs.readFileSync(USER_PREFS_FILE, 'utf8'));
-      _flowMode = !!prefs.flowMode;
       if (prefs.checkInAuto != null) _checkInAutoEnabled = !!prefs.checkInAuto;
+      if (prefs.tuning && typeof prefs.tuning === 'object') {
+        _applyTuning(prefs.tuning);
+      }
     }
   } catch { }
 }
@@ -204,7 +274,7 @@ function loadUserPrefs() {
 function saveUserPrefs() {
   try {
     fs.mkdirSync(path.dirname(USER_PREFS_FILE), { recursive: true });
-    fs.writeFileSync(USER_PREFS_FILE, JSON.stringify({ flowMode: _flowMode, checkInAuto: _checkInAutoEnabled }, null, 2));
+    fs.writeFileSync(USER_PREFS_FILE, JSON.stringify({ checkInAuto: _checkInAutoEnabled, tuning: _tuning }, null, 2));
   } catch (err) { console.error('[Spotify] Failed to save user prefs:', err.message); }
 }
 
@@ -335,6 +405,11 @@ function openActiveSession() {
     trackCount:       0,
     trackIds:         [],
   };
+  // Fresh session → fresh no-repeat memory and adaptive signals
+  _sessionTrackIds  = new Set();
+  _recentLikes      = [];
+  _dislikedTrackIds = new Set();
+  _artistScores     = new Map();
 }
 
 function closeActiveSession() {
@@ -349,6 +424,10 @@ function closeActiveSession() {
   _driftBuffer     = [];
   _pendingCheckIn  = null;
   _lastCheckInAt   = 0;
+  _sessionTrackIds  = new Set();
+  _recentLikes      = [];
+  _dislikedTrackIds = new Set();
+  _artistScores     = new Map();
   if (_activeFeeling) {
     _activeFeeling = null;
     if (_io) _io.emit('spotify:feeling_expired');
@@ -832,6 +911,86 @@ async function addToQueue(uri) {
   return api('POST', '/me/player/queue', { params: { uri } });
 }
 
+// Queue a track and remember it for the session so no automatic method queues the
+// same song twice. Returns false if the track was unqueueable (no uri/id).
+async function _queueTrack(t) {
+  const uri = (t && t.uri) || (t && t.id ? `spotify:track:${t.id}` : null);
+  if (!uri) return false;
+  await addToQueue(uri);
+  const id = (t && t.id) || (uri.startsWith('spotify:track:') ? uri.split(':').pop() : null);
+  if (id) _sessionTrackIds.add(id);
+  return true;
+}
+
+// Drop any tracks already played or queued during this session.
+function _excludePlayed(tracks) {
+  return (tracks || []).filter(t => t && t.id && !_sessionTrackIds.has(t.id));
+}
+
+// Net engagement score for an artist (each hard skip −1, each engaged listen +1).
+function _adjustArtistScore(artist, delta) {
+  if (!artist) return;
+  const key = artist.toLowerCase();
+  _artistScores.set(key, (_artistScores.get(key) || 0) + delta);
+}
+function _artistAvoided(artist) {
+  if (!artist) return false;
+  return (_artistScores.get(artist.toLowerCase()) || 0) <= ARTIST_DISLIKE_SCORE;
+}
+
+// Drop the specific songs the user skipped hard, plus any artist whose net score
+// has fallen to a strong-dislike pattern (engaged listens since then recover it).
+function _excludeDisliked(tracks) {
+  if (!_dislikedTrackIds.size && !_artistScores.size) return tracks || [];
+  return (tracks || []).filter(t =>
+    t && !(t.id && _dislikedTrackIds.has(t.id)) && !_artistAvoided(t.artist));
+}
+
+// Remember a track the user engaged with so the next refills lean toward it.
+function _pushRecentLike(t) {
+  if (!t || t.energy == null) return;
+  _recentLikes = _recentLikes.filter(x => x.id !== t.id);
+  _recentLikes.push(t);
+  if (_recentLikes.length > ADAPTIVE_LIKES_MAX) _recentLikes.shift();
+}
+
+// Judge how the user felt about the track that just ended, from how much of it
+// they heard. `prev` is the previous poll's serialized state (the outgoing track).
+//   • finished / ≥80%      → engaged → feed _recentLikes, +1 artist score
+//   • <15%                 → strong dislike → avoid THIS song, −1 artist score
+//                            (artist only avoided once net hits a strong pattern)
+//   • 15–50%               → didn't fit the vibe → neutral (no like, no penalty)
+//   • 50–80%               → heard most of it → mild like
+function _evaluateEngagement(prev) {
+  if (!prev || !prev.track || !prev.track.id || !prev.isPlaying) return;
+  const dur = prev.track.duration;
+  const pos = prev.progress;
+  if (!dur || dur <= 0 || pos == null) return;
+
+  const frac     = pos / dur;
+  const finished = frac >= FINISH_FRAC || (dur - pos) <= PROGRESS_DELTA_MAX;
+  const feat     = _findStoredFeatures(prev.track.id);
+  const likeRec  = feat ? {
+    id: prev.track.id, artist: prev.track.artist,
+    energy: feat.energy, valence: feat.valence, bpm: feat.bpm,
+  } : null;
+
+  if (finished || frac >= _tSkipSoft()) {
+    if (likeRec) _pushRecentLike(likeRec);
+    _adjustArtistScore(prev.track.artist, +1);   // engaged listen recovers the artist
+    return;
+  }
+  if (frac < _tSkipStrong()) {
+    _dislikedTrackIds.add(prev.track.id);        // avoid only this specific song
+    _adjustArtistScore(prev.track.artist, -1);
+    const avoided = _artistAvoided(prev.track.artist);
+    console.log(`[Spotify] Engagement: strong dislike (${Math.round(frac * 100)}%) "${prev.track.title}"${avoided ? ` — pattern detected, now avoiding ${prev.track.artist}` : ''}`);
+    return;
+  }
+  // Between the two thresholds: just didn't fit the current vibe — note it, but don't penalize.
+  console.log(`[Spotify] Engagement: vibe mismatch (${Math.round(frac * 100)}%) "${prev.track.title}"`);
+}
+
 /**
  * Play a single search track with continuation tracks bundled in the same
  * play() call as a mini-playlist, so Spotify has full context and keeps
@@ -841,9 +1000,10 @@ async function playWithContinuation(uri) {
   const trackId = uri.split(':').pop();
   let continuationUris = [];
 
-  // getSimilarTracks already has a 3-tier fallback; just unwrap URIs
+  // getSimilarTracks already has a multi-tier fallback; just unwrap URIs.
+  // Skip anything already played/queued this session so continuation doesn't repeat.
   try {
-    const similar = await getSimilarTracks([trackId], [], 24);
+    const similar = _excludePlayed(await getSimilarTracks([trackId], [], 30));
     continuationUris = similar.map(t => t.uri).filter(u => u !== uri);
     if (continuationUris.length) console.log(`[Spotify] Continuation: ${continuationUris.length} similar tracks`);
   } catch (e) {
@@ -936,6 +1096,17 @@ async function getAllLikedSongs() {
 const _audioFeaturesCache = new Map();
 // Maps a Spotify track ID → ReccoBeats internal UUID (null = looked up, genuinely not found)
 const _reccoIdCache = new Map();
+// Tracks that returned no features anywhere → trackId: timestamp. TTL-bounded so we
+// stop re-hitting Spotify (403) and spamming the log on every replay, while still
+// retrying occasionally in case a transient failure was the cause.
+const _audioFeaturesNegCache = new Map();
+const AUDIO_FEATURES_NEG_TTL = 6 * 60 * 60 * 1000; // 6 hours
+function _negCached(trackId) {
+  const t = _audioFeaturesNegCache.get(trackId);
+  if (t == null) return false;
+  if (Date.now() - t > AUDIO_FEATURES_NEG_TTL) { _audioFeaturesNegCache.delete(trackId); return false; }
+  return true;
+}
 
 // ReccoBeats throttle: all requests are serialized through one promise chain with a
 // minimum gap that widens automatically on 429 and relaxes on success. Prevents the
@@ -1015,6 +1186,8 @@ async function getReccoBeatsFeatures(trackId) {
 
 async function getAudioFeatures(trackId) {
   if (_audioFeaturesCache.has(trackId)) return _audioFeaturesCache.get(trackId);
+  // Recently failed everywhere — skip the wasted 403 + log spam until the TTL lapses.
+  if (_negCached(trackId)) return null;
   // Tier 1: Spotify's own endpoint (deprecated — 403s for most apps, kept for the few it works on)
   try {
     const data = await api('GET', `/audio-features/${trackId}`);
@@ -1033,6 +1206,7 @@ async function getAudioFeatures(trackId) {
     return recco;
   }
   console.warn('[Spotify] Audio features unavailable (Spotify + ReccoBeats) for', trackId);
+  _audioFeaturesNegCache.set(trackId, Date.now());
   return null;
 }
 
@@ -1051,12 +1225,16 @@ async function getBatchAudioFeatures(trackIds) {
     }
     // Tier 2: ReccoBeats fallback for whatever's still missing.
     // Sequential + capped so one-time seeding doesn't fire a request storm.
-    const stillMissing = toFetch.filter(id => !_audioFeaturesCache.has(id)).slice(0, 30);
+    // Skip tracks already known to have no features (TTL-bounded).
+    const stillMissing = toFetch
+      .filter(id => !_audioFeaturesCache.has(id) && !_negCached(id))
+      .slice(0, 30);
     if (stillMissing.length) {
       let got = 0;
       for (const id of stillMissing) {
         const recco = await getReccoBeatsFeatures(id);
         if (recco) { _audioFeaturesCache.set(id, recco); got++; }
+        else _audioFeaturesNegCache.set(id, Date.now());
       }
       console.log(`[Spotify] Batch features via ReccoBeats: ${got}/${stillMissing.length} enriched`);
     }
@@ -1127,10 +1305,13 @@ async function getRecommendations({ seedTracks = [], seedArtists = [], limit = 5
 
 /**
  * Get tracks similar to the given seeds.
- * Three-tier fallback because /recommendations is deprecated and 403s for many apps:
+ * Two-tier fallback because /recommendations is deprecated and 404s for many apps:
  *   1. /recommendations  (still works for some; fastest)
- *   2. related-artists → their top-tracks  (always available)
- *   3. user's own short-term top tracks shuffled  (last resort)
+ *   2. user's own short-term top tracks shuffled  (last resort)
+ *
+ * (A related-artists tier used to sit between these, but /artists/{id}/related-artists
+ *  was deprecated in the same Nov-2024 batch as /recommendations, so it only burned
+ *  API calls that 404'd. Removed.)
  *
  * Returns an array of raw Spotify track objects (with .uri, .id, .name, .artists …).
  */
@@ -1158,49 +1339,12 @@ async function getSimilarTracks(seedTrackIds = [], seedArtistIds = [], limit = 5
   } catch (err) {
     // /recommendations is deprecated and 404s for most apps — log once, then stay quiet
     if (!_recommendationsDeadLogged) {
-      console.warn('[Spotify] /recommendations unavailable, using related-artists fallback:', err.message);
+      console.warn('[Spotify] /recommendations unavailable, falling back to top-tracks:', err.message);
       _recommendationsDeadLogged = true;
     }
   }
 
-  // ── Tier 2: related artists → their top tracks ──────────────────────────────
-  try {
-    // Resolve artist IDs from seed tracks if none provided
-    let artistIds = [...seedArtistIds];
-    if (artistIds.length === 0 && seedTrackIds.length > 0) {
-      try {
-        const trackData = await api('GET', `/tracks/${seedTrackIds[0]}`);
-        artistIds = (trackData?.artists || []).map(a => a.id).filter(Boolean).slice(0, 2);
-      } catch { /* ignore */ }
-    }
-
-    if (artistIds.length > 0) {
-      const candidateTracks = [];
-      for (const artistId of artistIds.slice(0, 2)) {
-        try {
-          const related = await api('GET', `/artists/${artistId}/related-artists`);
-          const relatedArtists = (related?.artists || [])
-            .sort(() => Math.random() - 0.5)
-            .slice(0, 4);
-          for (const ra of relatedArtists) {
-            try {
-              const topTracks = await api('GET', `/artists/${ra.id}/top-tracks`);
-              candidateTracks.push(...(topTracks?.tracks || []).slice(0, 3));
-            } catch { /* ignore */ }
-          }
-        } catch { /* ignore */ }
-      }
-      const filtered = dedupe(candidateTracks, excludeUris).sort(() => Math.random() - 0.5);
-      if (filtered.length > 0) {
-        console.log(`[Spotify] getSimilarTracks: ${filtered.length} from related-artists fallback`);
-        return filtered.slice(0, limit);
-      }
-    }
-  } catch (err) {
-    console.warn('[Spotify] Related-artists fallback failed:', err.message);
-  }
-
-  // ── Tier 3: user's own short-term top tracks ────────────────────────────────
+  // ── Tier 2: user's own short-term top tracks ────────────────────────────────
   try {
     const top = await api('GET', '/me/top/tracks', { params: { time_range: 'short_term', limit: 50 } });
     const tracks = dedupe(top?.items || [], excludeUris).sort(() => Math.random() - 0.5);
@@ -1214,6 +1358,79 @@ async function getSimilarTracks(seedTrackIds = [], seedArtistIds = [], limit = 5
 
   console.warn('[Spotify] getSimilarTracks: all tiers exhausted, returning empty');
   return [];
+}
+
+// ── Genuine discovery (new music, not the user's own catalogue) ───────────────
+// /recommendations and /related-artists are dead, so getSimilarTracks falls back to
+// the user's OWN top tracks — familiar, not new. These helpers use /search (still
+// live) to surface songs the user hasn't played: deeper cuts from artists they like
+// plus fresh tracks in their favourite genres.
+
+let _topGenresCache = { genres: [], ts: 0 };
+const TOP_GENRES_TTL = 6 * 60 * 60 * 1000;
+async function _getTopGenres() {
+  if (_topGenresCache.genres.length && Date.now() - _topGenresCache.ts < TOP_GENRES_TTL) {
+    return _topGenresCache.genres;
+  }
+  try {
+    const res = await api('GET', '/me/top/artists', { params: { time_range: 'medium_term', limit: 50 } });
+    const counts = {};
+    for (const a of res?.items || []) for (const g of a.genres || []) counts[g] = (counts[g] || 0) + 1;
+    const genres = Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([g]) => g);
+    _topGenresCache = { genres, ts: Date.now() };
+    return genres;
+  } catch {
+    return _topGenresCache.genres;
+  }
+}
+
+// All track IDs the user already knows (everything in their listening history).
+// Used to keep "discovery" genuinely unfamiliar.
+function _knownTrackIdSet() {
+  const s = new Set();
+  for (const e of combinedHistory()) if (e.id) s.add(e.id);
+  return s;
+}
+
+// Find tracks the user almost certainly hasn't heard, via search.
+//   seedArtistNames — artist names from what they're currently enjoying
+//   excludeIds      — ids to skip (known history + session-played)
+async function getDiscoveryTracks(seedArtistNames = [], excludeIds = new Set(), limit = 6) {
+  const out  = [];
+  const seen = new Set(excludeIds);
+  const pushNew = (rawTracks) => {
+    for (const raw of rawTracks || []) {
+      const t = serializeTrack(raw);
+      if (!t || !t.id || seen.has(t.id)) continue;
+      seen.add(t.id);
+      out.push(t);
+    }
+  };
+
+  // 1) Deeper cuts from artists the user is into (songs they likely don't own/save)
+  const artists = [...new Set(seedArtistNames.filter(Boolean))].slice(0, 2);
+  for (const name of artists) {
+    if (out.length >= limit) break;
+    try {
+      const res = await search(`artist:"${name.replace(/"/g, '')}"`, 'track', 10);
+      pushNew(res?.tracks?.items || []);
+    } catch { /* keep going */ }
+  }
+
+  // 2) Fresh, recent tracks in the user's favourite genres (surfaces NEW artists)
+  if (out.length < limit) {
+    const genres = await _getTopGenres();
+    const yr = new Date().getFullYear();
+    for (const g of genres.slice(0, _tDiscoveryGenres())) {
+      if (out.length >= limit) break;
+      try {
+        const res = await search(`genre:"${g}" year:${yr - 2}-${yr}`, 'track', 10);
+        pushNew(res?.tracks?.items || []);
+      } catch { /* keep going */ }
+    }
+  }
+
+  return out.slice(0, limit);
 }
 
 async function getUserProfile() {
@@ -1331,10 +1548,10 @@ async function maybeQueueRecommendations(state) {
   const seedArtists = (state.track.artistIds || []).slice(0, 2);
 
   try {
-    const tracks = await getSimilarTracks(seedTracks, seedArtists, 5);
-    for (const track of tracks) {
+    const tracks = _excludePlayed(await getSimilarTracks(seedTracks, seedArtists, 8));
+    for (const track of tracks.slice(0, 5)) {
       try {
-        await addToQueue(track.uri);
+        await _queueTrack(track);
         _autoQueueCount++;
       } catch (err) {
         console.error('[Spotify] Failed to queue autoplay track:', err.message);
@@ -1367,10 +1584,10 @@ async function maybeSmartShuffle(state) {
   const seedArtists = (state.track.artistIds || []).slice(0, 2);
 
   try {
-    const tracks = await getSimilarTracks(seedTracks, seedArtists, 1);
-    for (const track of tracks) {
+    const tracks = _excludePlayed(await getSimilarTracks(seedTracks, seedArtists, 6));
+    for (const track of tracks.slice(0, 1)) {
       try {
-        await addToQueue(track.uri);
+        await _queueTrack(track);
         _autoQueueCount++;
         console.log(`[Spotify] Smart shuffle injected: ${track.name}`);
       } catch (err) {
@@ -1579,49 +1796,43 @@ const FEELING_DEFS = {
   angsty:    { emoji: '😤', label: 'Angsty',    energy: [55, 100], valence: [0,  42] },
 };
 
-// Build a mood's hard feature filter straight from its feeling's ranges.
-function _filtersForFeeling(feelingKey) {
-  const def = FEELING_DEFS[feelingKey];
-  return { minEnergy: def.energy[0], maxEnergy: def.energy[1], minValence: def.valence[0], maxValence: def.valence[1] };
-}
-
 const MOOD_STATES = [
   {
     key: 'in_my_feelings', name: 'In My Feelings', emoji: '🥀',
     desc: 'For when you\'re feeling sad', feeling: 'sad',
-    contextSignals: { hours: [0,1,2,3,23] }, discoveryRatio: 0.20,
+    contextSignals: { hours: [0,1,2,3,23] },
   },
   {
     key: 'cruise', name: 'Cruise', emoji: '🧘',
     desc: 'For when you\'re feeling chill', feeling: 'chill',
-    contextSignals: { hours: [21,22,23] }, discoveryRatio: 0.20,
+    contextSignals: { hours: [21,22,23] },
   },
   {
     key: 'lock_in', name: 'Lock In', emoji: '🎯',
     desc: 'For when you\'re feeling focused', feeling: 'focused',
-    contextSignals: { hours: [9,10,11,12,13,14,15,16] }, discoveryRatio: 0.25,
+    contextSignals: { hours: [9,10,11,12,13,14,15,16] },
   },
   {
     key: 'sunshine', name: 'Sunshine', emoji: '😊',
     desc: 'For when you\'re feeling happy', feeling: 'happy',
-    contextSignals: { hours: [7,8,9,10] }, discoveryRatio: 0.25,
+    contextSignals: { hours: [7,8,9,10] },
   },
   {
     key: 'charged_up', name: 'Charged Up', emoji: '⚡',
     desc: 'For when you\'re feeling energetic', feeling: 'energetic',
-    contextSignals: { hours: [6,7,8,17,18,19] }, discoveryRatio: 0.30,
+    contextSignals: { hours: [6,7,8,17,18,19] },
   },
   {
     key: 'full_send', name: 'Full Send', emoji: '🔥',
     desc: 'For when you\'re feeling hype', feeling: 'hype',
-    contextSignals: { hours: [20,21,22,23], dow: [4,5,6] }, discoveryRatio: 0.35,
+    contextSignals: { hours: [20,21,22,23], dow: [4,5,6] },
   },
   {
     key: 'going_hard', name: 'Going Hard', emoji: '😤',
     desc: 'For when you\'re feeling angsty', feeling: 'angsty',
-    contextSignals: { hours: [17,18,19] }, discoveryRatio: 0.30,
+    contextSignals: { hours: [17,18,19] },
   },
-].map(m => ({ ...m, filters: _filtersForFeeling(m.feeling) }));
+];
 
 // The single mood profile that corresponds to a given feeling.
 function moodForFeeling(feelingKey) {
@@ -1638,19 +1849,20 @@ async function buildVibePlaylist(vibeKey, limit = 25) {
   const cluster = vibes.clusters.find(c => c.key === vibeKey);
   if (!cluster) return [];
 
-  const pool = [...cluster.tracks];
-  const discoveryCount = Math.min(Math.floor(limit * 0.3), 8);
-  const baseCount = limit - discoveryCount;
+  // Skip anything already played/queued this session so the vibe never loops
+  const pool = _excludePlayed([...cluster.tracks]);
+  const discoveryCount = Math.min(Math.ceil(limit * _tDiscoveryRatio()), 10);
+  const baseCount = Math.max(1, limit - discoveryCount);
 
   const base = [...pool].sort(() => Math.random() - 0.5).slice(0, baseCount);
 
-  // Fetch discovery tracks similar to seeds from this vibe
+  // Discovery seeded from this vibe — prioritising genuinely new music
   const seedIds = base.slice(0, 3).map(t => t.id).filter(Boolean);
-  const similar = await getSimilarTracks(seedIds, [], discoveryCount + 5).catch(() => []);
-  const discovery = similar.slice(0, discoveryCount);
+  const seedArtists = base.map(t => t.artist).filter(Boolean);
+  const discovery = await _buildDiscovery(seedIds, seedArtists, discoveryCount);
 
-  const all = [...base, ...discovery];
-  return _flowMode ? flowOrder(all) : all;
+  const all = _excludeDisliked(_excludePlayed([...base, ...discovery]));
+  return _tFlowOn() ? flowOrder(all) : all;
 }
 
 async function buildMoodPlaylist(moodKey, limit = 25) {
@@ -1669,8 +1881,11 @@ async function buildFeelingPlaylist(feelingKey, sessionTracks = [], limit = 20) 
   const def = FEELING_DEFS[feelingKey];
   if (!def) return [];
 
-  const [eMin, eMax] = def.energy;
-  const [vMin, vMax] = def.valence;
+  // Widen the feeling's feature band by the Variety slider so a higher setting
+  // pulls in tracks further from the core energy/valence window.
+  const pad = _tBandPad();
+  const eMin = def.energy[0]  - pad, eMax = def.energy[1]  + pad;
+  const vMin = def.valence[0] - pad, vMax = def.valence[1] + pad;
   const all = combinedHistory();
 
   // Tracks that match the feeling's audio-feature ranges, excluding session tracks already heard
@@ -1679,6 +1894,7 @@ async function buildFeelingPlaylist(feelingKey, sessionTracks = [], limit = 20) 
   const pool = [];
   for (const e of all) {
     if (seen.has(e.id)) continue;
+    if (_sessionTrackIds.has(e.id)) continue; // already played/queued this session
     if (e.energy == null) continue;
     if (e.energy < eMin || e.energy > eMax) continue;
     if (e.valence < vMin || e.valence > vMax) continue;
@@ -1695,20 +1911,48 @@ async function buildFeelingPlaylist(feelingKey, sessionTracks = [], limit = 20) 
     pool.sort(() => Math.random() - 0.5);
   }
 
-  const discoveryCount = Math.min(Math.floor(limit * 0.3), 7);
-  const baseCount = limit - discoveryCount;
+  const discoveryCount = Math.min(Math.ceil(limit * _tDiscoveryRatio()), 10);
+  const baseCount = Math.max(1, limit - discoveryCount);
 
-  // Include a few recent session tracks (confirmed to match)
-  const sessionSample = [...sessionTracks].sort(() => Math.random() - 0.5).slice(0, 4);
+  // Include a few recent session tracks (confirmed to match) that haven't been queued yet
+  const sessionSample = _excludePlayed([...sessionTracks].sort(() => Math.random() - 0.5)).slice(0, 3);
   const base = pool.slice(0, baseCount);
 
-  // Discovery: similar to best matches
-  const seedIds = base.slice(0, 3).map(t => t.id).filter(Boolean);
-  const similar = await getSimilarTracks(seedIds, [], discoveryCount + 5).catch(() => []);
-  const discovery = similar.slice(0, discoveryCount);
+  // Discovery flows from what the user is engaging with (session sample first), then
+  // the best feeling-band matches.
+  const seedIds = [...sessionSample, ...base].map(t => t.id).filter(Boolean).slice(0, 3);
+  const seedArtists = [...sessionSample, ...base].map(t => t.artist).filter(Boolean);
+  const discovery = await _buildDiscovery(seedIds, seedArtists, discoveryCount);
 
-  const combined = [...sessionSample, ...base, ...discovery];
-  return _flowMode ? flowOrder(combined) : combined.sort(() => Math.random() - 0.5);
+  // Final guard: nothing already played/queued, and nothing by a hard-skipped artist
+  const combined = _excludeDisliked(_excludePlayed([...sessionSample, ...base, ...discovery]));
+  return _tFlowOn() ? flowOrder(combined) : combined.sort(() => Math.random() - 0.5);
+}
+
+// Assemble a discovery set that prioritises genuinely NEW music. Fresh search-based
+// finds come first; anything the user already knows is only used as a last-resort
+// filler so the queue never starves.
+async function _buildDiscovery(seedIds, seedArtists, count) {
+  if (count <= 0) return [];
+  const known = _knownTrackIdSet();
+  const excludeIds = new Set([...known, ..._sessionTrackIds]);
+
+  const [similar, fresh] = await Promise.all([
+    getSimilarTracks(seedIds, [], count + 5).catch(() => []),
+    getDiscoveryTracks(seedArtists, excludeIds, count + 4).catch(() => []),
+  ]);
+
+  // Prefer fresh (unfamiliar) tracks, then similar tracks the user hasn't heard.
+  const newSimilar = _excludePlayed(similar).filter(t => t.id && !known.has(t.id));
+  let discovery = _excludeDisliked([...fresh, ...newSimilar]).slice(0, count);
+
+  // Top up with known-but-unplayed similar so a batch is never short.
+  if (discovery.length < count) {
+    const have = new Set(discovery.map(t => t.id));
+    const filler = _excludeDisliked(_excludePlayed(similar)).filter(t => !have.has(t.id));
+    discovery = [...discovery, ...filler].slice(0, count);
+  }
+  return discovery;
 }
 
 // ---------------------------------------------------------------------------
@@ -1737,15 +1981,25 @@ function detectCurrentContext() {
     ? Math.round(recent.reduce((s, e) => s + e.energy, 0) / recent.length)
     : null;
 
-  // Score each mood by context signal match
+  // Score each mood by (a) time-of-day signal match and (b) how well the mood's
+  // feeling energy band fits what you're actually listening to right now.
+  // bestScore starts at 0, so a mood is only suggested when there's a real signal —
+  // otherwise suggestedMoodKey stays null and the UI shows nothing (no false "sad").
   let suggestedMoodKey = null;
-  let bestScore = -1;
+  let bestScore = 0;
   for (const mood of MOOD_STATES) {
     let score = 0;
     const cs = mood.contextSignals || {};
-    if (cs.hours && cs.hours.includes(h))      score += 3;
-    if (cs.dow   && cs.dow.includes(dow))       score += 2;
+    if (cs.hours && cs.hours.includes(h))                  score += 3;
+    if (cs.dow   && cs.dow.includes(dow))                  score += 2;
     if (cs.isWeekend != null && cs.isWeekend === isWeekend) score += 1;
+    // Energy fit from recent listening (0–2 points) — turns this into a real
+    // prediction rather than a fixed clock schedule.
+    if (recentEnergy != null) {
+      const def = FEELING_DEFS[mood.feeling];
+      const eMid = (def.energy[0] + def.energy[1]) / 2;
+      score += (1 - Math.abs(recentEnergy - eMid) / 100) * 2;
+    }
     if (score > bestScore) { bestScore = score; suggestedMoodKey = mood.key; }
   }
 
@@ -1890,7 +2144,7 @@ function _updateCluster(histEntry) {
     // Check if active feeling's centroid has now drifted too far
     if (_activeFeeling) {
       const feelingDist = _clusterDist(_activeFeeling.centroid, _currentCentroid);
-      if (feelingDist > 0.30 && _currentCluster.length >= 4) {
+      if (feelingDist > _tDriftThreshold() && _currentCluster.length >= 4) {
         _activeFeeling = null;
         if (_io) _io.emit('spotify:feeling_expired');
       }
@@ -1936,10 +2190,15 @@ async function maybeRefillContinuousQueue(state) {
     const queueLength = queueData?.queue?.length || 0;
     if (queueLength >= CONTINUOUS_REFILL_THRESHOLD) return;
 
-    const refillCount = 12;
+    const refillCount = _tLookahead();
     let tracks;
     if (_activeFeeling) {
-      tracks = await buildFeelingPlaylist(_activeFeeling.key, _activeFeeling.clusterTracks || [], refillCount);
+      // Feeling is the baseline, but go with the flow: blend in the tracks the user is
+      // actually engaging with right now. The Mood-lock↔Flow slider controls how many
+      // recent likes get mixed in (0 = stay locked to the feeling, more = follow the vibe).
+      const flowLikes = _recentLikes.slice(-_tFlowLikeCount());
+      const adaptive = [...flowLikes, ...(_activeFeeling.clusterTracks || [])];
+      tracks = await buildFeelingPlaylist(_activeFeeling.key, adaptive, refillCount);
     } else if (_activeMoodKey) {
       tracks = await buildMoodPlaylist(_activeMoodKey, refillCount);
     } else {
@@ -1947,9 +2206,9 @@ async function maybeRefillContinuousQueue(state) {
     }
 
     let added = 0;
-    for (const t of tracks) {
+    for (const t of _excludeDisliked(_excludePlayed(tracks))) {
       try {
-        await addToQueue(t.uri || `spotify:track:${t.id}`);
+        await _queueTrack(t);
         added++;
         await new Promise(r => setTimeout(r, 100));
       } catch { /* skip unplayable */ }
@@ -2101,21 +2360,6 @@ function computeRightNow() {
   };
 }
 
-function computeFilter({ minEnergy=0, maxEnergy=100, minValence=0, maxValence=100, minBpm=0, maxBpm=300 } = {}) {
-  const unique = new Map();
-  for (const e of combinedHistory()) {
-    if (unique.has(e.id)) continue;
-    if (e.energy != null) {
-      if (e.energy < minEnergy || e.energy > maxEnergy) continue;
-      if (e.valence < minValence || e.valence > maxValence) continue;
-      if (e.bpm && (e.bpm < minBpm || e.bpm > maxBpm)) continue;
-    }
-    unique.set(e.id, { id: e.id, uri: e.uri, title: e.title, artist: e.artist,
-                       energy: e.energy, valence: e.valence, bpm: e.bpm });
-  }
-  return { tracks: [...unique.values()], total: unique.size };
-}
-
 function buildStats() {
   const tracks = _sessionStats.tracksPlayed;
 
@@ -2193,6 +2437,9 @@ async function poll() {
         // Open a new session if none is active
         if (!_activeSession) openActiveSession();
 
+        // Remember the current track so no auto-queue method repeats it this session
+        if (state.track.id) _sessionTrackIds.add(state.track.id);
+
         const sameTrack = state.track.id === _lastTrackId;
         if (sameTrack && _lastProgress != null) {
           const delta = state.progress - _lastProgress;
@@ -2225,6 +2472,8 @@ async function poll() {
 
       // Reset progress cursor on track change to avoid a spurious delta
       if (trackChanged) {
+        // Judge engagement with the outgoing track (skip vs finish) before we move on
+        _evaluateEngagement(_lastState);
         _lastProgress = null;
         _autoQueueCount = Math.max(0, _autoQueueCount - 1);
         // Broadcast fresh queue ~1.5 s after track change so Spotify's queue
@@ -2414,9 +2663,9 @@ async function playPlaylistWithSmartShuffle(playlistUri, playlistId) {
       }
       const seedArtists = artistIds.slice(0, 2);
 
-      const similar = await getSimilarTracks(seedTracks, seedArtists, 5);
+      const similar = _excludePlayed(await getSimilarTracks(seedTracks, seedArtists, 8)).slice(0, 5);
       for (const track of similar) {
-        try { await addToQueue(track.uri); } catch { /* ignore */ }
+        try { await _queueTrack(track); } catch { /* ignore */ }
       }
       _autoQueueCount      = similar.length;
       _smartShuffleTrackCount = 0;
@@ -2513,7 +2762,8 @@ function init(io) {
             break;
 
           case 'queue_add':
-            await addToQueue(args.uri);
+            // Manual add — honour it, but record it so auto-queue methods don't duplicate it
+            await _queueTrack({ uri: args.uri, id: typeof args.uri === 'string' && args.uri.startsWith('spotify:track:') ? args.uri.split(':').pop() : undefined });
             break;
 
           case 'like':
@@ -2791,23 +3041,31 @@ function init(io) {
 
     // ----- spotify:get_insights -----
     socket.on('spotify:get_insights', async () => {
-      // Re-seed from Spotify if never seeded or stale (> 1 hour)
-      if (Date.now() - _seedTimestamp > 3600000) {
-        await seedFromSpotify();
+      try {
+        // Re-seed from Spotify if never seeded or stale (> 1 hour)
+        if (Date.now() - _seedTimestamp > 3600000) {
+          await seedFromSpotify();
+        }
+        // Each section is computed defensively so one failing analysis can't blank
+        // the entire panel — a bad vibe calc shouldn't wipe Profile/Patterns/etc.
+        const safe = (fn, fallback) => { try { return fn(); } catch (e) { console.error('[Spotify] insights section failed:', e.message); return fallback; } };
+        socket.emit('spotify:insights', {
+          profile:  safe(computeProfile,  { ready: false, total: 0 }),
+          patterns: safe(computePatterns, { ready: false }),
+          vibes:    safe(computeVibes,    { ready: false }),
+          rightNow: safe(computeRightNow, { ready: false }),
+          total:    safe(() => combinedHistory().length, 0),
+          ownTotal: _history.length,
+          tuning:        { ..._tuning },
+          activeMoodKey: _activeMoodKey,
+          activeVibeKey: _activeVibeKey,
+          moods: MOOD_STATES.map(({ key, name, emoji, desc, feeling }) => ({ key, name, emoji, desc, feeling })),
+          context: safe(detectCurrentContext, null),
+        });
+      } catch (err) {
+        console.error('[Spotify] get_insights error:', err.message);
+        socket.emit('spotify:insights', { error: err.message });
       }
-      socket.emit('spotify:insights', {
-        profile:  computeProfile(),
-        patterns: computePatterns(),
-        vibes:    computeVibes(),
-        rightNow: computeRightNow(),
-        total:    combinedHistory().length,
-        ownTotal: _history.length,
-        flowMode:      _flowMode,
-        activeMoodKey: _activeMoodKey,
-        activeVibeKey: _activeVibeKey,
-        moods: MOOD_STATES.map(({ key, name, emoji, desc, feeling }) => ({ key, name, emoji, desc, feeling })),
-        context: detectCurrentContext(),
-      });
     });
 
     // ----- spotify:rename_vibe -----
@@ -2832,7 +3090,7 @@ function init(io) {
         let queued = 0;
         for (const t of tracks) {
           try {
-            await addToQueue(t.uri || `spotify:track:${t.id}`);
+            await _queueTrack(t);
             queued++;
             await new Promise(r => setTimeout(r, 120));
           } catch { /* skip unplayable */ }
@@ -2861,7 +3119,7 @@ function init(io) {
         let queued = 0;
         for (const t of tracks) {
           try {
-            await addToQueue(t.uri || `spotify:track:${t.id}`);
+            await _queueTrack(t);
             queued++;
             await new Promise(r => setTimeout(r, 120));
           } catch { /* skip unplayable */ }
@@ -2940,11 +3198,11 @@ function init(io) {
 
       // Queue feeling playlist
       try {
-        const tracks = await buildFeelingPlaylist(feeling, _activeFeeling.clusterTracks, 20);
+        const tracks = await buildFeelingPlaylist(feeling, _activeFeeling.clusterTracks, CHECKIN_SEED_COUNT);
         let queued = 0;
         for (const t of tracks) {
           try {
-            await addToQueue(t.uri || `spotify:track:${t.id}`);
+            await _queueTrack(t);
             queued++;
             await new Promise(r => setTimeout(r, 100));
           } catch { }
@@ -2980,11 +3238,17 @@ function init(io) {
       _emitIntelligenceState();
     });
 
-    // ----- spotify:set_flow_mode -----
-    socket.on('spotify:set_flow_mode', ({ enabled } = {}) => {
-      _flowMode = !!enabled;
+    // ----- spotify:get_tuning -----
+    socket.on('spotify:get_tuning', () => {
+      socket.emit('spotify:tuning', { tuning: { ..._tuning }, defaults: { ...TUNING_DEFAULTS } });
+    });
+
+    // ----- spotify:set_tuning -----
+    socket.on('spotify:set_tuning', (patch = {}) => {
+      _applyTuning(patch && patch.tuning ? patch.tuning : patch);
       saveUserPrefs();
-      _io.emit('spotify:flow_mode', { enabled: _flowMode });
+      _io.emit('spotify:tuning', { tuning: { ..._tuning }, defaults: { ...TUNING_DEFAULTS } });
+      console.log('[Spotify] Tuning updated:', JSON.stringify(_tuning));
     });
 
     // ----- spotify:get_moods -----
@@ -3012,11 +3276,11 @@ function init(io) {
         _activeVibeKey = rn.vibeKey || null;
         _activeMoodKey = null;
         _activeFeeling = null;
-        let pool = [...rn.topTracks].sort(() => Math.random() - 0.5).slice(0, 25);
-        if (_flowMode) pool = flowOrder(pool);
+        let pool = _excludePlayed([...rn.topTracks]).sort(() => Math.random() - 0.5).slice(0, 25);
+        if (_tFlowOn()) pool = flowOrder(pool);
         let queued = 0;
         for (const t of pool) {
-          try { await addToQueue(t.uri); queued++; await new Promise(r => setTimeout(r, 120)); }
+          try { await _queueTrack(t); queued++; await new Promise(r => setTimeout(r, 120)); }
           catch { /* skip */ }
         }
         socket.emit('spotify:insights_action', { ok: true, msg: `Queued ${queued} tracks for right now · keeps going ∞` });
@@ -3024,28 +3288,6 @@ function init(io) {
       } catch (err) {
         socket.emit('spotify:insights_action', { ok: false, msg: err.message });
       }
-    });
-
-    // ----- spotify:play_filter -----
-    socket.on('spotify:play_filter', async (params = {}) => {
-      try {
-        const { tracks } = computeFilter(params);
-        const shuffled = [...tracks].sort(() => Math.random() - 0.5).slice(0, 25);
-        let queued = 0;
-        for (const t of shuffled) {
-          try { await addToQueue(t.uri); queued++; await new Promise(r => setTimeout(r, 120)); }
-          catch { /* skip */ }
-        }
-        socket.emit('spotify:insights_action', { ok: true, msg: `Queued ${queued} filtered tracks` });
-      } catch (err) {
-        socket.emit('spotify:insights_action', { ok: false, msg: err.message });
-      }
-    });
-
-    // ----- spotify:get_filter_count -----
-    socket.on('spotify:get_filter_count', (params = {}) => {
-      const { total } = computeFilter(params);
-      socket.emit('spotify:filter_count', { total });
     });
 
     // ----- spotify:get_devices -----

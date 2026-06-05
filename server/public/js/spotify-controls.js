@@ -22,13 +22,12 @@ import {
   renameVibe,
   playVibe,
   playNow,
-  playFilter,
-  getFilterCount,
   setSpotifyAutoplay,
   setSpotifySmartShuffle,
   playMood,
   stopContinuous,
-  setFlowMode,
+  getTuning,
+  setTuning,
   respondToCheckIn,
   dismissCheckIn,
   getIntelligence,
@@ -614,9 +613,6 @@ function renderSpotifyPlayer(ctrl) {
         <button class="sp-toggle-btn sp-repeat-btn"  aria-label="Repeat">${SVG.repeatContext()}</button>
       </div>
 
-      <!-- Audio features row -->
-      <div class="sp-audio-features" style="display:none"></div>
-
       <!-- Autoplay / Smart Shuffle toggles -->
       <div class="sp-smart-row">
         <button class="sp-smart-btn sp-autoplay-btn" aria-label="Autoplay" title="Autoplay — queues similar tracks when your queue runs low">
@@ -661,7 +657,6 @@ function renderSpotifyPlayer(ctrl) {
   const repeatBtn   = card.querySelector('.sp-repeat-btn');
   const noPlayback      = card.querySelector('.sp-no-playback');
   const playerEl        = card.querySelector('.sp-player');
-  const audioFeaturesEl = card.querySelector('.sp-audio-features');
   const autoplayBtn     = card.querySelector('.sp-autoplay-btn');
   const smartShuffleBtn = card.querySelector('.sp-smart-shuffle-btn');
 
@@ -862,18 +857,8 @@ function renderSpotifyPlayer(ctrl) {
     repeatBtn.innerHTML = _repeat === 'track' ? SVG.repeatTrack() : SVG.repeatContext();
   }
 
-  // ---- _showFeatures ----
-  function _showFeatures(f) {
-    audioFeaturesEl.innerHTML = '';
-    if (!f || (!f.bpm && !f.key)) { audioFeaturesEl.style.display = 'none'; return; }
-    audioFeaturesEl.style.display = 'flex';
-    const chips = [];
-    if (f.bpm)   chips.push(`<span class="sp-feat-chip sp-feat-bpm">♩ ${f.bpm} BPM</span>`);
-    if (f.key && f.mode) chips.push(`<span class="sp-feat-chip sp-feat-key">${f.key} ${f.mode}</span>`);
-    if (f.energy != null) chips.push(`<span class="sp-feat-chip sp-feat-energy">⚡ ${f.energy}%</span>`);
-    if (f.valence != null) chips.push(`<span class="sp-feat-chip sp-feat-valence">${f.valence >= 60 ? '😄' : f.valence >= 35 ? '😐' : '😔'} ${f.valence}%</span>`);
-    audioFeaturesEl.innerHTML = chips.join('');
-  }
+  // Audio-feature chips (BPM / key / energy / valence) are no longer shown in the
+  // player. Features are still tracked server-side for the intelligence panel.
 
   // ---- _updateSpotify ----
   card._updateSpotify = function (state) {
@@ -886,18 +871,10 @@ function renderSpotifyPlayer(ctrl) {
       _stopRaf();
       _liveState = null;
       _currentTrack = null;
-      audioFeaturesEl.style.display = 'none';
       return;
     }
 
     const { track, isPlaying, progress, shuffle, repeat, liked } = state;
-
-    // When track changes (or first load): clear stale features and request fresh ones
-    if (!_currentTrack || _currentTrack.id !== track.id) {
-      _showFeatures(null);
-      // Request features; the persistent socket.on listener below will handle the response
-      socket.emit('spotify:get_audio_features', { trackId: track.id });
-    }
 
     _currentTrack = track;
     _liked   = !!liked;
@@ -957,17 +934,10 @@ function renderSpotifyPlayer(ctrl) {
   });
   marqueeRo.observe(trackInfoEl);
 
-  // Audio features socket listener
-  const _onFeatures = (f) => {
-    if (f && _currentTrack && f.trackId === _currentTrack.id) _showFeatures(f);
-  };
-  socket.on('spotify:audio_features', _onFeatures);
-
   // Clean up when card is removed from the DOM
   const _playerCleanupObs = new MutationObserver(() => {
     if (!document.contains(card)) {
       marqueeRo.disconnect();
-      socket.off('spotify:audio_features', _onFeatures);
       _playerCleanupObs.disconnect();
     }
   });
@@ -2100,7 +2070,7 @@ export function renderSpotifyInsights(ctrl) {
         <button class="sp-ins-tab" data-tab="vibes">Vibes</button>
         <button class="sp-ins-tab" data-tab="mood">Mood</button>
         <button class="sp-ins-tab" data-tab="rightnow">Routine</button>
-        <button class="sp-ins-tab" data-tab="filter">Filter</button>
+        <button class="sp-ins-tab" data-tab="tuning">Tuning</button>
       </div>
       <div class="sp-ins-content">
 
@@ -2136,10 +2106,6 @@ export function renderSpotifyInsights(ctrl) {
         <!-- VIBES -->
         <div class="sp-ins-panel" data-panel="vibes" style="display:none">
           <div class="sp-ins-vibes-toolbar">
-            <label class="sp-ins-flow-toggle" title="Orders tracks for harmonic key, BPM and energy compatibility">
-              <input type="checkbox" class="sp-ins-flow-check">
-              <span class="sp-ins-flow-label">Flow order</span>
-            </label>
             <span class="sp-ins-continuous-badge" style="display:none">● Live</span>
             <button class="sp-ins-stop-btn" style="display:none">Stop</button>
           </div>
@@ -2178,44 +2144,44 @@ export function renderSpotifyInsights(ctrl) {
         </div>
 
         <!-- FILTER -->
-        <div class="sp-ins-panel" data-panel="filter" style="display:none">
-          <div class="sp-ins-filter-presets">
-            <button class="sp-ins-preset-btn" data-preset="hype">Hype</button>
-            <button class="sp-ins-preset-btn" data-preset="workout">Workout</button>
-            <button class="sp-ins-preset-btn" data-preset="goodvibes">Good Vibes</button>
-            <button class="sp-ins-preset-btn" data-preset="focus">Focus</button>
-            <button class="sp-ins-preset-btn" data-preset="chill">Chill</button>
-            <button class="sp-ins-preset-btn" data-preset="sad">Sad</button>
-            <button class="sp-ins-preset-btn sp-ins-preset-reset" data-preset="reset">Reset</button>
-          </div>
-          <div class="sp-ins-filter-form">
-            <div class="sp-ins-filter-row">
-              <label class="sp-ins-filter-label">Energy <span class="sp-ins-energy-val">0–100%</span></label>
-              <div class="sp-ins-range-wrap">
-                <input type="range" class="sp-ins-range" id="ins-energy-min" min="0" max="100" value="0">
-                <input type="range" class="sp-ins-range" id="ins-energy-max" min="0" max="100" value="100">
-              </div>
+        <!-- TUNING -->
+        <div class="sp-ins-panel" data-panel="tuning" style="display:none">
+          <div class="sp-ins-tune-intro">Shape how every Spotify feature picks music — autoplay, smart shuffle, vibes, moods, routines &amp; check-ins.</div>
+          <div class="sp-ins-tune-form">
+            <div class="sp-ins-tune-row">
+              <div class="sp-ins-tune-head"><span class="sp-ins-tune-label">Fresh vs Familiar</span><span class="sp-ins-tune-val" data-for="freshness">—</span></div>
+              <input type="range" class="sp-ins-tune-range" data-key="freshness" min="0" max="100" value="45">
+              <div class="sp-ins-tune-ends"><span>From my library</span><span>New discoveries</span></div>
             </div>
-            <div class="sp-ins-filter-row">
-              <label class="sp-ins-filter-label">Mood <span class="sp-ins-mood-val">Sad → Happy (0–100%)</span></label>
-              <div class="sp-ins-range-wrap">
-                <input type="range" class="sp-ins-range" id="ins-mood-min" min="0" max="100" value="0">
-                <input type="range" class="sp-ins-range" id="ins-mood-max" min="0" max="100" value="100">
-              </div>
+            <div class="sp-ins-tune-row">
+              <div class="sp-ins-tune-head"><span class="sp-ins-tune-label">Variety</span><span class="sp-ins-tune-val" data-for="variety">—</span></div>
+              <input type="range" class="sp-ins-tune-range" data-key="variety" min="0" max="100" value="50">
+              <div class="sp-ins-tune-ends"><span>Stay on taste</span><span>Adventurous</span></div>
             </div>
-            <div class="sp-ins-filter-row">
-              <label class="sp-ins-filter-label">BPM</label>
-              <div class="sp-ins-bpm-row">
-                <input type="number" class="sp-ins-bpm-input" id="ins-bpm-min" min="0" max="300" value="0" placeholder="Min">
-                <span class="sp-ins-bpm-sep">–</span>
-                <input type="number" class="sp-ins-bpm-input" id="ins-bpm-max" min="0" max="300" value="300" placeholder="Max">
-              </div>
+            <div class="sp-ins-tune-row">
+              <div class="sp-ins-tune-head"><span class="sp-ins-tune-label">Fade smoothness</span><span class="sp-ins-tune-val" data-for="fadeSmooth">—</span></div>
+              <input type="range" class="sp-ins-tune-range" data-key="fadeSmooth" min="0" max="100" value="50">
+              <div class="sp-ins-tune-ends"><span>Anything goes</span><span>Songs must blend</span></div>
             </div>
-            <div class="sp-ins-filter-footer">
-              <span class="sp-ins-filter-count">— tracks match</span>
-              <button class="sp-ins-action-btn sp-ins-filter-play-btn" disabled>Queue tracks</button>
+            <div class="sp-ins-tune-row">
+              <div class="sp-ins-tune-head"><span class="sp-ins-tune-label">Mood lock vs Flow</span><span class="sp-ins-tune-val" data-for="moodFlow">—</span></div>
+              <input type="range" class="sp-ins-tune-range" data-key="moodFlow" min="0" max="100" value="50">
+              <div class="sp-ins-tune-ends"><span>Lock to mood</span><span>Go with the flow</span></div>
+            </div>
+            <div class="sp-ins-tune-row">
+              <div class="sp-ins-tune-head"><span class="sp-ins-tune-label">Skip sensitivity</span><span class="sp-ins-tune-val" data-for="skipSensitivity">—</span></div>
+              <input type="range" class="sp-ins-tune-range" data-key="skipSensitivity" min="0" max="100" value="50">
+              <div class="sp-ins-tune-ends"><span>Forgiving</span><span>React fast</span></div>
+            </div>
+            <div class="sp-ins-tune-row">
+              <div class="sp-ins-tune-head"><span class="sp-ins-tune-label">Queue lookahead</span><span class="sp-ins-tune-val" data-for="lookahead">—</span></div>
+              <input type="range" class="sp-ins-tune-range" data-key="lookahead" min="1" max="10" value="5">
+              <div class="sp-ins-tune-ends"><span>Adapt fast</span><span>Stage ahead</span></div>
             </div>
           </div>
+          <div class="sp-ins-tune-footer">
+            <span class="sp-ins-tune-saved">Saved ✓</span>
+            <button class="sp-ins-action-btn sp-ins-tune-reset">Reset to defaults</button>
           </div>
         </div>
 
@@ -2449,92 +2415,62 @@ export function renderSpotifyInsights(ctrl) {
     _showFeedback('Queuing your routine vibe…');
   });
 
-  // ---- Filter tab ----
-  const energyMin  = card.querySelector('#ins-energy-min');
-  const energyMax  = card.querySelector('#ins-energy-max');
-  const moodMin    = card.querySelector('#ins-mood-min');
-  const moodMax    = card.querySelector('#ins-mood-max');
-  const bpmMin     = card.querySelector('#ins-bpm-min');
-  const bpmMax     = card.querySelector('#ins-bpm-max');
-  const countEl    = card.querySelector('.sp-ins-filter-count');
-  const filterBtn  = card.querySelector('.sp-ins-filter-play-btn');
-  const energyVal  = card.querySelector('.sp-ins-energy-val');
-  const moodVal    = card.querySelector('.sp-ins-mood-val');
+  // ---- Tuning tab ----
+  // Global sliders that shape every Spotify feature. Each change is debounced and
+  // pushed to the server, which persists it and applies it to autoplay, smart
+  // shuffle, vibes, moods, routines and check-ins.
+  const tuneRanges = Array.from(card.querySelectorAll('.sp-ins-tune-range'));
+  const tuneSaved  = card.querySelector('.sp-ins-tune-saved');
+  const tuneReset  = card.querySelector('.sp-ins-tune-reset');
+  let _tuneDefaults = { freshness: 45, variety: 50, fadeSmooth: 50, moodFlow: 50, skipSensitivity: 50, lookahead: 5 };
+  let _tuneDebounce = null;
+  let _tuneSavedTimer = null;
 
-  let _filterDebounce = null;
-  function _getFilterParams() {
-    return {
-      minEnergy: Math.min(+energyMin.value, +energyMax.value),
-      maxEnergy: Math.max(+energyMin.value, +energyMax.value),
-      minValence: Math.min(+moodMin.value, +moodMax.value),
-      maxValence: Math.max(+moodMin.value, +moodMax.value),
-      minBpm: Math.min(+bpmMin.value || 0, +bpmMax.value || 300),
-      maxBpm: Math.max(+bpmMin.value || 0, +bpmMax.value || 300),
-    };
+  function _fmtTune(key, val) {
+    return key === 'lookahead' ? `${val} track${val == 1 ? '' : 's'}` : `${val}%`;
   }
-  function _updateFilterLabels() {
-    const eMin = Math.min(+energyMin.value, +energyMax.value);
-    const eMax = Math.max(+energyMin.value, +energyMax.value);
-    const mMin = Math.min(+moodMin.value,   +moodMax.value);
-    const mMax = Math.max(+moodMin.value,   +moodMax.value);
-    energyVal.textContent = eMin === 0 && eMax === 100 ? 'any' : `${eMin}–${eMax}%`;
-    moodVal.textContent   = mMin === 0 && mMax === 100 ? 'any' : `${mMin}–${mMax}%`;
-  }
-  function _requestFilterCount() {
-    clearTimeout(_filterDebounce);
-    _filterDebounce = setTimeout(() => {
-      getFilterCount(_getFilterParams());
-    }, 300);
-  }
-  [energyMin, energyMax, moodMin, moodMax, bpmMin, bpmMax].forEach(el => {
-    el.addEventListener('input', () => { _updateFilterLabels(); _requestFilterCount(); });
-  });
-
-  // ---- Presets ----
-  const PRESETS = {
-    hype:      { eMin: 80, eMax: 100, mMin: 60,  mMax: 100, bMin: 120, bMax: 200 },
-    workout:   { eMin: 70, eMax: 100, mMin: 0,   mMax: 100, bMin: 120, bMax: 180 },
-    goodvibes: { eMin: 40, eMax: 80,  mMin: 60,  mMax: 100, bMin: 0,   bMax: 300 },
-    focus:     { eMin: 20, eMax: 55,  mMin: 0,   mMax: 100, bMin: 60,  bMax: 130 },
-    chill:     { eMin: 0,  eMax: 40,  mMin: 0,   mMax: 100, bMin: 0,   bMax: 110 },
-    sad:       { eMin: 0,  eMax: 40,  mMin: 0,   mMax: 40,  bMin: 0,   bMax: 300 },
-    reset:     { eMin: 0,  eMax: 100, mMin: 0,   mMax: 100, bMin: 0,   bMax: 300 },
-  };
-  function _applyPreset(key) {
-    const p = PRESETS[key];
-    if (!p) return;
-    energyMin.value = p.eMin; energyMax.value = p.eMax;
-    moodMin.value   = p.mMin; moodMax.value   = p.mMax;
-    bpmMin.value    = p.bMin; bpmMax.value    = p.bMax;
-    // Mark active preset (skip for reset)
-    card.querySelectorAll('.sp-ins-preset-btn').forEach(b => b.classList.remove('active'));
-    if (key !== 'reset') card.querySelector(`[data-preset="${key}"]`)?.classList.add('active');
-    _updateFilterLabels();
-    _requestFilterCount();
-  }
-  card.querySelector('.sp-ins-filter-presets').addEventListener('click', (e) => {
-    const btn = e.target.closest('.sp-ins-preset-btn');
-    if (!btn || isEditMode()) return;
-    _applyPreset(btn.dataset.preset);
-  });
-  // Clear active preset when sliders are moved manually
-  [energyMin, energyMax, moodMin, moodMax, bpmMin, bpmMax].forEach(el => {
-    el.addEventListener('input', () => {
-      card.querySelectorAll('.sp-ins-preset-btn').forEach(b => b.classList.remove('active'));
+  function _updateTuneLabels() {
+    tuneRanges.forEach(r => {
+      const out = card.querySelector(`.sp-ins-tune-val[data-for="${r.dataset.key}"]`);
+      if (out) out.textContent = _fmtTune(r.dataset.key, +r.value);
     });
+  }
+  function _collectTuning() {
+    const t = {};
+    tuneRanges.forEach(r => { t[r.dataset.key] = +r.value; });
+    return t;
+  }
+  function _flashTuneSaved() {
+    if (!tuneSaved) return;
+    tuneSaved.classList.add('show');
+    clearTimeout(_tuneSavedTimer);
+    _tuneSavedTimer = setTimeout(() => tuneSaved.classList.remove('show'), 1200);
+  }
+  function _pushTuning() {
+    clearTimeout(_tuneDebounce);
+    _tuneDebounce = setTimeout(() => { setTuning(_collectTuning()); _flashTuneSaved(); }, 250);
+  }
+  function _applyTuningState(tuning, defaults) {
+    if (defaults) _tuneDefaults = { ..._tuneDefaults, ...defaults };
+    if (tuning) {
+      tuneRanges.forEach(r => { if (tuning[r.dataset.key] != null) r.value = tuning[r.dataset.key]; });
+    }
+    _updateTuneLabels();
+  }
+  tuneRanges.forEach(r => {
+    r.addEventListener('input', () => { _updateTuneLabels(); _pushTuning(); });
   });
-
-  const _onFilterCount = ({ total }) => {
-    countEl.textContent = `${total} track${total !== 1 ? 's' : ''} match`;
-    filterBtn.disabled = total === 0;
-  };
-  socket.on('spotify:filter_count', _onFilterCount);
-
-  filterBtn.addEventListener('pointerup', () => {
+  tuneReset?.addEventListener('pointerup', () => {
     if (isEditMode()) return;
-    playFilter(_getFilterParams());
-    _showFeedback('Queuing filtered tracks…');
+    tuneRanges.forEach(r => { if (_tuneDefaults[r.dataset.key] != null) r.value = _tuneDefaults[r.dataset.key]; });
+    _updateTuneLabels();
+    setTuning(_collectTuning());
+    _flashTuneSaved();
   });
+  const _onTuning = ({ tuning, defaults } = {}) => _applyTuningState(tuning, defaults);
+  socket.on('spotify:tuning', _onTuning);
+  getTuning();
+  _updateTuneLabels();
 
   // ---- Mood tab ----
   let _moodsCache = [];
@@ -2614,12 +2550,6 @@ export function renderSpotifyInsights(ctrl) {
     });
   }
 
-  // Flow toggle
-  const flowCheck = card.querySelector('.sp-ins-flow-check');
-  flowCheck.addEventListener('change', () => {
-    setFlowMode(flowCheck.checked);
-  });
-
   // Stop continuous (Vibes toolbar)
   card.querySelector('.sp-ins-vibes-toolbar .sp-ins-stop-btn').addEventListener('pointerup', () => {
     if (isEditMode()) return;
@@ -2634,9 +2564,7 @@ export function renderSpotifyInsights(ctrl) {
 
   // Continuous state updates from server
   const _onContinuousState = (data) => _updateContinuousState(data);
-  const _onFlowMode = ({ enabled }) => { flowCheck.checked = enabled; };
   socket.on('spotify:continuous_state', _onContinuousState);
-  socket.on('spotify:flow_mode', _onFlowMode);
 
   // ---- Main data load ----
   function _loadAll(data) {
@@ -2649,12 +2577,10 @@ export function renderSpotifyInsights(ctrl) {
     if (data.moods) {
       _renderMoods(data.moods, data.activeMoodKey, data.activeVibeKey, data.context);
     }
-    // Flow toggle state
-    if (data.flowMode != null) flowCheck.checked = data.flowMode;
+    // Tuning sliders
+    if (data.tuning) _applyTuningState(data.tuning);
     // Continuous badge
     _updateContinuousState({ activeMoodKey: data.activeMoodKey, activeVibeKey: data.activeVibeKey });
-    // Init filter count
-    _requestFilterCount();
   }
 
   // Cleanup
@@ -2662,9 +2588,8 @@ export function renderSpotifyInsights(ctrl) {
     if (!document.contains(card)) {
       socket.off('spotify:insights_action', _onAction);
       socket.off('spotify:vibe_renamed',    _onVibeRenamed);
-      socket.off('spotify:filter_count',    _onFilterCount);
+      socket.off('spotify:tuning',          _onTuning);
       socket.off('spotify:continuous_state', _onContinuousState);
-      socket.off('spotify:flow_mode',        _onFlowMode);
       _cleanObs.disconnect();
     }
   });
