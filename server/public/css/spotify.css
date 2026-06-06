@@ -104,8 +104,16 @@
   display: flex;
   flex-direction: column;
   justify-content: space-between; /* rows stay at fixed positions; gaps absorb card height */
+  /* Fill the card box. The parent .control-card is `align-items: center`, so
+     without an explicit width this collapses to its content's intrinsic width
+     and gets centred — overflowing equally on BOTH sides when the content is
+     wider than the card, which the card's overflow:hidden then clips. Pinning
+     width:100% + min-width:0 keeps every row inside the borders and lets the
+     padding below act as a consistent inset from the edges. */
+  width: 100%;
+  min-width: 0;
   height: 100%;
-  padding: 8px 12px 8px;
+  padding: 10px 14px;
   box-sizing: border-box;
   position: relative;
 }

@@ -918,6 +918,17 @@ function renderSpotifyPlayer(ctrl) {
 
     const { track, isPlaying, progress, shuffle, repeat, liked } = state;
 
+    // Was this same track already playing in the bar? (Captured BEFORE we
+    // overwrite _currentTrack below.) Used to smooth out tiny backward jumps.
+    const _wasSameTrack = !!(_currentTrack && _currentTrack.id === track.id);
+    // The position the seek bar is currently showing (interpolated), so we can
+    // detect when an incoming poll would yank it backward.
+    const _prevDisplayed = _liveState
+      ? (_liveState.isPlaying
+          ? Math.min(_liveState.progress + (Date.now() - _liveState.ts), _liveState.duration || 0)
+          : _liveState.progress)
+      : null;
+
     _currentTrack = track;
     _liked   = !!liked;
     _repeat  = repeat || 'off';
@@ -949,8 +960,24 @@ function renderSpotifyPlayer(ctrl) {
 
     playBtn.innerHTML = isPlaying ? SVG.pause() : SVG.play();
 
+    // Anti-rewind smoothing. The server's progress is sampled slightly in the
+    // past (network + request-queue latency), so stamping it with a fresh ts
+    // makes the bar jump backward by the round-trip time on every poll. For the
+    // SAME playing track, if the new position is only marginally behind what the
+    // bar already shows, keep the displayed position instead of snapping back —
+    // the tiny over-estimate self-corrects as real progress catches up. Real
+    // backward seeks (large jumps) and track changes are always honored.
+    const SEEK_BACK_TOLERANCE = 3000; // ms — below this a backward move is treated as latency jitter
+    let _baseProgress = progress ?? 0;
+    if (_wasSameTrack && isPlaying && _prevDisplayed != null) {
+      const backJump = _prevDisplayed - _baseProgress;
+      if (backJump > 0 && backJump < SEEK_BACK_TOLERANCE) {
+        _baseProgress = _prevDisplayed;
+      }
+    }
+
     _liveState = {
-      progress: progress ?? 0,
+      progress: _baseProgress,
       duration: track.duration ?? 0,
       isPlaying,
       ts: Date.now(),
@@ -1841,7 +1868,6 @@ function renderSpotifyStats(ctrl) {
       <div class="sp-section-header">
         <span class="sp-section-title">Session</span>
         <span class="sp-stats-since"></span>
-        <button class="sp-stats-reset-btn" aria-label="Reset session" title="Reset session">${SP_ICON.reset}</button>
       </div>
       <div class="sp-stats-tabbar">
         <button class="sp-stats-tab active" data-tab="current">Current</button>
@@ -1907,7 +1933,6 @@ function renderSpotifyStats(ctrl) {
   card.appendChild(resizeHandle());
   card.appendChild(editOverlay(ctrl.id));
 
-  const resetBtn      = card.querySelector('.sp-stats-reset-btn');
   const sinceEl       = card.querySelector('.sp-stats-since');
   const tracksEl      = card.querySelector('.sp-stat-tracks');
   const timeEl        = card.querySelector('.sp-stat-time');
@@ -1951,16 +1976,6 @@ function renderSpotifyStats(ctrl) {
   const _timerInterval = setInterval(() => {
     if (_isPlaying) timeEl.textContent = fmtDuration(_liveSessionMs());
   }, 1000);
-
-  resetBtn.addEventListener('pointerup', () => {
-    if (isEditMode()) return;
-    // Reset local counters
-    _srvListenedMs = 0; _srvTodayMs = 0; _srvWeekMs = 0;
-    _srvUpdatedAt  = 0;
-    timeEl.textContent  = fmtDuration(0);
-    todayEl.textContent = fmtDuration(0);
-    resetSpotifySession();
-  });
 
   function _showSaveForm() {
     saveBtn.style.display = 'none';

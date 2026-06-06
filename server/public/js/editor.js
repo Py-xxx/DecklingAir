@@ -147,12 +147,21 @@ export function initEditor(state, callbacks) {
   document.getElementById('btn-add-macro-action').addEventListener('click', () => addMacroAction());
   document.getElementById('cfg-desktop-kind').addEventListener('change', updateDesktopActionFields);
 
-  document.getElementById('cfg-soundboard-browse').addEventListener('click', _fbOpen);
+  document.getElementById('cfg-soundboard-browse').addEventListener('click', () => _fbOpen());
   document.getElementById('cfg-soundboard-refresh').addEventListener('click', () => {
     requestSoundboardDevicesForEditor();
   });
   document.getElementById('s-soundboard-refresh').addEventListener('click', () => {
     requestSoundboardDevicesForEditor();
+  });
+  // Settings → pick the default soundboard browse folder
+  document.getElementById('s-soundboard-default-dir-browse')?.addEventListener('click', () => {
+    const input = document.getElementById('s-soundboard-default-dir');
+    _fbOpen({
+      mode: 'folder',
+      startPath: input?.value.trim() || '',
+      onPick: (path) => { if (input) input.value = path; },
+    });
   });
   document.getElementById('cfg-soundboard-volume').addEventListener('input', () => {
     document.getElementById('cfg-soundboard-volume-display').textContent =
@@ -324,6 +333,10 @@ export function openSettings() {
       sbSelect.value = globalDevice;
     }
   }
+  // Default browse folder
+  const defaultDirEl = document.getElementById('s-soundboard-default-dir');
+  if (defaultDirEl) defaultDirEl.value = _state.layoutStore?.globalSettings?.soundboardDefaultDir || '';
+
   // Request fresh device list from bridge (populates dropdown when response arrives)
   requestSoundboardDevicesForEditor();
 
@@ -780,16 +793,28 @@ const _fb = {
   list:     null,
   pathEl:   null,
   upBtn:    null,
+  selectBtn:null,
   parent:   null,    // null = at root level, string = parent path
+  current:  null,    // current directory path (null at the drive/root list)
+  mode:     'file',  // 'file' = pick a sound file, 'folder' = pick a directory
+  onPick:   null,    // folder-mode callback(path)
   pending:  false,
 };
 
-function _fbOpen() {
+/**
+ * Open the soundboard browser.
+ * @param {object} [opts]
+ * @param {'file'|'folder'} [opts.mode='file']  file = choose a sound; folder = choose a directory
+ * @param {string} [opts.startPath]             directory to open at (defaults to the saved default folder in file mode)
+ * @param {function(string):void} [opts.onPick] folder-mode selection callback
+ */
+function _fbOpen(opts = {}) {
   if (!_fb.modal) {
-    _fb.modal  = document.getElementById('filebrowser-modal');
-    _fb.list   = document.getElementById('filebrowser-list');
-    _fb.pathEl = document.getElementById('filebrowser-path');
-    _fb.upBtn  = document.getElementById('filebrowser-up');
+    _fb.modal     = document.getElementById('filebrowser-modal');
+    _fb.list      = document.getElementById('filebrowser-list');
+    _fb.pathEl    = document.getElementById('filebrowser-path');
+    _fb.upBtn     = document.getElementById('filebrowser-up');
+    _fb.selectBtn = document.getElementById('filebrowser-select-folder');
     document.getElementById('filebrowser-close').addEventListener('click',  _fbClose);
     document.getElementById('filebrowser-cancel').addEventListener('click', _fbClose);
     _fb.modal.addEventListener('click', e => { if (e.target === _fb.modal) _fbClose(); });
@@ -797,16 +822,47 @@ function _fbOpen() {
       if (_fb.parent != null) _fbNavigate(_fb.parent);
       else _fbShowRoots();
     });
+    _fb.selectBtn?.addEventListener('click', () => {
+      if (_fb.mode === 'folder' && _fb.current && typeof _fb.onPick === 'function') {
+        _fb.onPick(_fb.current);
+      }
+      _fbClose();
+    });
     // Listen for results from server
     socket.on('soundboard:browse_roots_result', _fbHandleRoots);
     socket.on('soundboard:browse_result',       _fbHandleDir);
   }
+
+  _fb.mode   = opts.mode === 'folder' ? 'folder' : 'file';
+  _fb.onPick = typeof opts.onPick === 'function' ? opts.onPick : null;
+
+  // Folder mode is launched from inside the Settings modal, so it must stack
+  // above it (both modals share z-index:500 and Settings comes later in the DOM).
+  _fb.modal.style.zIndex = _fb.mode === 'folder' ? '600' : '';
+  if (_fb.selectBtn) _fb.selectBtn.style.display = _fb.mode === 'folder' ? '' : 'none';
+
+  // Title reflects intent.
+  const titleEl = _fb.modal.querySelector('.modal-header h2');
+  if (titleEl) titleEl.textContent = _fb.mode === 'folder' ? 'Choose Default Folder' : 'Browse Sound Files';
+
   _fb.modal.style.display = '';
-  _fbShowRoots();
+
+  // Determine where to start. File mode honours the saved default folder unless
+  // an explicit startPath was given.
+  const fallbackStart = _fb.mode === 'file'
+    ? (_state.layoutStore?.globalSettings?.soundboardDefaultDir || '')
+    : '';
+  const start = (opts.startPath || fallbackStart || '').trim();
+  if (start) _fbNavigate(start);
+  else _fbShowRoots();
 }
 
 function _fbClose() {
-  if (_fb.modal) _fb.modal.style.display = 'none';
+  if (_fb.modal) { _fb.modal.style.display = 'none'; _fb.modal.style.zIndex = ''; }
+}
+
+function _fbUpdateSelectState() {
+  if (_fb.selectBtn) _fb.selectBtn.disabled = !(_fb.mode === 'folder' && _fb.current);
 }
 
 function _fbSetLoading(msg = 'Loading…') {
@@ -823,7 +879,9 @@ function _fbShowRoots() {
   _fbSetLoading('Loading drives…');
   _fb.pathEl.textContent = 'This PC';
   _fb.parent = null;
+  _fb.current = null;
   _fb.upBtn.disabled = true;
+  _fbUpdateSelectState();
   socket.emit('soundboard:browse_roots', { deviceId });
 }
 
@@ -837,7 +895,9 @@ function _fbNavigate(path) {
 function _fbHandleRoots({ roots }) {
   _fb.pathEl.textContent = 'This PC';
   _fb.parent = null;
+  _fb.current = null;
   _fb.upBtn.disabled = true;
+  _fbUpdateSelectState();
   _fb.list.innerHTML = '';
   if (!roots || !roots.length) {
     _fb.list.innerHTML = '<div class="filebrowser-loading filebrowser-error">No drives found.</div>';
@@ -851,18 +911,30 @@ function _fbHandleRoots({ roots }) {
 
 function _fbHandleDir({ path, parent, entries, error }) {
   if (error) {
+    // Don't strand the user on a bad/inaccessible path (e.g. a saved default
+    // folder that no longer exists) — let Up fall back to the drive list.
+    _fb.parent = null;
+    _fb.current = null;
+    _fb.upBtn.disabled = false;
+    _fbUpdateSelectState();
     _fb.list.innerHTML = `<div class="filebrowser-loading filebrowser-error">⚠ ${error}</div>`;
     return;
   }
   _fb.pathEl.textContent = path || '—';
   _fb.parent = parent;   // null when at drive root
+  _fb.current = path || null;
   _fb.upBtn.disabled = false;
+  _fbUpdateSelectState();
   _fb.list.innerHTML = '';
-  if (!entries || !entries.length) {
-    _fb.list.innerHTML = '<div class="filebrowser-loading">Empty folder</div>';
+  // In folder-pick mode, only directories are navigable; files are noise.
+  const visible = _fb.mode === 'folder'
+    ? (entries || []).filter(e => e.isDir)
+    : (entries || []);
+  if (!visible.length) {
+    _fb.list.innerHTML = `<div class="filebrowser-loading">${_fb.mode === 'folder' ? 'No subfolders here' : 'Empty folder'}</div>`;
     return;
   }
-  entries.forEach(({ name, isDir, ext }) => {
+  visible.forEach(({ name, isDir, ext }) => {
     const fullPath = path.replace(/[/\\]$/, '') + '\\' + name;
     const row = isDir
       ? _fbMakeDirRow(name, fullPath)
@@ -1214,10 +1286,12 @@ function applySettings() {
   const panelOpacity = clampFloat(document.getElementById('s-panel-opacity')?.value, 0.2, 1, 1);
   const fitToScreen = !!document.getElementById('s-fit-screen')?.checked;
   const soundboardDevice = document.getElementById('s-soundboard-device')?.value || null;
+  const soundboardDefaultDir = document.getElementById('s-soundboard-default-dir')?.value.trim() || null;
 
-  // Save global soundboard device preference
+  // Save global soundboard preferences
   if (!_state.layoutStore.globalSettings) _state.layoutStore.globalSettings = {};
   _state.layoutStore.globalSettings.soundboardDevice = soundboardDevice || null;
+  _state.layoutStore.globalSettings.soundboardDefaultDir = soundboardDefaultDir;
 
   const next = {
     ...(_state.layout.settings || {}),

@@ -143,8 +143,8 @@
               Sp Queue
             </button>
             <button class="type-card" data-type="spotify_stats">
-              <span class="type-card-icon">📊</span>
-              <span class="type-card-label">Spotify Stats</span>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></svg>
+              Spotify Stats
             </button>
             <button class="type-card" data-type="spotify_insights">
               <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 21h18"/><rect x="5" y="11" width="3.2" height="7"/><rect x="10.4" y="6" width="3.2" height="12"/><rect x="15.8" y="13" width="3.2" height="5"/></svg>
@@ -443,6 +443,7 @@
       </div>
       <div class="modal-footer">
         <div style="flex:1"></div>
+        <button class="btn-primary" id="filebrowser-select-folder" style="display:none">Select This Folder</button>
         <button class="btn-secondary" id="filebrowser-cancel">Cancel</button>
       </div>
     </div>
@@ -471,21 +472,27 @@
         </section>
         <section class="settings-section">
           <h3>Appearance</h3>
-          <div class="form-row">
-            <div class="form-group">
-              <label class="form-label">Primary Color</label>
+          <div class="color-settings">
+            <div class="color-setting-row">
               <input type="color" id="s-primary-color" class="form-color" value="#090910">
-              <span class="form-hint">Page background</span>
+              <div class="color-setting-text">
+                <span class="color-setting-name">Primary Color</span>
+                <span class="color-setting-desc">Page background</span>
+              </div>
             </div>
-            <div class="form-group">
-              <label class="form-label">Secondary Color</label>
+            <div class="color-setting-row">
               <input type="color" id="s-secondary-color" class="form-color" value="#181828">
-              <span class="form-hint">Panels</span>
+              <div class="color-setting-text">
+                <span class="color-setting-name">Secondary Color</span>
+                <span class="color-setting-desc">Panels</span>
+              </div>
             </div>
-            <div class="form-group">
-              <label class="form-label">Accent Color</label>
+            <div class="color-setting-row">
               <input type="color" id="s-accent-color" class="form-color" value="#6c63ff">
-              <span class="form-hint">Highlights</span>
+              <div class="color-setting-text">
+                <span class="color-setting-name">Accent Color</span>
+                <span class="color-setting-desc">Highlights &amp; active states</span>
+              </div>
             </div>
           </div>
           <div class="form-row" style="margin-top:10px">
@@ -541,6 +548,14 @@
               <button type="button" id="s-soundboard-refresh" class="btn-secondary btn-sm" title="Refresh device list">↻</button>
             </div>
             <span class="form-hint">Audio route for all soundboard buttons that don't have a per-button override. Pick a VoiceMeeter virtual input (e.g. "VoiceMeeter Input") to route sound through the mixer.</span>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Default Browse Folder</label>
+            <div class="soundboard-device-row">
+              <input type="text" id="s-soundboard-default-dir" class="form-input" placeholder="e.g. C:\Sounds — leave blank to start at drives">
+              <button type="button" id="s-soundboard-default-dir-browse" class="btn-secondary btn-sm" title="Pick folder">📁</button>
+            </div>
+            <span class="form-hint">When set, the soundboard file picker opens straight to this folder instead of the drive list.</span>
           </div>
         </section>
         <section class="settings-section">

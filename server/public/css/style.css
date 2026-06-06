@@ -37,7 +37,7 @@
   --snap:          16px;
 }
 
-html, body { height: 100%; overflow: hidden; }
+html, body { height: 100%; overflow: hidden; overscroll-behavior: none; }
 
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
@@ -237,7 +237,15 @@ body.has-bg-image {
    width/height can't push the container wider/taller than the viewport —
    that's what was letting horizontal scroll through even with overflow:hidden. */
 body.fit-screen #main-area {
+  /* iOS Safari lets you touch-pan an `overflow:hidden` box even with no visible
+     scrollbar (the scaled canvas's full 1280px layout box stays pannable).
+     `overflow: clip` creates NO scroll container at all, so the dashboard can't
+     be dragged sideways on iPad. `hidden` is kept as a fallback for old engines.
+     Inner panels (queue/playlist lists) keep their own overflow-y and still
+     scroll, since this only clips the main canvas container. */
   overflow: hidden;
+  overflow: clip;
+  overscroll-behavior: none;
   padding: 0;
 }
 body.fit-screen .control-grid {
@@ -807,6 +815,24 @@ body.edit-mode .control-card .drag-handle { display: flex; }
   width: 44px; height: 34px; padding: 2px; border-radius: var(--radius-sm);
   border: 1px solid var(--border); background: var(--bg-3); cursor: pointer;
 }
+
+/* Appearance colour list — one labelled row per colour, divided for clarity */
+.color-settings { display: flex; flex-direction: column; }
+.color-setting-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+.color-setting-row:first-child { padding-top: 2px; }
+.color-setting-row:last-child  { border-bottom: none; padding-bottom: 2px; }
+.color-setting-row .form-color {
+  width: 46px; height: 34px; flex-shrink: 0;
+}
+.color-setting-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.color-setting-name {
+  font-size: 13px; font-weight: 600; color: var(--text);
+}
+.color-setting-desc { font-size: 11px; color: var(--text-3); }
 .cfg-section { display: flex; flex-direction: column; gap: 12px; }
 .cfg-note { font-size: 12px; line-height: 1.5; color: var(--text-3); }
 
