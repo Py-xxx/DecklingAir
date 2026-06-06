@@ -765,7 +765,7 @@ function resetSessionState() {
 // ── Away-listening reconciliation ─────────────────────────────────────────────
 
 async function reconcileRecentlyPlayed() {
-  if (!isAuthed()) return;
+  if (!isAuthed() || _spotifyRateLimited()) return;
   try {
     const rp = await api('GET', '/me/player/recently-played', { params: { limit: 50 }, priority: 'low' });
     const items = rp?.items || [];
@@ -869,7 +869,7 @@ function combinedHistory() {
  * Called once on startup (after auth) and lazily refreshed every hour.
  */
 async function seedFromSpotify() {
-  if (!isAuthed()) return;
+  if (!isAuthed() || _spotifyRateLimited()) return;
   try {
     console.log('[Spotify] Seeding history from Spotify API…');
     const seeds = [];
@@ -990,7 +990,7 @@ let _featureWarmRunning = false;
  * up newly-liked songs.
  */
 async function warmFeatureLibrary() {
-  if (_featureWarmRunning || !isAuthed()) return;
+  if (_featureWarmRunning || !isAuthed() || _spotifyRateLimited()) return;
   _featureWarmRunning = true;
   try {
     // 1. Gather library + top-track metadata (deduped by id)
@@ -1030,7 +1030,7 @@ async function warmFeatureLibrary() {
     // 3. Gently fetch the missing features one at a time
     let got = 0, done = 0;
     for (const id of missing) {
-      if (!isAuthed() || !_pollTimer) break; // auth lost / shutting down — stop cleanly
+      if (!isAuthed() || !_pollTimer || _spotifyRateLimited()) break; // auth lost / shutting down / rate-limited — stop cleanly
       if (_audioFeaturesCache.has(id)) { _applyFeatToSeed(byId.get(id), _audioFeaturesCache.get(id)); done++; continue; }
       try {
         const recco = await getReccoBeatsFeatures(id);
@@ -1144,19 +1144,43 @@ let _spotifyLastTs = 0;
 let _spotifyGap = 220;                 // current spacing between requests (ms)
 const SPOTIFY_GAP_MIN = 220;
 const SPOTIFY_GAP_MAX = 8000;
-const SPOTIFY_MAX_RETRIES = 4;
+const SPOTIFY_MAX_RETRIES = 3;
+// A 429 pauses EVERY request globally (circuit breaker) until this timestamp.
+// Capped so a punitive multi-hour Retry-After can't wedge the whole app — once
+// the cap lapses we make a single probe; if still banned we just pause again.
+let _spotifyPauseUntil = 0;
+const SPOTIFY_PAUSE_MAX = 120000;      // never pause longer than 2 min per step
 
 const _sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// True while a 429 cooldown is in effect — background jobs check this and skip
+// a cycle entirely rather than queuing work that will just be paused/dropped.
+function _spotifyRateLimited() {
+  return Date.now() < _spotifyPauseUntil;
+}
 
 // Two-tier priority queue. Interactive requests (queue/playlists/search/poll)
 // go on the HIGH queue; bulk background work (library warm, history seed,
 // reconcile) goes on the LOW queue. The drainer always empties HIGH before it
-// touches LOW, so a multi-hundred-call library scan can never starve the
-// user-facing requests that triggered this whole rewrite. A single min-gap is
-// still enforced across both tiers so we never burst the API.
+// touches LOW. A single min-gap AND a global rate-limit pause are enforced
+// across both tiers, so one 429 stops the world instead of letting the rest of
+// the queue keep hammering Spotify into a longer ban.
 const _spotifyHigh = [];
 const _spotifyLow = [];
 let _spotifyDraining = false;
+
+// Drop all queued background (low-priority) work — used when we hit a hard 429
+// so we don't replay hundreds of already-rate-limited requests once the pause
+// lifts. The bulk jobs are idempotent and re-run on their own timers.
+function _flushLowQueue(reason) {
+  if (!_spotifyLow.length) return;
+  const n = _spotifyLow.length;
+  while (_spotifyLow.length) {
+    const job = _spotifyLow.shift();
+    job.reject(Object.assign(new Error(reason || 'dropped (rate-limited)'), { status: 429, dropped: true }));
+  }
+  console.warn(`[Spotify] Dropped ${n} queued background request(s) — ${reason || 'rate-limited'}`);
+}
 
 function _drainSpotify() {
   if (_spotifyDraining) return;
@@ -1164,6 +1188,14 @@ function _drainSpotify() {
   (async () => {
     try {
       while (_spotifyHigh.length || _spotifyLow.length) {
+        // Global circuit breaker: wait out any active rate-limit pause before
+        // touching the API at all. Re-check in slices so a pause extended by a
+        // fresh 429 is honoured too.
+        let pauseLeft = _spotifyPauseUntil - Date.now();
+        while (pauseLeft > 0) {
+          await _sleep(Math.min(pauseLeft, 1000));
+          pauseLeft = _spotifyPauseUntil - Date.now();
+        }
         const job = _spotifyHigh.length ? _spotifyHigh.shift() : _spotifyLow.shift();
         const wait = Math.max(0, _spotifyLastTs + _spotifyGap - Date.now());
         if (wait > 0) await _sleep(wait);
@@ -1193,8 +1225,10 @@ function _spotifyThrottle(fn, priority = 'high') {
   });
 }
 
-// Throttled + backed-off Spotify request. Retries on 429/5xx, honouring
-// Retry-After; widens the global gap on 429 and gently relaxes it on success.
+// Throttled + backed-off Spotify request. On 429 it engages the GLOBAL pause
+// (so every request waits, not just this one), widens the inter-request gap,
+// and dumps background work on a hard ban. Background ('low') requests don't
+// retry — they're best-effort and re-run on their own timers.
 async function _spotifySend(method, urlStr, reqOpts, label, priority = 'high') {
   for (let attempt = 1; ; attempt++) {
     try {
@@ -1204,20 +1238,28 @@ async function _spotifySend(method, urlStr, reqOpts, label, priority = 'high') {
       }
       return data;
     } catch (err) {
+      if (err.dropped) throw err; // background job intentionally discarded
       const is429 = err.status === 429;
       const is5xx = err.status >= 500 && err.status < 600;
       const isTimeout = err.status === 0; // socket timeout/abort — worth one retry
-      if ((is429 || is5xx || isTimeout) && attempt <= SPOTIFY_MAX_RETRIES) {
-        let waitMs;
-        if (is429) {
-          const ra = Number(err.headers?.['retry-after']);
-          waitMs = Number.isFinite(ra) && ra >= 0 ? ra * 1000 + 250 : Math.min(SPOTIFY_GAP_MAX, 1000 * 2 ** (attempt - 1));
-          _spotifyGap = Math.min(SPOTIFY_GAP_MAX, Math.max(_spotifyGap * 2, 1000));
-          console.warn(`[Spotify] 429 on ${label} — backing off ${waitMs}ms (gap now ${_spotifyGap}ms, attempt ${attempt}/${SPOTIFY_MAX_RETRIES})`);
-        } else {
-          waitMs = Math.min(8000, 500 * 2 ** (attempt - 1));
-        }
-        await _sleep(waitMs);
+
+      if (is429) {
+        const ra = Number(err.headers?.['retry-after']);
+        const raMs = Number.isFinite(ra) && ra >= 0 ? ra * 1000 + 250 : 5000;
+        // Engage the global pause (capped) so the whole queue stops hammering.
+        const applied = Math.min(raMs, SPOTIFY_PAUSE_MAX);
+        _spotifyPauseUntil = Math.max(_spotifyPauseUntil, Date.now() + applied);
+        _spotifyGap = Math.min(SPOTIFY_GAP_MAX, Math.max(_spotifyGap * 2, 1000));
+        console.warn(`[Spotify] 429 on ${label} — global pause ${applied}ms (server asked ${raMs}ms; gap now ${_spotifyGap}ms)`);
+        // A hard ban: shed all queued background work so it doesn't pile back on.
+        if (raMs > 15000) _flushLowQueue('hard 429 cooldown');
+        // Background requests are best-effort — give up rather than retry.
+        if (priority === 'low' || attempt > SPOTIFY_MAX_RETRIES) throw err;
+        continue; // re-enqueue; the drainer will wait out the global pause
+      }
+
+      if ((is5xx || isTimeout) && priority !== 'low' && attempt <= SPOTIFY_MAX_RETRIES) {
+        await _sleep(Math.min(8000, 500 * 2 ** (attempt - 1)));
         continue;
       }
       throw err;
@@ -1990,6 +2032,11 @@ async function getReccoBeatsFeatures(trackId) {
 // act on data that hadn't been saved yet (the bug that only showed up on new songs).
 const _audioFeaturesInflight = new Map();
 
+// Spotify deprecated /audio-features for most apps (returns 403). Once we see
+// that, stop calling it for the rest of the session — every attempt still costs
+// a request against the rate limit for a result we know will fail.
+let _spotifyAudioFeaturesDead = false;
+
 async function getAudioFeatures(trackId) {
   if (!trackId) return null;
   if (_audioFeaturesCache.has(trackId)) return _audioFeaturesCache.get(trackId);
@@ -1999,15 +2046,19 @@ async function getAudioFeatures(trackId) {
   if (_audioFeaturesInflight.has(trackId)) return _audioFeaturesInflight.get(trackId);
 
   const fetchPromise = (async () => {
-    // Tier 1: Spotify's own endpoint (deprecated — 403s for most apps, kept for the few it works on)
-    try {
-      const data = await api('GET', `/audio-features/${trackId}`);
-      if (data && data.tempo != null) {
-        _cacheFeatures(trackId, data);
-        return data;
+    // Tier 1: Spotify's own endpoint (deprecated — 403s for most apps). Skip it
+    // entirely once it's proven dead so we don't burn quota on guaranteed 403s.
+    if (!_spotifyAudioFeaturesDead) {
+      try {
+        const data = await api('GET', `/audio-features/${trackId}`);
+        if (data && data.tempo != null) {
+          _cacheFeatures(trackId, data);
+          return data;
+        }
+      } catch (err) {
+        if (err.status === 403 || err.status === 404) _spotifyAudioFeaturesDead = true;
+        // expected for deprecated endpoint — fall through to ReccoBeats
       }
-    } catch {
-      // expected for deprecated endpoint — fall through to ReccoBeats
     }
     // Tier 2: ReccoBeats fallback
     const recco = await getReccoBeatsFeatures(trackId);
@@ -2033,14 +2084,18 @@ async function getBatchAudioFeatures(trackIds, priority = 'high') {
   if (!trackIds || !trackIds.length) return [];
   const toFetch = trackIds.filter(id => !_audioFeaturesCache.has(id));
   if (toFetch.length) {
-    // Tier 1: Spotify batch (deprecated — usually 403s)
-    try {
-      const ids = toFetch.slice(0, 100).join(',');
-      const data = await api('GET', '/audio-features', { params: { ids }, priority });
-      const features = (data && data.audio_features) ? data.audio_features : [];
-      features.forEach(f => { if (f && f.id) _cacheFeatures(f.id, f); });
-    } catch {
-      // expected — fall through to ReccoBeats
+    // Tier 1: Spotify batch (deprecated — usually 403s). Skip once proven dead
+    // so we don't burn quota, but ALWAYS keep the ReccoBeats fallback below.
+    if (!_spotifyAudioFeaturesDead) {
+      try {
+        const ids = toFetch.slice(0, 100).join(',');
+        const data = await api('GET', '/audio-features', { params: { ids }, priority });
+        const features = (data && data.audio_features) ? data.audio_features : [];
+        features.forEach(f => { if (f && f.id) _cacheFeatures(f.id, f); });
+      } catch (err) {
+        if (err.status === 403 || err.status === 404) _spotifyAudioFeaturesDead = true;
+        // expected — fall through to ReccoBeats
+      }
     }
     // Tier 2: ReccoBeats fallback for whatever's still missing.
     // Sequential + capped so one-time seeding doesn't fire a request storm.
@@ -2454,11 +2509,24 @@ async function getCuratedTracks(seedArtistNames = [], seedGenres = [], excludeId
   return out.slice(0, limit);
 }
 
+let _userProfileInflight = null;
 async function getUserProfile() {
   if (_userProfile) return _userProfile;
-  _userProfile = await api('GET', '/me');
-  _userId = _userProfile.id || null;
-  return _userProfile;
+  // Share a single in-flight /me request so a burst of callers (auth-status
+  // checks, playlist/picker handlers) can't each fire their own — that was a
+  // big contributor to the /me request storm.
+  if (_userProfileInflight) return _userProfileInflight;
+  _userProfileInflight = (async () => {
+    const profile = await api('GET', '/me');
+    _userProfile = profile;
+    _userId = profile.id || null;
+    return profile;
+  })();
+  try {
+    return await _userProfileInflight;
+  } finally {
+    _userProfileInflight = null;
+  }
 }
 
 // ---------------------------------------------------------------------------
