@@ -27,19 +27,34 @@
   --row-h:         80px;
   --grid-cols:     8;
   --t:             150ms ease;
+
+  /* Theming / canvas (driven by app.js from per-device settings) */
+  --surface-rgb:   24, 24, 40;   /* secondary colour, for panel backgrounds */
+  --surface-solid: #181828;
+  --panel-opacity: 1;
+  --bg-image:      none;
+  --canvas-scale:  1;
+  --snap:          16px;
 }
 
 html, body { height: 100%; overflow: hidden; }
 
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-  background: var(--bg);
+  background-color: var(--bg);
   color: var(--text);
   font-size: 13px;
   -webkit-font-smoothing: antialiased;
   user-select: none;
   -webkit-user-select: none;
   touch-action: manipulation;
+}
+
+body.has-bg-image {
+  background-image: var(--bg-image);
+  background-size: cover;
+  background-position: center;
+  background-attachment: fixed;
 }
 
 /* ═══ LAYOUT ═══ */
@@ -208,35 +223,33 @@ body {
   padding: var(--gap);
 }
 
-/* ── Grid ── */
+/* ── Design canvas (free-form pixel positioning) ── */
 .control-grid {
-  display: grid;
-  grid-template-columns: repeat(var(--grid-cols), minmax(0, 1fr));
-  grid-auto-rows: var(--row-h);
-  gap: var(--gap);
   position: relative;
-  min-height: calc(var(--row-h) * 6 + var(--gap) * 5);
+  width: var(--canvas-w, 1280px);
+  height: var(--canvas-h, 720px);
+  transform-origin: top left;
 }
+.control-grid > .control-card { position: absolute; }
 
-/* Grid overlay (edit mode) */
+/* Fit-to-screen: scale the whole canvas to the viewport, no scrolling */
+body.fit-screen #main-area { overflow: hidden; padding: 0; }
+body.fit-screen .control-grid { transform: scale(var(--canvas-scale, 1)); }
+
+/* Fine-snap overlay (edit mode): subtle dotted grid for alignment */
 .grid-overlay {
   position: absolute;
-  inset: var(--gap);
+  inset: 0;
   pointer-events: none;
-  display: grid;
-  grid-template-columns: repeat(var(--grid-cols), minmax(0, 1fr));
-  grid-auto-rows: var(--row-h);
-  gap: var(--gap);
   opacity: 0;
   transition: opacity var(--t);
   z-index: 1;
+  background-image:
+    radial-gradient(circle, rgba(255,255,255,0.10) 1px, transparent 1px);
+  background-size: var(--snap, 16px) var(--snap, 16px);
 }
 body.edit-mode .grid-overlay { opacity: 1; }
-.grid-cell {
-  border-radius: var(--radius);
-  border: 1px dashed rgba(255,255,255,0.06);
-  background: rgba(255,255,255,0.015);
-}
+.grid-cell { display: none; }
 
 /* Drop preview (drag target highlight) */
 .drop-preview {
@@ -278,7 +291,7 @@ body.edit-mode .grid-overlay { opacity: 1; }
 
 /* ═══ CONTROL CARDS ═══ */
 .control-card {
-  background: var(--bg-2);
+  background: rgba(var(--surface-rgb), var(--panel-opacity));
   border: 1px solid var(--border);
   border-radius: var(--radius);
   position: relative;
@@ -917,6 +930,18 @@ body.edit-mode .control-card .drag-handle { display: flex; }
 /* ═══ SETTINGS ═══ */
 .settings-section { display: flex; flex-direction: column; gap: 10px; }
 .settings-section h3 { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--text-2); border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+
+/* Appearance: background upload + fit toggle */
+.bg-upload-row { display: flex; align-items: center; gap: 10px; }
+.bg-preview {
+  width: 64px; height: 40px; flex-shrink: 0;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-3) center/cover no-repeat;
+}
+.bg-preview.has-image { border-color: var(--border-hi); }
+.settings-toggle { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; }
+.settings-toggle input { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
 .info-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
 .info-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 12px; }
 .info-row:last-child { border-bottom: none; }

@@ -56,6 +56,9 @@ const DEFAULT_LAYOUT = {
 const dataDir = path.join(__dirname, 'data');
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
 
+const backgroundsDir = path.join(dataDir, 'backgrounds');
+if (!fs.existsSync(backgroundsDir)) fs.mkdirSync(backgroundsDir, { recursive: true });
+
 let layout = loadLayout();
 
 const bridgeSockets = new Map();
@@ -63,7 +66,31 @@ const deviceRuntime = new Map();
 const socketDevices = new WeakMap();
 
 app.disable('etag');
-app.use(express.json());
+app.use(express.json({ limit: '12mb' }));
+
+// Serve uploaded background images.
+app.use('/api/background-files', express.static(backgroundsDir));
+
+// Accept a base64 data-URL image, store it under data/backgrounds, return its URL.
+app.post('/api/background', (req, res) => {
+  try {
+    const { dataUrl } = req.body || {};
+    const match = /^data:image\/([a-zA-Z0-9.+-]+);base64,(.+)$/.exec(dataUrl || '');
+    if (!match) return res.status(400).json({ error: 'Invalid image data' });
+
+    const extMap = { jpeg: 'jpg', 'svg+xml': 'svg' };
+    const ext = extMap[match[1].toLowerCase()] || match[1].toLowerCase().replace(/[^a-z0-9]/g, '') || 'png';
+    const buffer = Buffer.from(match[2], 'base64');
+    if (buffer.length > 12 * 1024 * 1024) return res.status(413).json({ error: 'Image too large' });
+
+    const filename = `bg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    fs.writeFileSync(path.join(backgroundsDir, filename), buffer);
+    res.json({ path: `/api/background-files/${filename}` });
+  } catch (err) {
+    console.error('[background] upload failed', err);
+    res.status(500).json({ error: 'Upload failed' });
+  }
+});
 app.use((req, res, next) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, s-maxage=0');
   res.setHeader('Pragma', 'no-cache');

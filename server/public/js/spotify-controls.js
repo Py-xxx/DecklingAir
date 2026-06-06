@@ -59,11 +59,34 @@ const SP_ICON = {
 // Minimal local helpers (no import from controls.js to avoid circular deps)
 // ---------------------------------------------------------------------------
 
+// Legacy grid → pixel migration constants (must match controls.js).
+const LEGACY_COL_W = 150;
+const LEGACY_ROW_H = 80;
+const LEGACY_GAP = 8;
+
 function applyGridPlacement(card, ctrl) {
-  if (ctrl.col)     card.style.gridColumnStart = ctrl.col;
-  if (ctrl.colSpan) card.style.gridColumnEnd   = `span ${ctrl.colSpan}`;
-  if (ctrl.row)     card.style.gridRowStart    = ctrl.row;
-  if (ctrl.rowSpan) card.style.gridRowEnd      = `span ${ctrl.rowSpan}`;
+  let x = ctrl.x;
+  let y = ctrl.y;
+  let w = ctrl.w;
+  let h = ctrl.h;
+
+  if (!Number.isFinite(x) || !Number.isFinite(w)) {
+    const col = Number.isFinite(ctrl.col) ? ctrl.col : 1;
+    const row = Number.isFinite(ctrl.row) ? ctrl.row : 1;
+    const colSpan = Number.isFinite(ctrl.colSpan) ? ctrl.colSpan : 1;
+    const rowSpan = Number.isFinite(ctrl.rowSpan) ? ctrl.rowSpan : 2;
+    x = (col - 1) * (LEGACY_COL_W + LEGACY_GAP);
+    y = (row - 1) * (LEGACY_ROW_H + LEGACY_GAP);
+    w = colSpan * LEGACY_COL_W + (colSpan - 1) * LEGACY_GAP;
+    h = rowSpan * LEGACY_ROW_H + (rowSpan - 1) * LEGACY_GAP;
+    ctrl.x = x; ctrl.y = y; ctrl.w = w; ctrl.h = h;
+  }
+
+  card.style.position = 'absolute';
+  card.style.left = `${x}px`;
+  card.style.top = `${y}px`;
+  card.style.width = `${w}px`;
+  card.style.height = `${h}px`;
 }
 
 function isEditMode() {

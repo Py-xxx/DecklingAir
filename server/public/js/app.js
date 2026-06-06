@@ -1,5 +1,5 @@
 import { initSocket, requestDesktopIcon, requestState, saveLayout, requestSoundboardDevices } from './socket.js';
-import { renderControl, setStateRef } from './controls.js';
+import { renderControl, setStateRef, resolveRect, defaultSizeForType, minSizeForType, SNAP } from './controls.js';
 import {
   initEditor,
   initGridEvents,
@@ -22,7 +22,11 @@ const DEFAULT_DEVICE_LAYOUT = {
   ],
   settings: {
     accentColor: '#6c63ff',
-    gridColumns: 8,
+    primaryColor: '#090910',
+    secondaryColor: '#181828',
+    panelOpacity: 1,
+    fitToScreen: false,
+    backgroundImage: null,
   },
 };
 
@@ -33,23 +37,6 @@ const DEFAULT_LAYOUT_STORE = {
   devices: {
     default: DEFAULT_DEVICE_LAYOUT,
   },
-};
-
-const DEFAULT_SIZES = {
-  fader: [1, 4],
-  toggle: [1, 1],
-  button: [2, 1],
-  macro: [2, 1],
-  desktop_action: [2, 1],
-  soundboard: [2, 1],
-  vu_meter: [1, 3],
-  strip_panel: [1, 4],
-  bus_panel: [1, 3],
-  label: [2, 1],
-  spotify_player:    [3, 2],
-  spotify_search:    [3, 3],
-  spotify_playlists: [3, 4],
-  spotify_queue:     [2, 3],
 };
 
 const state = {
@@ -119,6 +106,11 @@ initEditor(state, {
 
 initGridEvents(gridEl);
 btnSettingsEl.addEventListener('click', () => openSettings());
+
+// Keep the fit-to-screen canvas scaled to the viewport on resize.
+window.addEventListener('resize', () => {
+  if (state.layout?.settings?.fitToScreen) applyFitScale();
+});
 
 initSocket({
   getActiveDeviceId: () => state.ui.activeDeviceId,
@@ -371,26 +363,37 @@ function normalizePage(page, pageIndex, gridColumns) {
 function normalizeControl(control, controlIndex, existingControls, gridColumns) {
   const rawControl = control && typeof control === 'object' ? control : {};
   const type = rawControl.type || 'fader';
-  const [defaultColSpan, defaultRowSpan] = DEFAULT_SIZES[type] || [1, 2];
-  const colSpan = clampInt(rawControl.colSpan ?? defaultColSpan, 1, gridColumns);
-  const rowSpan = clampInt(rawControl.rowSpan ?? defaultRowSpan, 1, 12);
 
-  let col = clampInt(rawControl.col ?? 1, 1, gridColumns - colSpan + 1);
-  let row = clampInt(rawControl.row ?? 1, 1, 999);
+  // Resolve a pixel rect: prefer explicit x/y/w/h, else migrate legacy grid
+  // coords, else fall back to the type default size.
+  let rect;
+  if (Number.isFinite(rawControl.x) && Number.isFinite(rawControl.w)) {
+    rect = resolveRect(rawControl);
+  } else if (Number.isFinite(rawControl.col) || Number.isFinite(rawControl.row)) {
+    rect = resolveRect(rawControl);
+  } else {
+    rect = { x: NaN, y: NaN, ...defaultSizeForType(type) };
+  }
 
-  if (!rawControl.col || !rawControl.row || collides(existingControls, { col, row, colSpan, rowSpan })) {
-    const placement = findNextOpenSlot(existingControls, { colSpan, rowSpan }, gridColumns);
-    col = placement.col;
-    row = placement.row;
+  const min = minSizeForType(type);
+  let w = Math.max(min.w, Math.round(rect.w));
+  let h = Math.max(min.h, Math.round(rect.h));
+  let x = Number.isFinite(rect.x) ? Math.max(0, Math.round(rect.x)) : NaN;
+  let y = Number.isFinite(rect.y) ? Math.max(0, Math.round(rect.y)) : NaN;
+
+  if (!Number.isFinite(x) || !Number.isFinite(y) || collides(existingControls, { x, y, w, h })) {
+    const slot = findNextOpenSlot(existingControls, { w, h });
+    x = slot.x;
+    y = slot.y;
   }
 
   return {
     id: rawControl.id || `ctrl_${controlIndex + 1}_${Math.random().toString(36).slice(2, 7)}`,
     type,
-    col,
-    row,
-    colSpan,
-    rowSpan,
+    x,
+    y,
+    w,
+    h,
     config: { ...(rawControl.config || {}) },
   };
 }
@@ -651,9 +654,6 @@ function renderCurrentPage() {
   gridEl.innerHTML = '';
   cardRegistry.clear();
 
-  const rows = getGridRowCount(page);
-  renderGridOverlay(rows);
-
   emptyStateEl.style.display = controls.length ? 'none' : 'flex';
 
   controls.forEach(control => {
@@ -664,6 +664,8 @@ function renderCurrentPage() {
     if (state.levels.length) card._updateLevels?.(state.levels);
     if (state.spotifyState) card._updateSpotify?.(state.spotifyState);
   });
+
+  updateCanvasMetrics();
 }
 
 function renderDeviceTabs() {
@@ -811,15 +813,53 @@ function currentPageHasDesktopTarget(target) {
   );
 }
 
-function renderGridOverlay(rows) {
-  const cols = state.layout.settings.gridColumns || DEFAULT_DEVICE_LAYOUT.settings.gridColumns;
-  gridOverlayEl.innerHTML = '';
+const CANVAS_BASE_W = 1280;
+const CANVAS_BASE_H = 720;
+const CANVAS_MARGIN = 40;
 
-  for (let i = 0; i < cols * rows; i += 1) {
-    const cell = document.createElement('div');
-    cell.className = 'grid-cell';
-    gridOverlayEl.appendChild(cell);
+/**
+ * Size the design canvas to wrap its content and, when fit-to-screen is on,
+ * scale the whole canvas to fill the viewport (the "slide" model).
+ */
+function updateCanvasMetrics() {
+  const page = getCurrentPage();
+  const controls = page?.controls || [];
+
+  let maxRight = 0;
+  let maxBottom = 0;
+  controls.forEach(control => {
+    const rect = resolveRect(control);
+    maxRight = Math.max(maxRight, rect.x + rect.w);
+    maxBottom = Math.max(maxBottom, rect.y + rect.h);
+  });
+
+  const settings = state.layout.settings || {};
+  const baseW = settings.canvasWidth || CANVAS_BASE_W;
+  const baseH = settings.canvasHeight || CANVAS_BASE_H;
+  const fit = !!settings.fitToScreen;
+
+  const canvasW = fit ? Math.max(baseW, maxRight) : Math.max(baseW, maxRight + CANVAS_MARGIN);
+  const canvasH = fit ? Math.max(baseH, maxBottom) : Math.max(baseH, maxBottom + CANVAS_MARGIN);
+
+  gridEl.style.setProperty('--canvas-w', `${canvasW}px`);
+  gridEl.style.setProperty('--canvas-h', `${canvasH}px`);
+
+  document.body.classList.toggle('fit-screen', fit);
+  applyFitScale(canvasW, canvasH);
+}
+
+function applyFitScale(canvasW, canvasH) {
+  const fit = !!state.layout.settings?.fitToScreen;
+  if (!fit) {
+    gridEl.style.setProperty('--canvas-scale', '1');
+    return;
   }
+  const main = document.getElementById('main-area');
+  if (!main) return;
+  const w = canvasW || parseFloat(gridEl.style.getPropertyValue('--canvas-w')) || CANVAS_BASE_W;
+  const h = canvasH || parseFloat(gridEl.style.getPropertyValue('--canvas-h')) || CANVAS_BASE_H;
+  const scale = Math.min(main.clientWidth / w, main.clientHeight / h) || 1;
+  gridEl.style.setProperty('--canvas-scale', String(scale));
 }
 
 function refreshAllCards() {
@@ -891,70 +931,53 @@ function clampCurrentPage() {
   }
 }
 
-function getGridRowCount(page) {
-  const controls = page?.controls || [];
-  const tallest = controls.reduce((max, control) => {
-    const bottom = (control.row || 1) + (control.rowSpan || 1) - 1;
-    return Math.max(max, bottom);
-  }, 0);
+function findNextOpenSlot(existingControls, size) {
+  const stepX = Math.max(SNAP, 40);
+  const stepY = Math.max(SNAP, 40);
+  const maxW = (state.layout.settings?.canvasWidth || CANVAS_BASE_W);
 
-  return Math.max(6, tallest + 1);
-}
-
-function findNextOpenSlot(existingControls, size, gridColumns) {
-  const maxRows = 120;
-
-  for (let row = 1; row <= maxRows; row += 1) {
-    for (let col = 1; col <= gridColumns - size.colSpan + 1; col += 1) {
-      const candidate = {
-        col,
-        row,
-        colSpan: size.colSpan,
-        rowSpan: size.rowSpan,
-      };
-
+  for (let y = 0; y <= 4000; y += stepY) {
+    for (let x = 0; x + size.w <= Math.max(maxW, size.w) ; x += stepX) {
+      const candidate = { x, y, w: size.w, h: size.h };
       if (!collides(existingControls, candidate)) {
         return candidate;
       }
     }
   }
 
-  return { col: 1, row: 1, colSpan: size.colSpan, rowSpan: size.rowSpan };
+  return { x: 0, y: 0, w: size.w, h: size.h };
 }
 
 function collides(controls, candidate, ignoreId = null) {
   return controls.some(control => {
     if (ignoreId && control.id === ignoreId) return false;
-    return rectsOverlap(control, candidate);
+    return rectsOverlap(resolveRect(control), candidate);
   });
 }
 
 function rectsOverlap(a, b) {
-  const aLeft = a.col;
-  const aRight = a.col + a.colSpan - 1;
-  const aTop = a.row;
-  const aBottom = a.row + a.rowSpan - 1;
-
-  const bLeft = b.col;
-  const bRight = b.col + b.colSpan - 1;
-  const bTop = b.row;
-  const bBottom = b.row + b.rowSpan - 1;
-
-  return !(aRight < bLeft || bRight < aLeft || aBottom < bTop || bBottom < aTop);
+  return !(
+    a.x + a.w <= b.x ||
+    b.x + b.w <= a.x ||
+    a.y + a.h <= b.y ||
+    b.y + b.h <= a.y
+  );
 }
+
+const DEFAULT_PRIMARY = '#090910';
+const DEFAULT_SECONDARY = '#181828';
 
 function applySettings() {
   const settings = state.layout.settings || DEFAULT_DEVICE_LAYOUT.settings;
   const accent = settings.accentColor || DEFAULT_DEVICE_LAYOUT.settings.accentColor;
-  const cols = clampInt(settings.gridColumns, 4, 12);
 
   state.layout.settings.accentColor = accent;
-  state.layout.settings.gridColumns = cols;
 
   setAccentColor(accent);
-  document.documentElement.style.setProperty('--grid-cols', String(cols));
-  gridEl.style.setProperty('--grid-cols', String(cols));
-  gridOverlayEl.style.setProperty('--grid-cols', String(cols));
+  setPrimaryColor(settings.primaryColor || DEFAULT_PRIMARY);
+  setSecondaryColor(settings.secondaryColor || DEFAULT_SECONDARY);
+  setPanelOpacity(settings.panelOpacity);
+  setBackgroundImage(settings.backgroundImage);
 }
 
 function setAccentColor(hex) {
@@ -962,6 +985,44 @@ function setAccentColor(hex) {
   document.documentElement.style.setProperty('--accent', hex);
   document.documentElement.style.setProperty('--accent-dim', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.16)`);
   document.documentElement.style.setProperty('--accent-glow', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.4)`);
+}
+
+// Primary colour drives the page background plus two derived shades.
+function setPrimaryColor(hex) {
+  const rgb = hexToRgb(hex) || { r: 9, g: 9, b: 16 };
+  document.documentElement.style.setProperty('--bg', hex);
+  document.documentElement.style.setProperty('--bg-2', shade(rgb, 1.5));
+  document.documentElement.style.setProperty('--bg-3', shade(rgb, 2.4));
+  document.documentElement.style.setProperty('--text', isLight(rgb) ? '#15151c' : '#e8e8f0');
+}
+
+// Secondary colour drives panel/surface backgrounds.
+function setSecondaryColor(hex) {
+  const rgb = hexToRgb(hex) || { r: 24, g: 24, b: 40 };
+  document.documentElement.style.setProperty('--surface-rgb', `${rgb.r}, ${rgb.g}, ${rgb.b}`);
+  document.documentElement.style.setProperty('--surface-solid', hex);
+}
+
+function setPanelOpacity(value) {
+  const op = Number.isFinite(value) ? Math.min(1, Math.max(0.2, value)) : 1;
+  document.documentElement.style.setProperty('--panel-opacity', String(op));
+}
+
+function setBackgroundImage(path) {
+  const url = path ? `url("${path}")` : 'none';
+  document.documentElement.style.setProperty('--bg-image', url);
+  document.body.classList.toggle('has-bg-image', !!path);
+}
+
+// Lighten an rgb toward white by a small factor (>=1 lightens).
+function shade(rgb, factor) {
+  const mix = (c) => Math.round(Math.min(255, c + (255 - c) * 0.05 * factor));
+  return `rgb(${mix(rgb.r)}, ${mix(rgb.g)}, ${mix(rgb.b)})`;
+}
+
+function isLight(rgb) {
+  // Perceived luminance.
+  return (0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b) > 150;
 }
 
 function platformLabel(platform) {

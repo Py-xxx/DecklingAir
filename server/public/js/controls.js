@@ -311,11 +311,110 @@ function resizeHandle() {
   return h;
 }
 
+// Legacy grid → pixel migration constants (matches the old 8-col / 80px design).
+export const LEGACY_COL_W = 150;
+export const LEGACY_ROW_H = 80;
+export const LEGACY_GAP = 8;
+
+// Base snap step (px) for free-form positioning. Hold a modifier to bypass.
+export const SNAP = 8;
+
+// Default size (px) for a freshly added control, by type.
+export const DEFAULT_PX_SIZES = {
+  fader:             { w: 150, h: 344 },
+  toggle:            { w: 150, h: 80 },
+  button:            { w: 308, h: 80 },
+  macro:             { w: 308, h: 80 },
+  desktop_action:    { w: 308, h: 80 },
+  soundboard:        { w: 308, h: 80 },
+  vu_meter:          { w: 150, h: 256 },
+  strip_panel:       { w: 150, h: 344 },
+  bus_panel:         { w: 150, h: 256 },
+  label:             { w: 308, h: 80 },
+  spotify_player:        { w: 466, h: 168 },
+  spotify_search:        { w: 466, h: 256 },
+  spotify_playlists:     { w: 466, h: 344 },
+  spotify_queue:         { w: 308, h: 256 },
+  spotify_stats:         { w: 308, h: 344 },
+  spotify_insights:      { w: 624, h: 432 },
+  spotify_intelligence:  { w: 308, h: 256 },
+};
+
+// Minimum size (px) per type — the floor enforced while resizing.
+export const MIN_PX_SIZES = {
+  fader:             { w: 80,  h: 200 },
+  toggle:            { w: 70,  h: 56 },
+  button:            { w: 90,  h: 48 },
+  macro:             { w: 90,  h: 48 },
+  desktop_action:    { w: 90,  h: 48 },
+  soundboard:        { w: 90,  h: 48 },
+  vu_meter:          { w: 56,  h: 140 },
+  strip_panel:       { w: 110, h: 240 },
+  bus_panel:         { w: 110, h: 180 },
+  label:             { w: 80,  h: 40 },
+  spotify_player:        { w: 280, h: 120 },
+  spotify_search:        { w: 260, h: 180 },
+  spotify_playlists:     { w: 260, h: 200 },
+  spotify_queue:         { w: 220, h: 160 },
+  spotify_stats:         { w: 220, h: 200 },
+  spotify_insights:      { w: 320, h: 280 },
+  spotify_intelligence:  { w: 220, h: 180 },
+};
+
+const DEFAULT_FALLBACK_SIZE = { w: 150, h: 160 };
+const MIN_FALLBACK_SIZE = { w: 64, h: 40 };
+
+export function defaultSizeForType(type) {
+  return { ...(DEFAULT_PX_SIZES[type] || DEFAULT_FALLBACK_SIZE) };
+}
+
+export function minSizeForType(type) {
+  return { ...(MIN_PX_SIZES[type] || MIN_FALLBACK_SIZE) };
+}
+
+/**
+ * Resolve a control's pixel rect {x,y,w,h}. New controls store x/y/w/h directly;
+ * legacy controls (col/row/colSpan/rowSpan) are converted on the fly. The result
+ * is also written back onto the control so the migration only happens once.
+ */
+export function resolveRect(ctrl) {
+  if (Number.isFinite(ctrl.x) && Number.isFinite(ctrl.w)) {
+    return {
+      x: ctrl.x,
+      y: Number.isFinite(ctrl.y) ? ctrl.y : 0,
+      w: ctrl.w,
+      h: Number.isFinite(ctrl.h) ? ctrl.h : LEGACY_ROW_H,
+    };
+  }
+
+  const col = Number.isFinite(ctrl.col) ? ctrl.col : 1;
+  const row = Number.isFinite(ctrl.row) ? ctrl.row : 1;
+  const colSpan = Number.isFinite(ctrl.colSpan) ? ctrl.colSpan : 1;
+  const rowSpan = Number.isFinite(ctrl.rowSpan) ? ctrl.rowSpan : 2;
+
+  const rect = {
+    x: (col - 1) * (LEGACY_COL_W + LEGACY_GAP),
+    y: (row - 1) * (LEGACY_ROW_H + LEGACY_GAP),
+    w: colSpan * LEGACY_COL_W + (colSpan - 1) * LEGACY_GAP,
+    h: rowSpan * LEGACY_ROW_H + (rowSpan - 1) * LEGACY_GAP,
+  };
+
+  // Persist migrated coords back onto the control so we don't recompute.
+  ctrl.x = rect.x;
+  ctrl.y = rect.y;
+  ctrl.w = rect.w;
+  ctrl.h = rect.h;
+
+  return rect;
+}
+
 function applyGridPlacement(card, ctrl) {
-  if (ctrl.col)     card.style.gridColumnStart = ctrl.col;
-  if (ctrl.colSpan) card.style.gridColumnEnd   = `span ${ctrl.colSpan}`;
-  if (ctrl.row)     card.style.gridRowStart    = ctrl.row;
-  if (ctrl.rowSpan) card.style.gridRowEnd      = `span ${ctrl.rowSpan}`;
+  const rect = resolveRect(ctrl);
+  card.style.position = 'absolute';
+  card.style.left = `${rect.x}px`;
+  card.style.top = `${rect.y}px`;
+  card.style.width = `${rect.w}px`;
+  card.style.height = `${rect.h}px`;
 }
 
 // ── Fader control ─────────────────────────────────────────────────────────────

@@ -1,26 +1,28 @@
-import { VM_STRIPS, VM_BUSES, buildParamOptions } from './controls.js';
+import {
+  VM_STRIPS,
+  VM_BUSES,
+  buildParamOptions,
+  resolveRect,
+  minSizeForType,
+  SNAP,
+  LEGACY_COL_W,
+  LEGACY_ROW_H,
+  LEGACY_GAP,
+} from './controls.js';
 import { vmMacro, requestSoundboardDevices, socket } from './socket.js';
 import { saveSpotifyConfig, disconnectSpotify } from './spotify-client.js';
 
-const DEFAULT_SIZES = {
-  fader: [1, 4],
-  toggle: [1, 1],
-  button: [2, 1],
-  macro: [2, 1],
-  desktop_action: [2, 1],
-  soundboard: [2, 1],
-  vu_meter: [1, 3],
-  strip_panel: [1, 4],
-  bus_panel: [1, 3],
-  label: [2, 1],
-  spotify_player:    [3, 2],
-  spotify_search:    [3, 3],
-  spotify_playlists: [3, 4],
-  spotify_queue:     [2, 3],
-  spotify_stats:        [2, 4],
-  spotify_insights:     [4, 5],
-  spotify_intelligence: [2, 3],
-};
+// Convert the size-picker's colSpan/rowSpan choice into a pixel size,
+// clamped up to the type's minimum footprint.
+function pickerToPixelSize(type) {
+  const colSpan = Math.max(1, _selectedSize.colSpan || 1);
+  const rowSpan = Math.max(1, _selectedSize.rowSpan || 1);
+  const min = minSizeForType(type);
+  return {
+    w: Math.max(min.w, colSpan * LEGACY_COL_W + (colSpan - 1) * LEGACY_GAP),
+    h: Math.max(min.h, rowSpan * LEGACY_ROW_H + (rowSpan - 1) * LEGACY_GAP),
+  };
+}
 
 const VM_ONLY_TYPES = new Set([
   'fader',
@@ -40,6 +42,9 @@ let _selectedSize = { colSpan: 1, rowSpan: 2 };
 let _pageEditIndex = null;
 let _gridGesture = null;
 let _importParsed = null;
+// Pending background change while the settings modal is open:
+//   undefined = unchanged, null = cleared, string = new uploaded path.
+let _pendingBg = undefined;
 
 const previewEl = document.getElementById('drop-preview');
 const mainAreaEl = document.getElementById('main-area');
@@ -176,6 +181,14 @@ export function initEditor(state, callbacks) {
   document.getElementById('settings-close').addEventListener('click', closeSettings);
   document.getElementById('settings-cancel').addEventListener('click', closeSettings);
   document.getElementById('settings-apply').addEventListener('click', applySettings);
+
+  const bgInput = document.getElementById('s-bg-image');
+  if (bgInput) bgInput.addEventListener('change', handleBackgroundUpload);
+  const bgClear = document.getElementById('s-bg-clear');
+  if (bgClear) bgClear.addEventListener('click', () => {
+    _pendingBg = null;
+    updateBgPreview(null);
+  });
   document.getElementById('settings-modal').addEventListener('click', event => {
     if (event.target === document.getElementById('settings-modal')) closeSettings();
   });
@@ -288,7 +301,13 @@ export function openSettings() {
   const restartButton = document.getElementById('s-vm-restart');
 
   document.getElementById('s-accent-color').value = settings.accentColor || '#6c63ff';
-  document.getElementById('s-grid-cols').value = String(settings.gridColumns || 8);
+  setIfPresent('s-primary-color', settings.primaryColor || '#090910');
+  setIfPresent('s-secondary-color', settings.secondaryColor || '#181828');
+  setIfPresent('s-panel-opacity', String(Number.isFinite(settings.panelOpacity) ? settings.panelOpacity : 1));
+  const fitEl = document.getElementById('s-fit-screen');
+  if (fitEl) fitEl.checked = !!settings.fitToScreen;
+  updateBgPreview(settings.backgroundImage || null);
+  _pendingBg = undefined;
   restartButton.disabled = !hasVoiceMeeter;
   restartButton.textContent = hasVoiceMeeter ? 'Restart Audio Engine' : 'No Mixer Available';
 
@@ -370,9 +389,24 @@ function resetModal() {
   updateSizePicker();
 }
 
+// Sensible starting footprint (in picker cells) for the size picker per type.
+const PICKER_DEFAULT_CELLS = {
+  fader: [1, 4], toggle: [1, 1], button: [2, 1], macro: [2, 1],
+  desktop_action: [2, 1], soundboard: [2, 1], vu_meter: [1, 3],
+  strip_panel: [1, 4], bus_panel: [1, 3], label: [2, 1],
+  spotify_player: [3, 2], spotify_search: [3, 3], spotify_playlists: [3, 4],
+  spotify_queue: [2, 3], spotify_stats: [2, 4], spotify_insights: [4, 5],
+  spotify_intelligence: [2, 3],
+};
+
+function pickerCellsForType(type) {
+  const [colSpan, rowSpan] = PICKER_DEFAULT_CELLS[type] || [2, 2];
+  return { colSpan, rowSpan };
+}
+
 function selectType(type) {
   _selectedType = type;
-  _selectedSize = sizeForType(type);
+  _selectedSize = pickerCellsForType(type);
   highlightSelectedType(type);
   updateSizePicker();
   showConfigStep(false);
@@ -532,41 +566,24 @@ function saveControl() {
   const page = currentPage();
   if (!page) return;
 
-  const size = {
-    colSpan: _selectedSize.colSpan,
-    rowSpan: _selectedSize.rowSpan,
-  };
+  const size = pickerToPixelSize(type);
 
   if (_editingId) {
     const control = findControl(_editingId);
     if (!control) return;
 
-    const resolved = resolvePlacement(
-      page.controls,
-      {
-        col: control.col,
-        row: control.row,
-        colSpan: size.colSpan,
-        rowSpan: size.rowSpan,
-      },
-      control.id,
-      currentGridColumns(),
-    );
-
-    control.col = resolved.col;
-    control.row = resolved.row;
-    control.colSpan = resolved.colSpan;
-    control.rowSpan = resolved.rowSpan;
+    // Keep the existing position; only the config changes on edit. Size is
+    // adjusted freely via the resize handle, not the picker, so leave w/h.
     control.config = config;
   } else {
-    const placement = findNextOpenSlot(page.controls, size, currentGridColumns());
+    const slot = findNextOpenSlot(page.controls, size);
     page.controls.push({
       id: genId(),
       type,
-      col: placement.col,
-      row: placement.row,
-      colSpan: size.colSpan,
-      rowSpan: size.rowSpan,
+      x: slot.x,
+      y: slot.y,
+      w: size.w,
+      h: size.h,
       config,
     });
   }
@@ -1192,28 +1209,94 @@ function devicePlatformLabel(platform) {
 
 function applySettings() {
   const accentColor = document.getElementById('s-accent-color').value;
-  const gridColumns = clampInt(document.getElementById('s-grid-cols').value, 4, 12);
+  const primaryColor = document.getElementById('s-primary-color')?.value || '#090910';
+  const secondaryColor = document.getElementById('s-secondary-color')?.value || '#181828';
+  const panelOpacity = clampFloat(document.getElementById('s-panel-opacity')?.value, 0.2, 1, 1);
+  const fitToScreen = !!document.getElementById('s-fit-screen')?.checked;
   const soundboardDevice = document.getElementById('s-soundboard-device')?.value || null;
 
   // Save global soundboard device preference
   if (!_state.layoutStore.globalSettings) _state.layoutStore.globalSettings = {};
   _state.layoutStore.globalSettings.soundboardDevice = soundboardDevice || null;
 
-  _state.layout.settings = {
+  const next = {
     ...(_state.layout.settings || {}),
     accentColor,
-    gridColumns,
+    primaryColor,
+    secondaryColor,
+    panelOpacity,
+    fitToScreen,
   };
-
-  _state.layout.pages.forEach(page => {
-    page.controls.forEach(control => {
-      control.colSpan = Math.min(control.colSpan || 1, gridColumns);
-      control.col = Math.min(control.col || 1, gridColumns - control.colSpan + 1);
-    });
-  });
+  if (_pendingBg !== undefined) {
+    next.backgroundImage = _pendingBg;
+    _pendingBg = undefined;
+  }
+  _state.layout.settings = next;
 
   closeSettings();
   _callbacks.commitLayout?.();
+}
+
+function clampFloat(value, min, max, fallback) {
+  const n = Number.parseFloat(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function setIfPresent(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.value = value;
+}
+
+function updateBgPreview(path) {
+  const preview = document.getElementById('s-bg-preview');
+  const clearBtn = document.getElementById('s-bg-clear');
+  if (preview) {
+    preview.style.backgroundImage = path ? `url("${path}")` : 'none';
+    preview.classList.toggle('has-image', !!path);
+  }
+  if (clearBtn) clearBtn.style.display = path ? '' : 'none';
+}
+
+async function handleBackgroundUpload(event) {
+  const file = event.target.files?.[0];
+  event.target.value = '';
+  if (!file) return;
+
+  if (!file.type.startsWith('image/')) {
+    window.alert('Please choose an image file.');
+    return;
+  }
+  if (file.size > 8 * 1024 * 1024) {
+    window.alert('Background image must be under 8 MB.');
+    return;
+  }
+
+  try {
+    const dataUrl = await readFileAsDataUrl(file);
+    const res = await fetch('/api/background', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dataUrl, name: file.name }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (!data?.path) throw new Error('No path returned');
+    _pendingBg = data.path;
+    updateBgPreview(data.path);
+  } catch (err) {
+    console.error('[editor] background upload failed', err);
+    window.alert('Background upload failed. Please try again.');
+  }
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
 }
 
 function renderPagesList() {
@@ -1462,7 +1545,7 @@ function detectImportFormat(data) {
 function buildSizePicker() {
   const picker = document.getElementById('size-picker');
   picker.innerHTML = '';
-  const cols = Math.min(currentGridColumns(), 6);
+  const cols = 6;
   const rows = 4;
   picker.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
 
@@ -1487,7 +1570,7 @@ function buildSizePicker() {
 }
 
 function updateSizePicker() {
-  const cols = Math.min(currentGridColumns(), 6);
+  const cols = 6;
   const picker = document.getElementById('size-picker');
   picker.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
   paintSizePicker(_selectedSize.colSpan, _selectedSize.rowSpan, true);
@@ -1546,29 +1629,31 @@ function populateParamDropdown(id, options) {
   });
 }
 
+const ALIGN_THRESHOLD = 6; // px tolerance for snapping to another panel's edges
+
+function canvasScale(gridEl) {
+  const v = parseFloat(getComputedStyle(gridEl).getPropertyValue('--canvas-scale'));
+  return Number.isFinite(v) && v > 0 ? v : 1;
+}
+
 function startGridGesture({ mode, event, gridEl, card }) {
   const control = findControl(card.dataset.id);
   if (!control) return;
 
-  const metrics = getGridMetrics(gridEl);
-  const original = {
-    col: control.col,
-    row: control.row,
-    colSpan: control.colSpan,
-    rowSpan: control.rowSpan,
-  };
+  const original = resolveRect(control);
 
   _gridGesture = {
     mode,
     gridEl,
     card,
     controlId: control.id,
+    type: control.type,
     pointerId: event.pointerId,
     startX: event.clientX,
     startY: event.clientY,
+    scale: canvasScale(gridEl),
     original,
-    lastValid: original,
-    metrics,
+    lastValid: { ...original },
   };
 
   card.classList.add('is-dragging');
@@ -1579,42 +1664,78 @@ function startGridGesture({ mode, event, gridEl, card }) {
   event.preventDefault();
 }
 
+function snap(value, disabled) {
+  return disabled ? Math.round(value) : Math.round(value / SNAP) * SNAP;
+}
+
 function onGridGestureMove(event) {
   if (!_gridGesture) return;
 
-  const { mode, controlId, original, metrics } = _gridGesture;
+  const { mode, controlId, type, original, scale } = _gridGesture;
   const page = currentPage();
   if (!page) return;
 
-  const deltaCols = Math.round((event.clientX - _gridGesture.startX) / metrics.stepX);
-  const deltaRows = Math.round((event.clientY - _gridGesture.startY) / metrics.stepY);
+  const noSnap = event.altKey;
+  const dx = (event.clientX - _gridGesture.startX) / scale;
+  const dy = (event.clientY - _gridGesture.startY) / scale;
 
+  const others = page.controls.filter(c => c.id !== controlId).map(resolveRect);
+
+  let candidate;
   if (mode === 'move') {
-    const candidate = clampPlacement({
-      col: original.col + deltaCols,
-      row: original.row + deltaRows,
-      colSpan: original.colSpan,
-      rowSpan: original.rowSpan,
-    }, metrics.cols);
-
-    const resolved = resolvePlacement(page.controls, candidate, controlId, metrics.cols);
-    _gridGesture.lastValid = resolved;
-    showDropPreview(resolved, false);
-    return;
+    candidate = {
+      x: Math.max(0, snap(original.x + dx, noSnap)),
+      y: Math.max(0, snap(original.y + dy, noSnap)),
+      w: original.w,
+      h: original.h,
+    };
+    if (!noSnap) applyAlignSnap(candidate, others);
+  } else {
+    const min = minSizeForType(type);
+    candidate = {
+      x: original.x,
+      y: original.y,
+      w: Math.max(min.w, snap(original.w + dx, noSnap)),
+      h: Math.max(min.h, snap(original.h + dy, noSnap)),
+    };
   }
-
-  const candidate = clampPlacement({
-    col: original.col,
-    row: original.row,
-    colSpan: original.colSpan + deltaCols,
-    rowSpan: original.rowSpan + deltaRows,
-  }, metrics.cols);
 
   const blocked = collides(page.controls, candidate, controlId);
-  if (!blocked) {
-    _gridGesture.lastValid = candidate;
-  }
+  if (!blocked) _gridGesture.lastValid = candidate;
   showDropPreview(blocked ? candidate : _gridGesture.lastValid, blocked);
+}
+
+// Nudge a moving rect so its edges/centres line up with nearby panels.
+function applyAlignSnap(rect, others) {
+  const xCandidates = [rect.x, rect.x + rect.w / 2, rect.x + rect.w];
+  const yCandidates = [rect.y, rect.y + rect.h / 2, rect.y + rect.h];
+
+  let bestX = null;
+  let bestY = null;
+
+  others.forEach(o => {
+    const oxs = [o.x, o.x + o.w / 2, o.x + o.w];
+    const oys = [o.y, o.y + o.h / 2, o.y + o.h];
+    xCandidates.forEach((cx, i) => {
+      oxs.forEach(ox => {
+        const d = Math.abs(cx - ox);
+        if (d <= ALIGN_THRESHOLD && (!bestX || d < bestX.d)) {
+          bestX = { d, delta: ox - cx };
+        }
+      });
+    });
+    yCandidates.forEach((cy) => {
+      oys.forEach(oy => {
+        const d = Math.abs(cy - oy);
+        if (d <= ALIGN_THRESHOLD && (!bestY || d < bestY.d)) {
+          bestY = { d, delta: oy - cy };
+        }
+      });
+    });
+  });
+
+  if (bestX) rect.x = Math.max(0, rect.x + bestX.delta);
+  if (bestY) rect.y = Math.max(0, rect.y + bestY.delta);
 }
 
 function endGridGesture() {
@@ -1624,11 +1745,11 @@ function endGridGesture() {
   card.classList.remove('is-dragging');
 
   const control = findControl(controlId);
-  if (control && hasPlacementChanged(original, lastValid)) {
-    control.col = lastValid.col;
-    control.row = lastValid.row;
-    control.colSpan = lastValid.colSpan;
-    control.rowSpan = lastValid.rowSpan;
+  if (control && hasRectChanged(original, lastValid)) {
+    control.x = lastValid.x;
+    control.y = lastValid.y;
+    control.w = lastValid.w;
+    control.h = lastValid.h;
     _callbacks.commitLayout?.();
   } else {
     _callbacks.commitLayout?.({ persist: false, rerender: true });
@@ -1641,51 +1762,21 @@ function endGridGesture() {
   _gridGesture = null;
 }
 
-function showDropPreview(placement, invalid) {
-  const metrics = getGridMetrics(_gridGesture?.gridEl || document.getElementById('control-grid'));
-  const rect = placementToPixels(metrics, placement);
+function showDropPreview(rect, invalid) {
+  const gridEl = _gridGesture?.gridEl || document.getElementById('control-grid');
+  if (previewEl.parentElement !== gridEl) gridEl.appendChild(previewEl);
 
   previewEl.style.display = 'block';
-  previewEl.style.left = `${rect.left}px`;
-  previewEl.style.top = `${rect.top}px`;
-  previewEl.style.width = `${rect.width}px`;
-  previewEl.style.height = `${rect.height}px`;
+  previewEl.style.left = `${rect.x}px`;
+  previewEl.style.top = `${rect.y}px`;
+  previewEl.style.width = `${rect.w}px`;
+  previewEl.style.height = `${rect.h}px`;
   previewEl.classList.toggle('invalid', !!invalid);
 }
 
 function hideDropPreview() {
   previewEl.style.display = 'none';
   previewEl.classList.remove('invalid');
-}
-
-function placementToPixels(metrics, placement) {
-  return {
-    left: metrics.gridOffsetLeft + (placement.col - 1) * metrics.stepX,
-    top: metrics.gridOffsetTop + (placement.row - 1) * metrics.stepY,
-    width: metrics.cellWidth * placement.colSpan + metrics.gap * (placement.colSpan - 1),
-    height: metrics.rowHeight * placement.rowSpan + metrics.gap * (placement.rowSpan - 1),
-  };
-}
-
-function getGridMetrics(gridEl) {
-  const gridRect = gridEl.getBoundingClientRect();
-  const mainRect = mainAreaEl.getBoundingClientRect();
-  const styles = window.getComputedStyle(gridEl);
-  const cols = currentGridColumns();
-  const gap = Number.parseFloat(styles.columnGap || styles.gap || '8') || 8;
-  const rowHeight = Number.parseFloat(styles.gridAutoRows || '80') || 80;
-  const cellWidth = (gridRect.width - gap * (cols - 1)) / cols;
-
-  return {
-    cols,
-    gap,
-    rowHeight,
-    cellWidth,
-    stepX: cellWidth + gap,
-    stepY: rowHeight + gap,
-    gridOffsetLeft: gridRect.left - mainRect.left + mainAreaEl.scrollLeft,
-    gridOffsetTop: gridRect.top - mainRect.top + mainAreaEl.scrollTop,
-  };
 }
 
 function deleteControl(id) {
@@ -1699,10 +1790,6 @@ function currentPage() {
   return _state.layout?.pages?.[_state.ui.currentPage] || null;
 }
 
-function currentGridColumns() {
-  return clampInt(_state.layout?.settings?.gridColumns ?? 8, 4, 12);
-}
-
 function findControl(id) {
   for (const page of _state.layout.pages || []) {
     const control = page.controls.find(item => item.id === id);
@@ -1711,88 +1798,36 @@ function findControl(id) {
   return null;
 }
 
-function sizeForType(type) {
-  const [colSpan, rowSpan] = DEFAULT_SIZES[type] || [1, 2];
-  return { colSpan, rowSpan };
-}
-
-function clampPlacement(placement, cols) {
-  const colSpan = clampInt(placement.colSpan, 1, cols);
-  return {
-    col: clampInt(placement.col, 1, cols - colSpan + 1),
-    row: Math.max(1, clampInt(placement.row, 1, 999)),
-    colSpan,
-    rowSpan: Math.max(1, clampInt(placement.rowSpan, 1, 20)),
-  };
-}
-
-function resolvePlacement(controls, candidate, ignoreId, cols) {
-  const clamped = clampPlacement(candidate, cols);
-  if (!collides(controls, clamped, ignoreId)) return clamped;
-
-  let best = null;
-  let bestScore = Number.POSITIVE_INFINITY;
-
-  for (let row = 1; row <= 120; row += 1) {
-    for (let col = 1; col <= cols - clamped.colSpan + 1; col += 1) {
-      const next = {
-        col,
-        row,
-        colSpan: clamped.colSpan,
-        rowSpan: clamped.rowSpan,
-      };
-      if (collides(controls, next, ignoreId)) continue;
-
-      const score = Math.abs(next.row - clamped.row) * 10 + Math.abs(next.col - clamped.col);
-      if (score < bestScore) {
-        best = next;
-        bestScore = score;
-      }
-    }
-  }
-
-  return best || clamped;
-}
-
-function findNextOpenSlot(controls, size, cols) {
-  for (let row = 1; row <= 120; row += 1) {
-    for (let col = 1; col <= cols - size.colSpan + 1; col += 1) {
-      const candidate = {
-        col,
-        row,
-        colSpan: size.colSpan,
-        rowSpan: size.rowSpan,
-      };
+function findNextOpenSlot(controls, size) {
+  const step = Math.max(SNAP, 24);
+  const maxW = _state.layout?.settings?.canvasWidth || 1280;
+  for (let y = 0; y <= 4000; y += step) {
+    for (let x = 0; x + size.w <= Math.max(maxW, size.w); x += step) {
+      const candidate = { x, y, w: size.w, h: size.h };
       if (!collides(controls, candidate)) return candidate;
     }
   }
-
-  return {
-    col: 1,
-    row: 1,
-    colSpan: size.colSpan,
-    rowSpan: size.rowSpan,
-  };
+  return { x: 0, y: 0, w: size.w, h: size.h };
 }
 
 function collides(controls, candidate, ignoreId = null) {
   return controls.some(control => {
     if (ignoreId && control.id === ignoreId) return false;
-    return rectsOverlap(control, candidate);
+    return rectsOverlap(resolveRect(control), candidate);
   });
 }
 
 function rectsOverlap(a, b) {
-  const aRight = a.col + a.colSpan - 1;
-  const aBottom = a.row + a.rowSpan - 1;
-  const bRight = b.col + b.colSpan - 1;
-  const bBottom = b.row + b.rowSpan - 1;
-
-  return !(aRight < b.col || bRight < a.col || aBottom < b.row || bBottom < a.row);
+  return !(
+    a.x + a.w <= b.x ||
+    b.x + b.w <= a.x ||
+    a.y + a.h <= b.y ||
+    b.y + b.h <= a.y
+  );
 }
 
-function hasPlacementChanged(a, b) {
-  return a.col !== b.col || a.row !== b.row || a.colSpan !== b.colSpan || a.rowSpan !== b.rowSpan;
+function hasRectChanged(a, b) {
+  return a.x !== b.x || a.y !== b.y || a.w !== b.w || a.h !== b.h;
 }
 
 function setSelectValue(id, value) {

@@ -473,15 +473,47 @@
           <h3>Appearance</h3>
           <div class="form-row">
             <div class="form-group">
-              <label class="form-label">Accent Color</label>
-              <input type="color" id="s-accent-color" class="form-color" value="#6c63ff">
+              <label class="form-label">Primary Color</label>
+              <input type="color" id="s-primary-color" class="form-color" value="#090910">
+              <span class="form-hint">Page background</span>
             </div>
             <div class="form-group">
-              <label class="form-label">Grid Columns</label>
-              <select id="s-grid-cols" class="form-select">
-                <option value="4">4</option><option value="6">6</option>
-                <option value="8" selected>8</option><option value="10">10</option><option value="12">12</option>
-              </select>
+              <label class="form-label">Secondary Color</label>
+              <input type="color" id="s-secondary-color" class="form-color" value="#181828">
+              <span class="form-hint">Panels</span>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Accent Color</label>
+              <input type="color" id="s-accent-color" class="form-color" value="#6c63ff">
+              <span class="form-hint">Highlights</span>
+            </div>
+          </div>
+          <div class="form-row" style="margin-top:10px">
+            <div class="form-group fg-grow">
+              <label class="form-label">Panel Transparency</label>
+              <input type="range" id="s-panel-opacity" class="form-range" min="0.2" max="1" step="0.05" value="1">
+              <span class="form-hint">Lower = see more of the background through panels.</span>
+            </div>
+          </div>
+          <div class="form-row" style="margin-top:10px">
+            <div class="form-group fg-grow">
+              <label class="form-label">Background Image</label>
+              <div class="bg-upload-row">
+                <div id="s-bg-preview" class="bg-preview"></div>
+                <label class="btn-secondary btn-sm" for="s-bg-image">Upload…</label>
+                <input type="file" id="s-bg-image" accept="image/*" style="display:none">
+                <button type="button" class="btn-secondary btn-sm" id="s-bg-clear" style="display:none">Remove</button>
+              </div>
+              <span class="form-hint">A custom image shown behind your panels.</span>
+            </div>
+          </div>
+          <div class="form-row" style="margin-top:10px">
+            <div class="form-group fg-grow">
+              <label class="settings-toggle">
+                <input type="checkbox" id="s-fit-screen">
+                <span>Fit to screen (no scrolling)</span>
+              </label>
+              <span class="form-hint">Scales the whole layout to fill the screen so it never scrolls.</span>
             </div>
           </div>
         </section>
