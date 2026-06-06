@@ -2771,6 +2771,39 @@
   opacity: 1;
 }
 
+/* ── Now Playing: fit on small grids (e.g. 3×2) without clipping ─────────── */
+/* Never let the stacked sections bleed through the panel — the wrap clips and
+   the compact tiers below shed/shrink content so everything fits the footprint. */
+.sp-intel-wrap { overflow: hidden; min-height: 0; }
+.sp-intel-active { min-height: 0; }
+
+/* COMPACT (short card): tighten spacing, drop the listening-pattern bar + its
+   divider, and slim the active/prediction rows. */
+.sp-intel-compact .sp-intel-wrap { gap: 6px; padding: 8px 10px; }
+.sp-intel-compact .sp-intel-cluster,
+.sp-intel-compact .sp-intel-cluster + .sp-intel-divider { display: none; }
+.sp-intel-compact .sp-intel-feeling-row,
+.sp-intel-compact .sp-intel-vibe-row { padding: 5px 8px; }
+.sp-intel-compact .sp-intel-feeling-emoji { font-size: 17px; }
+.sp-intel-compact .sp-intel-predict { padding: 5px 8px; gap: 7px; margin-top: 3px; }
+.sp-intel-compact .sp-intel-predict-emoji { font-size: 17px; }
+.sp-intel-compact .sp-intel-predict-play { width: 27px; height: 27px; }
+.sp-intel-compact .sp-intel-checkin-btn { padding: 6px 10px; }
+.sp-intel-compact .sp-intel-reset-btn { width: 30px; }
+
+/* TINY (very short card): shed secondary lines so the essentials always fit. */
+.sp-intel-tiny .sp-intel-context-hint,
+.sp-intel-tiny .sp-intel-predict-sub,
+.sp-intel-tiny .sp-intel-feeling-sub,
+.sp-intel-tiny .sp-intel-vibe-sub { display: none; }
+.sp-intel-tiny .sp-intel-wrap { gap: 5px; }
+.sp-intel-tiny .sp-intel-context-label { margin-bottom: 1px; }
+.sp-intel-tiny .sp-intel-checkin-btn { padding: 5px 8px; font-size: 11px; }
+
+/* NARROW (thin card): hide the "Auto" toggle text, keep the switch. */
+.sp-intel-narrow .sp-intel-auto-label { display: none; }
+.sp-intel-narrow .sp-intel-wrap { padding-left: 8px; padding-right: 8px; }
+
 /* ── Queue "Auto" pill (auto-managed indicator) ─────────────────────────── */
 .sp-queue-auto-pill {
   display: inline-flex;

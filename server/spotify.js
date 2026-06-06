@@ -2852,6 +2852,119 @@ function moodForFeeling(feelingKey) {
 }
 
 // ---------------------------------------------------------------------------
+// Vibe gating
+//
+// Discovery candidates (curated playlists, genre search, artist deep cuts) are
+// sourced by ARTIST or GENRE, never by audio profile — so a melancholy session
+// seeded by a versatile artist could pull in that artist's upbeat hip-hop. These
+// gates keep the discovery stream inside the chosen mood/vibe's actual sound.
+//
+// The Variety slider sets the TOLERANCE, not a quota. "Stay on taste" passes only
+// tracks squarely inside the feeling's energy/valence window; sliding toward
+// "Adventurous" widens that window so songs may stray a little further and still
+// qualify. It never forces a percentage of off-vibe songs into the queue — it only
+// relaxes how far a track may drift before it's rejected as contradictory.
+// ---------------------------------------------------------------------------
+
+// Energy/valence acceptance window for a feeling, widened by the Variety tolerance.
+function _feelingBand(def) {
+  const pad = _tBandPad(); // 0 → 25, scaled off the Variety slider
+  return {
+    eMin: def.energy[0]  - pad, eMax: def.energy[1]  + pad,
+    vMin: def.valence[0] - pad, vMax: def.valence[1] + pad,
+  };
+}
+
+// Resolve a track's audio features from the candidate itself or any cache.
+function _trackFeatures(track) {
+  if (track && track.energy != null) return track;
+  return (track && track.id) ? _findStoredFeatures(track.id) : null;
+}
+
+// Verdict against a feeling band:
+//   true  — features known and inside the band  (on-vibe, keep)
+//   false — features known and outside the band  (off-vibe, reject)
+//   null  — features unknown                      (can't judge yet)
+function _bandVerdict(track, band) {
+  const f = _trackFeatures(track);
+  if (!f || f.energy == null || f.valence == null) return null;
+  return f.energy  >= band.eMin && f.energy  <= band.eMax &&
+         f.valence >= band.vMin && f.valence <= band.vMax;
+}
+
+// Verdict against a vibe cluster: inside a tolerance radius of its centroid.
+function _centroidVerdict(track, centroid, maxDist) {
+  const f = _trackFeatures(track);
+  if (!f || f.energy == null || f.valence == null) return null;
+  return _clusterDist(centroid, f) <= maxDist;
+}
+
+// Tolerance radius for a vibe cluster: the cluster's own spread (85th-percentile
+// distance to the centroid) plus a Variety-scaled allowance.
+function _vibeRadius(tracks, centroid) {
+  const dists = (tracks || [])
+    .map(t => _trackFeatures(t)).filter(Boolean)
+    .map(f => _clusterDist(centroid, f)).sort((a, b) => a - b);
+  const spread = dists.length ? dists[Math.floor(dists.length * 0.85)] : 0.18;
+  return spread + _lerp(0.04, 0.30, _tVariety());
+}
+
+// Build the verdict fn for one vibe key (or null if the vibe has no data yet).
+function _vibeGateFor(vibeKey) {
+  const vibes = computeVibes();
+  if (!vibes.ready) return null;
+  const cluster = vibes.clusters.find(c => c.key === vibeKey);
+  if (!cluster || !cluster.tracks || !cluster.tracks.length) return null;
+  const centroid = _computeCentroid(cluster.tracks);
+  if (!centroid) return null;
+  const radius = _vibeRadius(cluster.tracks, centroid);
+  return (t) => _centroidVerdict(t, centroid, radius);
+}
+
+// The verdict fn for whatever continuous target is running right now, or null when
+// nothing is active. Used as the refill's final safety net.
+function _activeVibeVerdict() {
+  let feelingKey = null;
+  if (_activeFeeling) feelingKey = _activeFeeling.key;
+  else if (_activeMoodKey) { const m = MOOD_STATES.find(x => x.key === _activeMoodKey); feelingKey = m && m.feeling; }
+  if (feelingKey && FEELING_DEFS[feelingKey]) {
+    const band = _feelingBand(FEELING_DEFS[feelingKey]);
+    return (t) => _bandVerdict(t, band);
+  }
+  if (_activeVibeKey) return _vibeGateFor(_activeVibeKey);
+  return null;
+}
+
+// Warm features (bounded) for candidates we can't yet judge, then split into
+// on-vibe and unknown buckets — dropping anything known to be off-vibe. On-vibe
+// tracks come first; unknowns (genuinely new, unjudgeable) only fill the remainder
+// so a thin pool never starves the queue, while proven-contradictory tracks are
+// gone for good.
+async function _gateDiscovery(tracks, verdict, limit) {
+  const list = (tracks || []).filter(t => t && t.id);
+  if (!list.length || !verdict) return list.slice(0, limit);
+
+  const toWarm = [];
+  for (const t of list) {
+    if (t.energy != null) continue;
+    if (_findStoredFeatures(t.id)) continue;
+    toWarm.push(t.id);
+  }
+  if (toWarm.length) { try { await getBatchAudioFeatures(toWarm.slice(0, 24)); } catch { /* warm best-effort */ } }
+
+  const onVibe = [], unknown = [];
+  for (const t of list) {
+    const v = verdict(t);
+    if (v === true) onVibe.push(t);
+    else if (v === null) unknown.push(t);
+    // v === false → known off-vibe, dropped
+  }
+  const out = onVibe.slice(0, limit);
+  for (const t of unknown) { if (out.length >= limit) break; out.push(t); }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Playlist builders
 // ---------------------------------------------------------------------------
 
@@ -2866,6 +2979,13 @@ async function buildVibePlaylist(vibeKey, limit = 25) {
   const discoveryCount = Math.min(Math.ceil(limit * _tDiscoveryRatio()), 10);
   const baseCount = Math.max(1, limit - discoveryCount);
 
+  // Gate discovery to this vibe's sound: within a Variety-scaled radius of the
+  // cluster centroid. Keeps genre/artist-sourced finds from straying off-vibe.
+  const centroid = _computeCentroid(cluster.tracks);
+  const vibeVerdict = centroid
+    ? (t) => _centroidVerdict(t, centroid, _vibeRadius(cluster.tracks, centroid))
+    : null;
+
   // Taste-bias the shuffle so durably-loved artists are favoured when the pool is
   // truncated, while keeping randomness among equally-scored tracks.
   const base = _applyTasteBias([...pool].sort(() => Math.random() - 0.5)).slice(0, baseCount);
@@ -2877,7 +2997,7 @@ async function buildVibePlaylist(vibeKey, limit = 25) {
   const seedIds = [...seedSource].sort(() => Math.random() - 0.5)
     .slice(0, 3).map(t => t.id).filter(Boolean);
   const seedArtists = seedSource.map(t => t.artist).filter(Boolean);
-  const discovery = await _buildDiscovery(seedIds, seedArtists, discoveryCount);
+  const discovery = await _buildDiscovery(seedIds, seedArtists, discoveryCount, vibeVerdict);
 
   let all = _excludeDisliked(_excludePlayed([...base, ...discovery]));
   // Last resort: a vibe with real history should never come back empty. If session
@@ -2902,11 +3022,10 @@ async function buildFeelingPlaylist(feelingKey, sessionTracks = [], limit = 20) 
   const def = FEELING_DEFS[feelingKey];
   if (!def) return [];
 
-  // Widen the feeling's feature band by the Variety slider so a higher setting
-  // pulls in tracks further from the core energy/valence window.
-  const pad = _tBandPad();
-  const eMin = def.energy[0]  - pad, eMax = def.energy[1]  + pad;
-  const vMin = def.valence[0] - pad, vMax = def.valence[1] + pad;
+  // The feeling's energy/valence window, widened by the Variety tolerance. Used to
+  // filter the library pool AND to gate artist/genre-sourced discovery so it can't
+  // contradict the mood.
+  const band = _feelingBand(def);
   const all = combinedHistory();
 
   // Tracks that match the feeling's audio-feature ranges, excluding session tracks already heard
@@ -2917,8 +3036,8 @@ async function buildFeelingPlaylist(feelingKey, sessionTracks = [], limit = 20) 
     if (seen.has(e.id)) continue;
     if (_sessionTrackIds.has(e.id)) continue; // already played/queued this session
     if (e.energy == null) continue;
-    if (e.energy < eMin || e.energy > eMax) continue;
-    if (e.valence < vMin || e.valence > vMax) continue;
+    if (e.energy  < band.eMin || e.energy  > band.eMax) continue;
+    if (e.valence < band.vMin || e.valence > band.vMax) continue;
     seen.add(e.id);
     pool.push(e);
   }
@@ -2944,7 +3063,8 @@ async function buildFeelingPlaylist(feelingKey, sessionTracks = [], limit = 20) 
   // the best feeling-band matches.
   const seedIds = [...sessionSample, ...base].map(t => t.id).filter(Boolean).slice(0, 3);
   const seedArtists = [...sessionSample, ...base].map(t => t.artist).filter(Boolean);
-  const discovery = await _buildDiscovery(seedIds, seedArtists, discoveryCount);
+  const discovery = await _buildDiscovery(seedIds, seedArtists, discoveryCount,
+                                          (t) => _bandVerdict(t, band));
 
   // Final guard: nothing already played/queued, and nothing by a hard-skipped artist
   const combined = _excludeDisliked(_excludePlayed([...sessionSample, ...base, ...discovery]));
@@ -2955,32 +3075,42 @@ async function buildFeelingPlaylist(feelingKey, sessionTracks = [], limit = 20) 
 // curated playlists (borrowed collaborative filtering) come first, then fresh
 // search finds; anything the user already knows is only last-resort filler so
 // the queue never starves.
-async function _buildDiscovery(seedIds, seedArtists, count) {
+// `verdict` (optional) gates every candidate against the active mood/vibe's audio
+// profile — see _gateDiscovery. Off-vibe tracks are dropped so artist/genre-sourced
+// discovery can't contradict the chosen sound.
+async function _buildDiscovery(seedIds, seedArtists, count, verdict = null) {
   if (count <= 0) return [];
   const known = _knownTrackIdSet();
   const excludeIds = new Set([...known, ..._sessionTrackIds]);
   const topGenres = await _getTopGenres();
 
+  // Over-fetch each source so there's slack to gate against the vibe and still fill.
+  const fetch = verdict ? (count * 2 + 4) : (count + 4);
   const [curated, similar, fresh] = await Promise.all([
-    getCuratedTracks(seedArtists, topGenres, excludeIds, count + 4).catch(() => []),
-    getSimilarTracks(seedIds, [], count + 5).catch(() => []),
-    getDiscoveryTracks(seedArtists, excludeIds, count + 4).catch(() => []),
+    getCuratedTracks(seedArtists, topGenres, excludeIds, fetch).catch(() => []),
+    getSimilarTracks(seedIds, [], fetch + 1).catch(() => []),
+    getDiscoveryTracks(seedArtists, excludeIds, fetch).catch(() => []),
   ]);
 
   // Curated (Spotify CF) first — strongest cross-user signal — then fresh search
   // finds, then unfamiliar similar. Keep only genuinely new (unknown) tracks.
   const newCurated = _excludePlayed(curated).filter(t => t.id && !known.has(t.id));
   const newSimilar = _excludePlayed(similar).filter(t => t.id && !known.has(t.id));
-  let discovery = _excludeDisliked([...newCurated, ...fresh, ...newSimilar]);
+  let pool = _excludeDisliked([...newCurated, ...fresh, ...newSimilar]);
   // De-dupe by id, preserving the priority order above.
   const seenIds = new Set();
-  discovery = discovery.filter(t => t.id && !seenIds.has(t.id) && seenIds.add(t.id)).slice(0, count);
+  pool = pool.filter(t => t.id && !seenIds.has(t.id) && seenIds.add(t.id));
 
-  // Top up with known-but-unplayed similar so a batch is never short.
+  // Gate the deduped pool against the vibe (drops off-vibe, prefers on-vibe), then
+  // cap to count. Without a verdict this is just the slice as before.
+  let discovery = await _gateDiscovery(pool, verdict, count);
+
+  // Top up with known-but-unplayed similar so a batch is never short — gated too.
   if (discovery.length < count) {
     const have = new Set(discovery.map(t => t.id));
     const filler = _excludeDisliked(_excludePlayed(similar)).filter(t => !have.has(t.id));
-    discovery = [...discovery, ...filler].slice(0, count);
+    const gatedFiller = await _gateDiscovery(filler, verdict, count - discovery.length);
+    discovery = [...discovery, ...gatedFiller].slice(0, count);
   }
   return discovery;
 }
@@ -3437,6 +3567,26 @@ async function maybeRefillContinuousQueue(state) {
       const seen = new Set(fresh.map(t => t && t.id).filter(Boolean));
       for (const t of moreFresh) {
         if (t && t.id && !seen.has(t.id)) { fresh.push(t); seen.add(t.id); }
+      }
+    }
+
+    // 3b) Final safety net: drop anything that CONTRADICTS the active mood/vibe before
+    //     it can be staged. The builders already gate discovery, but the similar-track
+    //     top-up above (and any never-starve replay below) bypass that — this is the
+    //     backstop. Unknown-feature tracks are kept (can't judge); only proven off-vibe
+    //     songs are removed, and only when on-vibe candidates remain so we never starve.
+    const _verdict = _activeVibeVerdict();
+    if (_verdict && fresh.length) {
+      const warm = fresh
+        .filter(t => t && t.id && t.energy == null && !_findStoredFeatures(t.id))
+        .map(t => t.id).slice(0, 24);
+      if (warm.length) { try { await getBatchAudioFeatures(warm); } catch { /* best-effort */ } }
+      const onVibe = fresh.filter(t => _verdict(t) !== false); // keep on-vibe + unknown
+      if (onVibe.length) {
+        if (onVibe.length < fresh.length) {
+          console.log(`[Spotify] Refill: dropped ${fresh.length - onVibe.length} off-vibe track(s) (${label})`);
+        }
+        fresh = onVibe;
       }
     }
 

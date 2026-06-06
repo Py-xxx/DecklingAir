@@ -3127,6 +3127,17 @@ export function renderSpotifyIntelligence(ctrl) {
   socket.on('spotify:checkin_auto',       _onCheckinAuto);
   socket.on('spotify:session_reset',      _onSessionReset);
 
+  // Adapt the layout to the card's footprint so nothing clips on small grids
+  // (e.g. a 3×2 cell). `compact` tightens spacing + drops the listening-pattern
+  // bar; `tiny` collapses the prediction sub-line and check-in label too.
+  const _intelRo = new ResizeObserver(entries => {
+    const { height, width } = entries[0].contentRect;
+    card.classList.toggle('sp-intel-compact', height < 240);
+    card.classList.toggle('sp-intel-tiny',    height < 195);
+    card.classList.toggle('sp-intel-narrow',  width  < 210);
+  });
+  _intelRo.observe(card);
+
   // Cleanup
   const _cleanObs = new MutationObserver(() => {
     if (!document.contains(card)) {
@@ -3135,6 +3146,7 @@ export function renderSpotifyIntelligence(ctrl) {
       socket.off('spotify:continuous_state',   _onContState);
       socket.off('spotify:checkin_auto',       _onCheckinAuto);
       socket.off('spotify:session_reset',      _onSessionReset);
+      _intelRo.disconnect();
       _cleanObs.disconnect();
     }
   });
