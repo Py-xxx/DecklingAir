@@ -37,13 +37,21 @@ export function spotifySearch(query, type = 'track') {
 
 /**
  * Emit a request and resolve with the first matching reply. Resolves with
- * `fallback` if the server reports an error or nothing arrives in time, so a
- * single failed/rate-limited request can never leave a widget hanging forever
- * on a Promise that resolves only on the happy path.
+ * `fallback` only if nothing arrives within the timeout, so a widget can never
+ * hang forever on a Promise that resolves only on the happy path.
+ *
+ * NOTE: We deliberately do NOT listen for the global 'spotify:error' event.
+ * The server emits that event without a correlation id, so it is shared by all
+ * concurrent requests. Coupling to it meant a single failed/rate-limited
+ * request (e.g. the queue when no device is active) would resolve EVERY other
+ * in-flight request (playlists, liked songs, devices…) with their empty
+ * fallback — blanking unrelated widgets all at once. Each request now waits
+ * only for its own reply event, falling back after the timeout if it never
+ * comes.
  * @param {string} emitEvent    event to emit
  * @param {object} payload      payload to send
  * @param {string} replyEvent   event carrying the successful reply
- * @param {*}      fallback     value to resolve with on error/timeout
+ * @param {*}      fallback     value to resolve with on timeout
  * @param {number} [timeoutMs=12000]
  */
 function _request(emitEvent, payload, replyEvent, fallback, timeoutMs = 12000) {
@@ -54,14 +62,11 @@ function _request(emitEvent, payload, replyEvent, fallback, timeoutMs = 12000) {
       done = true;
       clearTimeout(timer);
       socket.off(replyEvent, onReply);
-      socket.off('spotify:error', onErr);
       resolve(val);
     };
     const onReply = (data) => finish(data);
-    const onErr = () => finish(fallback);
     const timer = setTimeout(() => finish(fallback), timeoutMs);
     socket.once(replyEvent, onReply);
-    socket.once('spotify:error', onErr);
     socket.emit(emitEvent, payload);
   });
 }
