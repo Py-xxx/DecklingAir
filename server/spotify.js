@@ -767,7 +767,7 @@ function resetSessionState() {
 async function reconcileRecentlyPlayed() {
   if (!isAuthed()) return;
   try {
-    const rp = await api('GET', '/me/player/recently-played', { params: { limit: 50 } });
+    const rp = await api('GET', '/me/player/recently-played', { params: { limit: 50 }, priority: 'low' });
     const items = rp?.items || [];
     if (!items.length) return;
 
@@ -876,7 +876,7 @@ async function seedFromSpotify() {
 
     // 1. Recently played — has real played_at timestamps
     try {
-      const rp = await api('GET', '/me/player/recently-played', { params: { limit: 50 } });
+      const rp = await api('GET', '/me/player/recently-played', { params: { limit: 50 }, priority: 'low' });
       for (const item of (rp?.items || [])) {
         const t = item.track;
         if (!t?.id) continue;
@@ -902,7 +902,7 @@ async function seedFromSpotify() {
     const seededTopIds = new Set();
     for (const range of ['long_term', 'medium_term']) {
       try {
-        const tt = await api('GET', '/me/top/tracks', { params: { time_range: range, limit: 50 } });
+        const tt = await api('GET', '/me/top/tracks', { params: { time_range: range, limit: 50 }, priority: 'low' });
         let added = 0;
         for (const t of (tt?.items || [])) {
           if (!t?.id || ownIds.has(t.id) || seededTopIds.has(t.id)) continue;
@@ -927,7 +927,7 @@ async function seedFromSpotify() {
     for (let i = 0; i < seedIds.length; i += 100) {
       const batch = seedIds.slice(i, i + 100);
       try {
-        const features = await getBatchAudioFeatures(batch);
+        const features = await getBatchAudioFeatures(batch, 'low');
         features.forEach((f, idx) => {
           if (!f) return;
           const seed = idToSeed.get(batch[idx]);
@@ -996,7 +996,7 @@ async function warmFeatureLibrary() {
     // 1. Gather library + top-track metadata (deduped by id)
     const byId = new Map();
     try {
-      const liked = await getAllLikedSongs();
+      const liked = await getAllLikedSongs('low');
       for (const entry of liked) {
         const t = entry.item || entry.track;
         if (t?.id && !byId.has(t.id)) byId.set(t.id, _libSeedFromTrack(t, 'liked_library'));
@@ -1006,7 +1006,7 @@ async function warmFeatureLibrary() {
     }
     for (const range of ['short_term', 'medium_term', 'long_term']) {
       try {
-        const tt = await api('GET', '/me/top/tracks', { params: { time_range: range, limit: 50 } });
+        const tt = await api('GET', '/me/top/tracks', { params: { time_range: range, limit: 50 }, priority: 'low' });
         for (const t of (tt?.items || [])) {
           if (t?.id && !byId.has(t.id)) byId.set(t.id, _libSeedFromTrack(t, 'top_' + range));
         }
@@ -1140,7 +1140,6 @@ function httpsRequest(method, urlStr, opts = {}) {
 // single rate-limit response slows every queued request, not just the one that
 // tripped it.
 // ---------------------------------------------------------------------------
-let _spotifyChain = Promise.resolve();
 let _spotifyLastTs = 0;
 let _spotifyGap = 220;                 // current spacing between requests (ms)
 const SPOTIFY_GAP_MIN = 220;
@@ -1149,27 +1148,57 @@ const SPOTIFY_MAX_RETRIES = 4;
 
 const _sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Serialize a unit of work behind the chain, enforcing the current min-gap.
-function _spotifyThrottle(fn) {
-  const run = _spotifyChain.then(async () => {
-    const wait = Math.max(0, _spotifyLastTs + _spotifyGap - Date.now());
-    if (wait > 0) await _sleep(wait);
+// Two-tier priority queue. Interactive requests (queue/playlists/search/poll)
+// go on the HIGH queue; bulk background work (library warm, history seed,
+// reconcile) goes on the LOW queue. The drainer always empties HIGH before it
+// touches LOW, so a multi-hundred-call library scan can never starve the
+// user-facing requests that triggered this whole rewrite. A single min-gap is
+// still enforced across both tiers so we never burst the API.
+const _spotifyHigh = [];
+const _spotifyLow = [];
+let _spotifyDraining = false;
+
+function _drainSpotify() {
+  if (_spotifyDraining) return;
+  _spotifyDraining = true;
+  (async () => {
     try {
-      return await fn();
+      while (_spotifyHigh.length || _spotifyLow.length) {
+        const job = _spotifyHigh.length ? _spotifyHigh.shift() : _spotifyLow.shift();
+        const wait = Math.max(0, _spotifyLastTs + _spotifyGap - Date.now());
+        if (wait > 0) await _sleep(wait);
+        try {
+          const data = await job.fn();
+          job.resolve(data);
+        } catch (err) {
+          job.reject(err);
+        } finally {
+          _spotifyLastTs = Date.now();
+        }
+      }
     } finally {
-      _spotifyLastTs = Date.now();
+      _spotifyDraining = false;
     }
+  })();
+}
+
+// Serialize a unit of work behind the queue, enforcing the current min-gap.
+// priority: 'high' (default, interactive) or 'low' (background bulk work).
+function _spotifyThrottle(fn, priority = 'high') {
+  return new Promise((resolve, reject) => {
+    const job = { fn, resolve, reject };
+    if (priority === 'low') _spotifyLow.push(job);
+    else _spotifyHigh.push(job);
+    _drainSpotify();
   });
-  _spotifyChain = run.then(() => {}, () => {}); // keep the chain alive on success or failure
-  return run;
 }
 
 // Throttled + backed-off Spotify request. Retries on 429/5xx, honouring
 // Retry-After; widens the global gap on 429 and gently relaxes it on success.
-async function _spotifySend(method, urlStr, reqOpts, label) {
+async function _spotifySend(method, urlStr, reqOpts, label, priority = 'high') {
   for (let attempt = 1; ; attempt++) {
     try {
-      const data = await _spotifyThrottle(() => httpsRequest(method, urlStr, reqOpts));
+      const data = await _spotifyThrottle(() => httpsRequest(method, urlStr, reqOpts), priority);
       if (_spotifyGap > SPOTIFY_GAP_MIN) {
         _spotifyGap = Math.max(SPOTIFY_GAP_MIN, Math.round(_spotifyGap * 0.85));
       }
@@ -1224,7 +1253,7 @@ async function api(method, endpoint, opts = {}) {
   const _noisy = method === 'GET' && (_short === '/me/player' || _short.startsWith('/me/player/queue'));
   if (!_noisy) console.log(`[Spotify] ${method} ${_short}`);
 
-  return _spotifySend(method, urlStr, { headers, body }, _short);
+  return _spotifySend(method, urlStr, { headers, body }, _short, opts.priority || 'high');
 }
 
 // ---------------------------------------------------------------------------
@@ -1794,18 +1823,18 @@ async function getAllPlaylistTracks(playlistId) {
   return allItems;
 }
 
-async function getAllLikedSongs() {
+async function getAllLikedSongs(priority = 'high') {
   const limit = 50;
   let offset = 0;
   let allItems = [];
   // First page also gives total
-  const first = await getLikedSongTracks(limit, 0);
+  const first = await getLikedSongTracks(limit, 0, priority);
   if (!first) return [];
   const total = first.total || 0;
   allItems = allItems.concat(first.items || []);
   while (allItems.length < total) {
     offset = allItems.length;
-    const page = await getLikedSongTracks(limit, offset);
+    const page = await getLikedSongTracks(limit, offset, priority);
     if (!page || !page.items || !page.items.length) break;
     allItems = allItems.concat(page.items);
   }
@@ -2000,14 +2029,14 @@ async function getAudioFeatures(trackId) {
   }
 }
 
-async function getBatchAudioFeatures(trackIds) {
+async function getBatchAudioFeatures(trackIds, priority = 'high') {
   if (!trackIds || !trackIds.length) return [];
   const toFetch = trackIds.filter(id => !_audioFeaturesCache.has(id));
   if (toFetch.length) {
     // Tier 1: Spotify batch (deprecated — usually 403s)
     try {
       const ids = toFetch.slice(0, 100).join(',');
-      const data = await api('GET', '/audio-features', { params: { ids } });
+      const data = await api('GET', '/audio-features', { params: { ids }, priority });
       const features = (data && data.audio_features) ? data.audio_features : [];
       features.forEach(f => { if (f && f.id) _cacheFeatures(f.id, f); });
     } catch {
@@ -2032,16 +2061,16 @@ async function getBatchAudioFeatures(trackIds) {
   return trackIds.map(id => _audioFeaturesCache.get(id) || null);
 }
 
-async function getLikedSongTracks(limit = 50, offset = 0) {
+async function getLikedSongTracks(limit = 50, offset = 0, priority = 'high') {
   // Feb 2026: /me/tracks → /me/library/items?type=track
   // Fall back to the old endpoint if the new one returns an unexpected structure
   try {
-    const data = await api('GET', '/me/library/items', { params: { type: 'track', limit, offset } });
+    const data = await api('GET', '/me/library/items', { params: { type: 'track', limit, offset }, priority });
     if (data && data.items) return data;
   } catch {
     // new endpoint failed — try legacy
   }
-  return api('GET', '/me/tracks', { params: { limit, offset } });
+  return api('GET', '/me/tracks', { params: { limit, offset }, priority });
 }
 
 async function getDevices() {
@@ -3933,7 +3962,15 @@ function buildStats() {
 // Polling
 // ---------------------------------------------------------------------------
 
+let _pollInFlight = false;
+
 async function poll() {
+  // Never let poll cycles overlap. The 5 s interval can fire again while a slow
+  // (rate-limited) cycle is still draining; without this guard each tick stacks
+  // another getPlaybackState + checkLiked + refill onto the queue, so the backlog
+  // grows without bound and interactive requests never get a turn.
+  if (_pollInFlight) return;
+  _pollInFlight = true;
   try {
     const raw = await getPlaybackState();
     const state = serializeState(raw);
@@ -4138,6 +4175,8 @@ async function poll() {
   } catch (err) {
     // Do not crash — log only
     console.error('[Spotify] Poll error:', err.message);
+  } finally {
+    _pollInFlight = false;
   }
 }
 

@@ -342,23 +342,23 @@ export const DEFAULT_PX_SIZES = {
 
 // Minimum size (px) per type — the floor enforced while resizing.
 export const MIN_PX_SIZES = {
-  fader:             { w: 80,  h: 200 },
-  toggle:            { w: 70,  h: 56 },
+  fader:             { w: 80,  h: 90 },   // low enough that width>height flips it to the horizontal layout
+  toggle:            { w: 64,  h: 48 },
   button:            { w: 90,  h: 48 },
   macro:             { w: 90,  h: 48 },
   desktop_action:    { w: 90,  h: 48 },
   soundboard:        { w: 90,  h: 48 },
-  vu_meter:          { w: 56,  h: 140 },
+  vu_meter:          { w: 44,  h: 44 },   // low enough to reach the tiny (horizontal-bar) mode at h<100
   strip_panel:       { w: 110, h: 240 },
   bus_panel:         { w: 110, h: 180 },
   label:             { w: 80,  h: 40 },
-  spotify_player:        { w: 280, h: 120 },
-  spotify_search:        { w: 260, h: 180 },
-  spotify_playlists:     { w: 260, h: 200 },
-  spotify_queue:         { w: 220, h: 160 },
-  spotify_stats:         { w: 220, h: 200 },
-  spotify_insights:      { w: 320, h: 280 },
-  spotify_intelligence:  { w: 220, h: 180 },
+  spotify_player:        { w: 200, h: 96 },
+  spotify_search:        { w: 220, h: 150 },
+  spotify_playlists:     { w: 220, h: 160 },
+  spotify_queue:         { w: 140, h: 110 },   // below the w<160 compact threshold so it can collapse
+  spotify_stats:         { w: 200, h: 170 },
+  spotify_insights:      { w: 300, h: 240 },
+  spotify_intelligence:  { w: 170, h: 120 },
 };
 
 const DEFAULT_FALLBACK_SIZE = { w: 150, h: 160 };

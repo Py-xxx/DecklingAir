@@ -1143,6 +1143,24 @@
   justify-content: space-between;
 }
 
+/* ── Player responsive tiers — keep all rows inside the panel ─────────────── */
+/* SHORT: drop the Autoplay/Smart-Shuffle row first (lowest-priority controls). */
+.sp-player-short .sp-smart-row { display: none; }
+.sp-player-short .sp-player { padding-top: 6px; padding-bottom: 6px; }
+/* MINI: hide the time read-out and tighten the seek row + album art. */
+.sp-player-mini .sp-time { display: none; }
+.sp-player-mini .sp-seek-row { gap: 0; }
+.sp-player-mini .sp-album-art-wrap,
+.sp-player-mini .sp-album-art,
+.sp-player-mini .sp-no-art { width: 38px; height: 38px; }
+.sp-player-mini .sp-player { padding-top: 5px; padding-bottom: 5px; gap: 4px; }
+/* COMPACT (narrow): shrink art and drop the secondary action buttons. */
+.sp-player-compact .sp-action-btns .sp-add-btn,
+.sp-player-compact .sp-action-btns .sp-device-btn { display: none; }
+.sp-player-compact .sp-album-art-wrap,
+.sp-player-compact .sp-album-art,
+.sp-player-compact .sp-no-art { width: 40px; height: 40px; }
+
 .sp-smart-btn {
   flex: 0 0 auto;
   display: flex;
@@ -2800,9 +2818,22 @@
 .sp-intel-tiny .sp-intel-context-label { margin-bottom: 1px; }
 .sp-intel-tiny .sp-intel-checkin-btn { padding: 5px 8px; font-size: 11px; }
 
+/* MICRO (tiny panel): shed the whole "vibe you're going for" context block and
+   its dividers, leaving just the now-playing state + check-in row so nothing
+   is ever clipped outside the panel. A scroll safety net still applies below. */
+.sp-intel-micro .sp-intel-context,
+.sp-intel-micro .sp-intel-divider { display: none; }
+.sp-intel-micro .sp-intel-wrap { gap: 5px; padding: 7px 9px; }
+.sp-intel-micro .sp-intel-header { margin-bottom: 0; }
+.sp-intel-micro .sp-intel-checkin-row { margin-top: auto; }
+
 /* NARROW (thin card): hide the "Auto" toggle text, keep the switch. */
 .sp-intel-narrow .sp-intel-auto-label { display: none; }
 .sp-intel-narrow .sp-intel-wrap { padding-left: 8px; padding-right: 8px; }
+
+/* Ultimate safety net: if content still can't fit after the tiers collapse,
+   let the card scroll rather than clip controls out of reach. */
+.sp-intel-wrap { overflow-y: auto; overflow-x: hidden; }
 
 /* ── Queue "Auto" pill (auto-managed indicator) ─────────────────────────── */
 .sp-queue-auto-pill {

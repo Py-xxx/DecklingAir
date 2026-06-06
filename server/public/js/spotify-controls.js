@@ -976,10 +976,23 @@ function renderSpotifyPlayer(ctrl) {
   });
   marqueeRo.observe(trackInfoEl);
 
+  // Adapt the player layout to its panel so the four rows never clip:
+  //   short → drop the Autoplay/Smart-Shuffle row
+  //   mini  → also hide the time read-out + tighten the seek row
+  //   compact (narrow) → shrink album art + hide the secondary action buttons
+  const _playerRo = new ResizeObserver(entries => {
+    const { height, width } = entries[0].contentRect;
+    card.classList.toggle('sp-player-short',   height < 150);
+    card.classList.toggle('sp-player-mini',    height < 116);
+    card.classList.toggle('sp-player-compact', width  < 230);
+  });
+  _playerRo.observe(card);
+
   // Clean up when card is removed from the DOM
   const _playerCleanupObs = new MutationObserver(() => {
     if (!document.contains(card)) {
       marqueeRo.disconnect();
+      _playerRo.disconnect();
       _playerCleanupObs.disconnect();
     }
   });
@@ -3155,8 +3168,14 @@ export function renderSpotifyIntelligence(ctrl) {
   // bar; `tiny` collapses the prediction sub-line and check-in label too.
   const _intelRo = new ResizeObserver(entries => {
     const { height, width } = entries[0].contentRect;
-    card.classList.toggle('sp-intel-compact', height < 240);
-    card.classList.toggle('sp-intel-tiny',    height < 195);
+    // Progressive collapse so the card always fits its panel instead of clipping:
+    //   compact → drop the listening-pattern bar
+    //   tiny    → drop the prediction/feeling sub-lines
+    //   micro   → drop the whole "vibe you're going for" context block + dividers,
+    //             leaving just the active state + check-in row (the essentials).
+    card.classList.toggle('sp-intel-compact', height < 260);
+    card.classList.toggle('sp-intel-tiny',    height < 210);
+    card.classList.toggle('sp-intel-micro',   height < 165);
     card.classList.toggle('sp-intel-narrow',  width  < 210);
   });
   _intelRo.observe(card);

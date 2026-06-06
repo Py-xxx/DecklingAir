@@ -36,15 +36,43 @@ export function spotifySearch(query, type = 'track') {
 // ---------------------------------------------------------------------------
 
 /**
+ * Emit a request and resolve with the first matching reply. Resolves with
+ * `fallback` if the server reports an error or nothing arrives in time, so a
+ * single failed/rate-limited request can never leave a widget hanging forever
+ * on a Promise that resolves only on the happy path.
+ * @param {string} emitEvent    event to emit
+ * @param {object} payload      payload to send
+ * @param {string} replyEvent   event carrying the successful reply
+ * @param {*}      fallback     value to resolve with on error/timeout
+ * @param {number} [timeoutMs=12000]
+ */
+function _request(emitEvent, payload, replyEvent, fallback, timeoutMs = 12000) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (val) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      socket.off(replyEvent, onReply);
+      socket.off('spotify:error', onErr);
+      resolve(val);
+    };
+    const onReply = (data) => finish(data);
+    const onErr = () => finish(fallback);
+    const timer = setTimeout(() => finish(fallback), timeoutMs);
+    socket.once(replyEvent, onReply);
+    socket.once('spotify:error', onErr);
+    socket.emit(emitEvent, payload);
+  });
+}
+
+/**
  * Request playlist list. Resolves with { items } when server responds.
  * @param {object} [opts]
  * @param {boolean} [opts.ownedOnly=false]  true = only return playlists the user can modify
  */
 export function getSpotifyPlaylists(opts = {}) {
-  return new Promise((resolve) => {
-    socket.once('spotify:playlists', resolve);
-    socket.emit('spotify:get_playlists', opts);
-  });
+  return _request('spotify:get_playlists', opts, 'spotify:playlists', { items: [] });
 }
 
 /**
@@ -52,10 +80,7 @@ export function getSpotifyPlaylists(opts = {}) {
  * @param {string} playlistId
  */
 export function getSpotifyPlaylistTracks(playlistId) {
-  return new Promise((resolve) => {
-    socket.once('spotify:playlist_tracks', resolve);
-    socket.emit('spotify:get_playlist_tracks', { playlistId });
-  });
+  return _request('spotify:get_playlist_tracks', { playlistId }, 'spotify:playlist_tracks', { playlistId, tracks: [] });
 }
 
 /**
@@ -65,10 +90,7 @@ export function getSpotifyPlaylistTracks(playlistId) {
  * @param {number} [opts.offset=0]
  */
 export function getSpotifyLikedSongs(opts = {}) {
-  return new Promise((resolve) => {
-    socket.once('spotify:liked_songs', resolve);
-    socket.emit('spotify:get_liked_songs', opts);
-  });
+  return _request('spotify:get_liked_songs', opts, 'spotify:liked_songs', { tracks: [] });
 }
 
 /**
@@ -210,20 +232,14 @@ export function queueSession(id) {
  * Request playback queue. Resolves with { items } when server responds.
  */
 export function getSpotifyQueue() {
-  return new Promise((resolve) => {
-    socket.once('spotify:queue', resolve);
-    socket.emit('spotify:get_queue');
-  });
+  return _request('spotify:get_queue', undefined, 'spotify:queue', { items: [] });
 }
 
 /**
  * Request available Spotify devices. Resolves with { devices } when server responds.
  */
 export function getSpotifyDevices() {
-  return new Promise((resolve) => {
-    socket.once('spotify:devices', resolve);
-    socket.emit('spotify:get_devices');
-  });
+  return _request('spotify:get_devices', undefined, 'spotify:devices', { devices: [] });
 }
 
 // ---------------------------------------------------------------------------
