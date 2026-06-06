@@ -2992,7 +2992,9 @@ export function renderSpotifyIntelligence(ctrl) {
   const idleEl       = card.querySelector('.sp-intel-idle');
   const feelingEmoji = card.querySelector('.sp-intel-feeling-emoji');
   const feelingLabel = card.querySelector('.sp-intel-feeling-label');
+  const feelingSub   = card.querySelector('.sp-intel-feeling-sub');
   const vibeLabelEl  = card.querySelector('.sp-intel-vibe-label');
+  const vibeSub      = card.querySelector('.sp-intel-vibe-sub');
   const contextVal   = card.querySelector('.sp-intel-context-value');
   const predictEl    = card.querySelector('.sp-intel-predict');
   const predictEmoji = card.querySelector('.sp-intel-predict-emoji');
@@ -3007,6 +3009,10 @@ export function renderSpotifyIntelligence(ctrl) {
   const resetBtn     = card.querySelector('.sp-intel-reset-btn');
 
   let _currentClusterSizeCache = 0;
+  // Cached separately from clusterSize: a continuous_state event carries the active
+  // keys but NOT the pool size, so without a cache the "drawing from N songs" line
+  // would flicker blank until the next full intelligence_state arrives.
+  let _currentPoolSizeCache = null;
 
   function _renderState(data) {
     if (!data) return;
@@ -3015,15 +3021,22 @@ export function renderSpotifyIntelligence(ctrl) {
     const { activeFeeling, activeMoodKey, activeVibeKey, clusterSize: cs, clusterCentroid, context } = data;
 
     if (cs != null) _currentClusterSizeCache = cs;
+    if (data.activePoolSize !== undefined) _currentPoolSizeCache = data.activePoolSize;
+
+    // "Drawing from N of your songs" — how big the active pool the engine picks from is.
+    const _ps = _currentPoolSizeCache;
+    const _poolText = (_ps != null && _ps > 0) ? `drawing from ${_ps} of your songs` : null;
 
     if (activeFeeling) {
       feelingEmoji.textContent = activeFeeling.emoji;
       feelingLabel.textContent = activeFeeling.label;
+      if (feelingSub) feelingSub.textContent = _poolText ? `Feeling · ${_poolText}` : 'Feeling · keeps going';
       feelingRow.style.display = '';
       vibeRow.style.display    = 'none';
       idleEl.style.display     = 'none';
     } else if (activeMoodKey || activeVibeKey) {
       vibeLabelEl.textContent  = data.activeMoodName || activeMoodKey || activeVibeKey;
+      if (vibeSub) vibeSub.textContent = _poolText ? `${_poolText} · keeps going ∞` : 'keeps going ∞';
       vibeRow.style.display    = '';
       feelingRow.style.display = 'none';
       idleEl.style.display     = 'none';

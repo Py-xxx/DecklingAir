@@ -2494,6 +2494,15 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
+  /* width:100% + min-width:0 are essential: .control-card sets align-items:center,
+     so a flex child WITHOUT an explicit width collapses to its intrinsic content
+     width and gets centred. The personalized prediction line is the widest content;
+     when the card is tall enough that the compact/tiny classes stop hiding it, that
+     line pushes the wrap wider than the card and it spills past BOTH edges. Pinning
+     to 100% + min-width:0 keeps it bounded so inner ellipsis/wrapping can do its job.
+     (Same fix already applied to .sp-player.) */
+  width: 100%;
+  min-width: 0;
   height: 100%;
   padding: 10px 12px 10px;
   box-sizing: border-box;

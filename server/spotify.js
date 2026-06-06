@@ -3528,6 +3528,43 @@ function _guessFeeling(centroid) {
   return best;
 }
 
+// How many of the user's OWN songs the currently-active mood/vibe/feeling is
+// drawing from — a cheap, synchronous count (no API calls) for the Now Playing
+// card's "drawing from N songs" line. This is the candidate pool the engine
+// picks from, NOT the listening-pattern cluster (that's clusterSize):
+//   • feeling/mood → library+history tracks whose energy/valence fall in the band
+//   • vibe         → the size of that vibe's detected cluster
+// Returns null when nothing is active (or features aren't warm yet).
+function _activePoolSize() {
+  try {
+    if (_activeVibeKey) {
+      const vibes = computeVibes();
+      if (!vibes.ready) return null;
+      const cluster = vibes.clusters.find(c => c.key === _activeVibeKey);
+      return cluster ? cluster.tracks.length : null;
+    }
+    // Mood resolves 1:1 to a feeling; feeling is used directly.
+    let feelingKey = _activeFeeling?.key || null;
+    if (!feelingKey && _activeMoodKey) {
+      feelingKey = MOOD_STATES.find(m => m.key === _activeMoodKey)?.feeling || null;
+    }
+    if (!feelingKey) return null;
+    const def = FEELING_DEFS[feelingKey];
+    if (!def) return null;
+    const band = _feelingBand(def);
+    let n = 0;
+    for (const e of combinedHistory()) {
+      if (e.energy == null) continue;
+      if (e.energy  < band.eMin || e.energy  > band.eMax) continue;
+      if (e.valence < band.vMin || e.valence > band.vMax) continue;
+      n++;
+    }
+    return n;
+  } catch {
+    return null;
+  }
+}
+
 function _emitIntelligenceState() {
   if (!_io) return;
   _io.emit('spotify:intelligence_state', {
@@ -3535,6 +3572,7 @@ function _emitIntelligenceState() {
     activeMoodKey:  _activeMoodKey,
     activeMoodName: _activeMoodKey ? (MOOD_STATES.find(m => m.key === _activeMoodKey)?.name || null) : null,
     activeVibeKey:  _activeVibeKey,
+    activePoolSize: _activePoolSize(),
     clusterSize:    _currentCluster.length,
     clusterCentroid: _currentCentroid,
     pendingCheckIn: _pendingCheckIn ? { guessedFeeling: _pendingCheckIn.guessedFeeling } : null,
@@ -4794,6 +4832,7 @@ function init(io) {
         const label = getVibeName(key);
         socket.emit('spotify:insights_action', { ok: true, msg: `Playing ${queued} tracks · "${label}" · keeps going ∞` });
         _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: key });
+        _emitIntelligenceState(); // push the full state (incl. activePoolSize) so the pool count shows immediately
         setTimeout(emitQueue, 1500);
       } catch (err) {
         socket.emit('spotify:insights_action', { ok: false, msg: err.message });
@@ -4817,6 +4856,7 @@ function init(io) {
         const queued = await playFresh(tracks);
         socket.emit('spotify:insights_action', { ok: true, msg: `Playing ${queued} tracks · "${mood.name}" · keeps going ∞` });
         _io.emit('spotify:continuous_state', { activeMoodKey: key, activeVibeKey: null });
+        _emitIntelligenceState(); // push the full state (incl. activePoolSize) so the pool count shows immediately
         setTimeout(emitQueue, 1500);
       } catch (err) {
         socket.emit('spotify:insights_action', { ok: false, msg: err.message });
@@ -4839,7 +4879,9 @@ function init(io) {
       socket.emit('spotify:intelligence_state', {
         activeFeeling:   _activeFeeling ? { key: _activeFeeling.key, label: _activeFeeling.label, emoji: _activeFeeling.emoji } : null,
         activeMoodKey:   _activeMoodKey,
+        activeMoodName:  _activeMoodKey ? (MOOD_STATES.find(m => m.key === _activeMoodKey)?.name || null) : null,
         activeVibeKey:   _activeVibeKey,
+        activePoolSize:  _activePoolSize(),
         clusterSize:     _currentCluster.length,
         clusterCentroid: _currentCentroid,
         pendingCheckIn:  _pendingCheckIn ? { guessedFeeling: _pendingCheckIn.guessedFeeling } : null,
