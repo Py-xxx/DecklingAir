@@ -205,6 +205,23 @@ let _refillFullLoggedAt = 0; // throttle for the "queue full" refill log
 function _setStaged(uris) { _stagedUris = new Set((uris || []).filter(Boolean)); }
 function _addStaged(uris) { for (const u of (uris || [])) if (u) _stagedUris.add(u); }
 
+// Ordered IDs of the tracks we've ACTUALLY played most recently (pushed on track
+// change, newest last). Unlike _sessionTrackIds — which also holds merely-staged
+// tracks and caps at 200 — this is a tight "don't replay this soon" window. The
+// refill's never-starve fallback (fresh = tracks) used to re-stage already-played
+// songs when a narrow vibe pool ran dry, causing the same track to come back after
+// only 3-5 songs. We hard-block anything in this window from being re-staged.
+let _recentPlayIds = [];
+const RECENT_PLAY_GUARD = 30; // no song repeats until this many others have played
+function _notePlayed(id) {
+  if (!id) return;
+  const i = _recentPlayIds.indexOf(id);
+  if (i !== -1) _recentPlayIds.splice(i, 1); // move to most-recent
+  _recentPlayIds.push(id);
+  if (_recentPlayIds.length > RECENT_PLAY_GUARD) _recentPlayIds.shift();
+}
+function _isRecentlyPlayed(id) { return !!id && _recentPlayIds.includes(id); }
+
 // ── Adaptive engagement ───────────────────────────────────────────────────────
 // _recentLikes:  rolling features of tracks the user actually engaged with
 //                (finished / heard most of) — steers refills toward the flow.
@@ -679,6 +696,7 @@ function resetSessionState() {
   _sessionTrackIds  = new Set();
   _recentLikes      = [];
   _stagedUris       = new Set();
+  _recentPlayIds    = [];     // fresh session = no recent-repeat history to guard against
   _transitionPrevId = null;   // new session = no prior track to chain a transition from
   // Durable taste (artist scores + track dislikes) intentionally survives a reset —
   // it's a long-term profile, not session state.
@@ -1378,14 +1396,50 @@ async function rebuildUpcoming(freshTracks) {
 
   const have = new Set([currentUri, ...upcoming].filter(Boolean));
   const freshUris = [];
+  const freshByUri = new Map();
   for (const t of (freshTracks || [])) {
     const u = t.uri || (t.id ? `spotify:track:${t.id}` : null);
-    if (u && !have.has(u)) { freshUris.push(u); have.add(u); }
+    if (!u || have.has(u)) continue;
+    // Hard recent-repeat guard: never re-stage a song we played in the last
+    // RECENT_PLAY_GUARD tracks, even if a narrow vibe pool's never-starve fallback
+    // handed us already-played songs. Better to stage fewer than to repeat soon.
+    const id = u.startsWith('spotify:track:') ? u.split(':').pop() : null;
+    if (_isRecentlyPlayed(id)) continue;
+    freshUris.push(u); freshByUri.set(u, t); have.add(u);
     if (freshUris.length >= need) break;
   }
   if (!freshUris.length) return 0; // nothing new to add — skip the rebuild/blip
 
-  const nextUris = [...upcoming, ...freshUris]; // ≤ QUEUE_TARGET
+  // Combine the staged upcoming we kept with the fresh tracks, then — this is what
+  // keeps the queue ADAPTIVE — re-flow-order the whole upcoming run anchored to the
+  // track playing right now. A freshly found song that fits better (harmonically,
+  // BPM/energy-wise, or by a learned transition) than an already-staged one slots
+  // AHEAD of it instead of always landing at the tail. We only get here when we're
+  // adding (a play() rebuild is happening regardless), so the reorder is free.
+  const combined = [...upcoming, ...freshUris]; // ≤ QUEUE_TARGET
+  let nextUris = combined;
+  if (_tFlowOn() && combined.length > 1) {
+    const annotate = (u) => {
+      const id = u.startsWith('spotify:track:') ? u.split(':').pop() : null;
+      const t = freshByUri.get(u);
+      const f = (t && t.energy != null) ? t : (id ? _findStoredFeatures(id) : null);
+      return { uri: u, id, bpm: f?.bpm, energy: f?.energy, _cam: f ? _camelotPos(f.key, f.mode) : null };
+    };
+    const seed = currentUri ? annotate(currentUri) : null;
+    const remaining = combined.map(annotate);
+    const ordered = [];
+    let last = seed;
+    while (remaining.length) {
+      let best = 0, bestScore = -Infinity;
+      for (let i = 0; i < remaining.length; i++) {
+        const s = last ? _trackFlowScore(last, remaining[i]) : 0;
+        if (s > bestScore) { bestScore = s; best = i; }
+      }
+      ordered.push(remaining.splice(best, 1)[0]);
+      last = ordered[ordered.length - 1];
+    }
+    nextUris = ordered.map(o => o.uri);
+  }
   if (currentUri) await play({ uris: [currentUri, ...nextUris], positionMs: progressMs });
   else            await play({ uris: nextUris });
 
@@ -3597,6 +3651,8 @@ async function poll() {
         // looped look-ahead keeps the played track "upcoming" and the queue never
         // drains below QUEUE_TARGET, so the refill never fires.
         if (state.track?.uri) _stagedUris.delete(state.track.uri);
+        // Record it in the recent-play window so it can't be re-staged for a while.
+        _notePlayed(state.track?.id);
         // Judge engagement with the outgoing track (skip vs finish) before we move on
         _evaluateEngagement(_lastState);
         _lastProgress = null;
@@ -4183,11 +4239,16 @@ function init(io) {
 
     // ----- spotify:reset_session -----
     socket.on('spotify:reset_session', () => {
-      resetSessionState();
-      _io.emit('spotify:stats', buildStats());
-      _emitIntelligenceState();
-      // Explicit success ack so the UI can confirm the refresh with a toast.
-      _io.emit('spotify:session_reset', { ok: true, msg: 'Music intelligence refreshed' });
+      try {
+        resetSessionState();
+        _io.emit('spotify:stats', buildStats());
+        _emitIntelligenceState();
+        // Explicit success ack so the UI can confirm the refresh with a toast.
+        _io.emit('spotify:session_reset', { ok: true, msg: 'Music intelligence refreshed' });
+      } catch (err) {
+        console.error('[Spotify] reset_session failed:', err.message);
+        _io.emit('spotify:session_reset', { ok: false, msg: 'Reset failed — check server logs' });
+      }
     });
 
     // ----- spotify:save_session_playlist -----

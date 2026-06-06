@@ -3031,6 +3031,9 @@ export function renderSpotifyIntelligence(ctrl) {
         _resetArmed = true;
         resetBtn.classList.add('armed');
         resetBtn.title = 'Tap again to reset the session';
+        // Touch devices never show the title tooltip, so without this the first
+        // tap looks like a no-op. The toast tells the user to confirm.
+        _spToast('Tap again to reset the session');
         clearTimeout(_resetTimer);
         _resetTimer = setTimeout(() => {
           _resetArmed = false;
