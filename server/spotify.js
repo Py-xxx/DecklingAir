@@ -54,6 +54,7 @@ const USER_PREFS_FILE    = path.join(__dirname, 'data', 'user-prefs.json');
 const TRACK_FEATURES_FILE = path.join(__dirname, 'data', 'track-features.json');
 const LIVE_STATE_FILE    = path.join(__dirname, 'data', 'live-session.json');
 const TASTE_PROFILE_FILE = path.join(__dirname, 'data', 'taste-profile.json');
+const FEELING_LOG_FILE   = path.join(__dirname, 'data', 'feeling-log.ndjson');
 
 // ── Background feature warming ────────────────────────────────────────────────
 // An idle-time job that fetches audio features for the WHOLE saved library + top
@@ -347,6 +348,50 @@ function saveVibeNames() {
 // carries across sessions instead of resetting each time.
 let _tasteSaveTimer = null;
 let _tasteDirty = false;
+
+// ── Feeling log ───────────────────────────────────────────────────────────────
+// When the user answers a check-in ("how have you been feeling?"), we DON'T start
+// playback — we just record the answer as a labeled sample: at this time/day, with
+// this audio fingerprint and these tracks, you reported feeling X. These labels are
+// the ground truth that powers the slot prediction (what vibe you're usually going
+// for right now) — far more reliable than guessing a feeling purely from audio.
+let _feelingLog = []; // [{ ts, h, dow, feeling, energy, valence, bpm, trackIds }]
+const FEELING_LOG_MAX = 2000;
+
+function loadFeelingLog() {
+  try {
+    if (!fs.existsSync(FEELING_LOG_FILE)) return;
+    _feelingLog = fs.readFileSync(FEELING_LOG_FILE, 'utf8').split('\n')
+      .map(l => { try { return l.trim() ? JSON.parse(l) : null; } catch { return null; } })
+      .filter(Boolean);
+    console.log(`[Spotify] Loaded ${_feelingLog.length} feeling labels`);
+  } catch (err) {
+    console.error('[Spotify] loadFeelingLog error:', err.message);
+  }
+}
+
+function _recordFeeling(feeling, fingerprint, clusterSnapshot) {
+  const entry = {
+    ts: Date.now(),
+    h:  new Date().getHours(),
+    dow: new Date().getDay(),
+    feeling,
+    energy:  fingerprint?.energy  != null ? Math.round(fingerprint.energy)  : null,
+    valence: fingerprint?.valence != null ? Math.round(fingerprint.valence) : null,
+    bpm:     fingerprint?.bpm      ? Math.round(fingerprint.bpm) : null,
+    trackIds: (clusterSnapshot || []).map(t => t && t.id).filter(Boolean).slice(0, 30),
+  };
+  _feelingLog.push(entry);
+  if (_feelingLog.length > FEELING_LOG_MAX) _feelingLog = _feelingLog.slice(-FEELING_LOG_MAX);
+  _contextProfilesAt = 0; // invalidate cached prediction so the new label counts immediately
+  try {
+    fs.mkdirSync(path.dirname(FEELING_LOG_FILE), { recursive: true });
+    fs.appendFileSync(FEELING_LOG_FILE, JSON.stringify(entry) + '\n');
+  } catch (err) {
+    console.error('[Spotify] feeling log append error:', err.message);
+  }
+  return entry;
+}
 
 function loadTasteProfile() {
   try {
@@ -3027,6 +3072,56 @@ function _applyContextBias(tracks) {
     .map(x => x.t);
 }
 
+// What vibe are you going for right now? Merges the ground-truth feelings you've
+// reported at this time-of-day (check-in labels) with what this slot usually SOUNDS
+// like (audio-pattern centroid). Reported feelings win when we have them; the audio
+// pattern is the fallback. Returns a playable mood so the UI can offer one-tap play.
+function _predictForNow() {
+  const now = new Date();
+  const weekend = now.getDay() === 0 || now.getDay() === 6;
+  const slot = _timeSlotFor(now.getHours());
+  const slotLabel = `${weekend ? 'Weekend' : 'Weekday'} ${SLOT_LABELS[slot] || slot}`;
+
+  // 1) Reported feelings (ground truth) for this slot — composite match preferred.
+  const composite = [], slotOnly = [];
+  for (const e of _feelingLog) {
+    if (!e.feeling || _timeSlotFor(e.h) !== slot) continue;
+    slotOnly.push(e);
+    if (((e.dow === 0 || e.dow === 6) === weekend)) composite.push(e);
+  }
+  const sample = composite.length >= 2 ? composite : slotOnly;
+  let reportedFeeling = null;
+  if (sample.length) {
+    const counts = {};
+    for (const e of sample) counts[e.feeling] = (counts[e.feeling] || 0) + 1;
+    reportedFeeling = Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0];
+  }
+
+  // 2) Audio-pattern feeling for this slot (what it usually sounds like).
+  const prof = _currentContextProfile();
+  const patternFeeling = (prof && prof.centroid) ? _guessFeeling(prof.centroid) : null;
+
+  const feeling = reportedFeeling || patternFeeling;
+  if (!feeling) return null;
+  const def  = FEELING_DEFS[feeling];
+  const mood = moodForFeeling(feeling);
+  return {
+    label:        slotLabel,
+    feeling,
+    feelingLabel: def?.label || feeling,
+    emoji:        def?.emoji || '',
+    moodKey:      mood?.key  || null,
+    moodName:     mood?.name || null,
+    moodEmoji:    mood?.emoji || '',
+    source:       reportedFeeling ? 'reported' : 'pattern',
+    samples:      reportedFeeling ? sample.length : (prof?.count || 0),
+    energy:  prof?.centroid ? Math.round(prof.centroid.energy)  : (def ? Math.round((def.energy[0]  + def.energy[1])  / 2) : null),
+    valence: prof?.centroid ? Math.round(prof.centroid.valence) : (def ? Math.round((def.valence[0] + def.valence[1]) / 2) : null),
+    bpm:     prof?.centroid?.bpm ? Math.round(prof.centroid.bpm) : null,
+    topArtists: prof?.topArtists || [],
+  };
+}
+
 function detectCurrentContext() {
   const now  = new Date();
   const h    = now.getHours();
@@ -3066,25 +3161,10 @@ function detectCurrentContext() {
 
   const suggestedMood = MOOD_STATES.find(m => m.key === suggestedMoodKey);
 
-  // Learned auto-profile for this exact slot (what this time-of-day usually sounds
-  // like). Surfaced for the UI and used to bias unguided recommendations.
-  const prof = _currentContextProfile();
-  let contextProfile = null;
-  if (prof && prof.centroid) {
-    const feelingKey = _guessFeeling(prof.centroid);
-    const def = FEELING_DEFS[feelingKey];
-    contextProfile = {
-      label: `${isWeekend ? 'Weekend' : 'Weekday'} ${SLOT_LABELS[timeSlot] || timeSlot}`,
-      feeling: feelingKey,
-      feelingLabel: def?.label || feelingKey,
-      emoji: def?.emoji || '',
-      energy: Math.round(prof.centroid.energy),
-      valence: Math.round(prof.centroid.valence),
-      bpm: prof.centroid.bpm ? Math.round(prof.centroid.bpm) : null,
-      samples: prof.count,
-      topArtists: prof.topArtists,
-    };
-  }
+  // Learned prediction for this exact slot — the vibe you're usually going for now,
+  // blending your reported feelings with the slot's audio pattern, and carrying a
+  // playable mood so the UI can offer one-tap play. Also biases unguided recs.
+  const contextProfile = _predictForNow();
 
   return { hour: h, dow, timeSlot, isWeekend, recentEnergy, suggestedMoodKey,
            suggestedMoodName: suggestedMood?.name, suggestedMoodEmoji: suggestedMood?.emoji,
@@ -3367,8 +3447,13 @@ async function maybeRefillContinuousQueue(state) {
 
     // Stage via context rebuild (no addToQueue) so the queue stays clearable.
     const added = await rebuildUpcoming(fresh);
-    if (added > 0) console.log(`[Spotify] Continuous refill +${added} tracks (${label}) → queue now full`);
-    else console.log(`[Spotify] Refill: nothing new to stage — pool exhausted for ${label} (had ${fresh.length} candidates, all already queued/played)`);
+    if (added > 0) {
+      console.log(`[Spotify] Continuous refill +${added} tracks (${label}) → queue now full`);
+      // Let the Queue widget flash its "Auto" pill to show it just topped up.
+      try { _io.emit('spotify:queue_managed', { active: true, added, label }); } catch {}
+    } else {
+      console.log(`[Spotify] Refill: nothing new to stage — pool exhausted for ${label} (had ${fresh.length} candidates, all already queued/played)`);
+    }
   } catch (err) {
     console.error('[Spotify] Continuous refill error:', err.message);
   }
@@ -3424,6 +3509,12 @@ function computeProfile() {
     unique: new Set(all.map(e => e.id)).size,
     daysLogging, topArtists, peakHour, hourCount,
     avgFeatures, featCoverage: featEntries.length,
+    signals: {
+      // Distinct A→B transitions that net-survived (the next track wasn't skipped).
+      flowLinks:     [..._transitions.values()].filter(v => v > 0).length,
+      transitions:   _transitions.size,
+      feelingLabels: _feelingLog.length,
+    },
   };
 }
 
@@ -3903,6 +3994,7 @@ function init(io) {
   loadUserPrefs();
   loadFeaturesDB();
   loadTasteProfile();
+  loadFeelingLog();
   loadLiveState(); // after loadSessions so stale-session finalize can de-dupe
 
   // Start polling if already authed
@@ -4424,37 +4516,16 @@ function init(io) {
       }
 
       const def = FEELING_DEFS[feeling];
-      _activeFeeling = {
-        key:          feeling,
-        label:        def.label,
-        emoji:        def.emoji,
-        confirmedAt:  Date.now(),
-        centroid:     { ..._pendingCheckIn.fingerprint },
-        clusterTracks: _pendingCheckIn.clusterSnapshot,
-      };
+
+      // A check-in answer is a LABEL, not a command. The user is telling us "I've
+      // been feeling like this while listening to these songs" — so we just record
+      // the association (it trains the slot prediction) and leave whatever is
+      // currently playing completely untouched. No new queue, no playFresh.
+      _recordFeeling(feeling, _pendingCheckIn.fingerprint, _pendingCheckIn.clusterSnapshot);
       _pendingCheckIn = null;
 
-      // A feeling maps 1:1 to a mood profile — activate that mood so the Mood tab
-      // reflects it. The feeling drives the (cluster-aware) playback.
-      const mappedMood = moodForFeeling(feeling);
-      _activeMoodKey = mappedMood ? mappedMood.key : null;
-      _activeVibeKey = null;
-
-      _emitIntelligenceState();
-      _io.emit('spotify:continuous_state', { activeMoodKey: _activeMoodKey, activeVibeKey: null });
-      const moodLabel = mappedMood ? ` · ${mappedMood.emoji} ${mappedMood.name}` : '';
-      socket.emit('spotify:insights_action', { ok: true, msg: `Got it · "${def.label}"${moodLabel} · building your playlist…` });
-
-      // Play feeling playlist fresh — clears the old (now-irrelevant) queue and
-      // caps to QUEUE_TARGET. Continuous refill keeps it topped up afterwards.
-      try {
-        const tracks = await buildFeelingPlaylist(feeling, _activeFeeling.clusterTracks, QUEUE_TARGET + 3);
-        const queued = await playFresh(tracks);
-        if (queued > 0) console.log(`[Spotify] Feeling "${feeling}" playing ${queued} tracks`);
-        setTimeout(emitQueue, 1500);
-      } catch (err) {
-        console.error('[Spotify] Feeling playlist error:', err.message);
-      }
+      _emitIntelligenceState(); // refresh prediction with the new label
+      socket.emit('spotify:insights_action', { ok: true, msg: `Got it · ${def.emoji} "${def.label}" — I'll remember this` });
     });
 
     // ----- spotify:dismiss_checkin -----

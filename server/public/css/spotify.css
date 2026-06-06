@@ -2622,18 +2622,64 @@
   font-weight: 600;
   color: var(--text, #fff);
 }
-.sp-intel-autoprofile {
-  margin-top: 3px;
+/* Now-Playing vibe prediction (merged from old Routine tab) */
+.sp-intel-predict {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 5px;
+  padding: 7px 9px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgba(29,185,84,0.12), rgba(29,185,84,0.04));
+  border: 1px solid rgba(29,185,84,0.22);
+}
+.sp-intel-predict-emoji {
+  font-size: 20px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.sp-intel-predict-info {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+.sp-intel-predict-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text, #fff);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sp-intel-predict-sub {
   font-size: 10px;
-  line-height: 1.35;
-  color: var(--text-3, #888);
-  text-transform: none;
-  letter-spacing: 0;
+  color: var(--text-3, #9a9a9a);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.sp-intel-autoprofile strong {
-  color: var(--text-2, #bbb);
-  font-weight: 600;
+.sp-intel-predict-play {
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: none;
+  background: var(--sp-green, #1DB954);
+  color: #04130a;
+  font-size: 13px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.12s ease, background 0.12s ease;
 }
+.sp-intel-predict-play:hover {
+  transform: scale(1.08);
+  background: #1ed760;
+}
+.sp-intel-predict-play:active { transform: scale(0.95); }
 .sp-intel-cluster {
   display: flex;
   flex-direction: column;
@@ -2724,3 +2770,102 @@
 .sp-intel-checkin-btn:hover .sp-intel-checkin-icon {
   opacity: 1;
 }
+
+/* ── Queue "Auto" pill (auto-managed indicator) ─────────────────────────── */
+.sp-queue-auto-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 7px;
+  margin-right: auto;          /* keep pill next to title, push refresh right */
+  padding: 2px 8px 2px 7px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--sp-green, #1DB954);
+  background: rgba(29,185,84,0.12);
+  border: 1px solid rgba(29,185,84,0.28);
+  white-space: nowrap;
+  transition: background 0.3s ease, border-color 0.3s ease, color 0.3s ease;
+}
+.sp-queue-auto-pill[hidden] { display: none; }
+.sp-queue-auto-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--sp-green, #1DB954);
+  flex-shrink: 0;
+  animation: sp-queue-auto-pulse 2.4s ease-in-out infinite;
+}
+@keyframes sp-queue-auto-pulse {
+  0%, 100% { opacity: 0.45; transform: scale(0.85); }
+  50%      { opacity: 1;    transform: scale(1.1); }
+}
+/* brief flash when the queue is topped up */
+.sp-queue-auto-pill.is-flash {
+  background: rgba(29,185,84,0.30);
+  border-color: rgba(29,185,84,0.7);
+  color: #1ed760;
+  box-shadow: 0 0 0 3px rgba(29,185,84,0.18);
+}
+.sp-queue-auto-pill.is-flash .sp-queue-auto-dot {
+  animation: none;
+  opacity: 1;
+  transform: scale(1.15);
+}
+/* hide the label in compact (narrow) queue, keep the dot */
+.sp-queue-compact .sp-queue-auto-text { display: none; }
+.sp-queue-compact .sp-queue-auto-pill { padding: 3px; gap: 0; }
+
+/* ── Profile tab: two-column compressed layout ──────────────────────────── */
+.sp-ins-profile-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  align-items: start;
+}
+.sp-ins-profile-col {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+/* collapse to one column when the widget is narrow */
+.spotify-insights-card.sp-ins-narrow .sp-ins-profile-cols {
+  grid-template-columns: 1fr;
+}
+
+/* ── Learned-signals strip (transition flow + feeling labels) ───────────── */
+.sp-ins-signals {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--sp-border, rgba(255,255,255,0.07));
+}
+.sp-ins-signals-title {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-3, #888);
+}
+.sp-ins-signal-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-2, #cfcfcf);
+  background: rgba(255,255,255,0.05);
+  border: 1px solid rgba(255,255,255,0.08);
+  cursor: default;
+}
+.sp-ins-signal-icon { font-size: 12px; line-height: 1; }
+.sp-ins-signal-val { color: var(--sp-green, #1DB954); font-weight: 700; }

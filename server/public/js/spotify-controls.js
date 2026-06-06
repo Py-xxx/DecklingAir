@@ -23,7 +23,6 @@ import {
   getSpotifyInsights,
   renameVibe,
   playVibe,
-  playNow,
   setSpotifyAutoplay,
   setSpotifySmartShuffle,
   playMood,
@@ -1670,6 +1669,9 @@ function renderSpotifyQueue(ctrl) {
     <div class="sp-queue-wrap">
       <div class="sp-section-header">
         <span class="sp-section-title">Up Next</span>
+        <span class="sp-queue-auto-pill" title="This queue is being managed automatically" hidden>
+          <span class="sp-queue-auto-dot"></span><span class="sp-queue-auto-text">Auto</span>
+        </span>
         <button class="sp-icon-btn sp-queue-refresh" aria-label="Refresh queue">${SVG.refresh()}</button>
       </div>
       <div class="sp-queue-list"></div>
@@ -1682,6 +1684,26 @@ function renderSpotifyQueue(ctrl) {
 
   const listEl     = card.querySelector('.sp-queue-list');
   const refreshBtn = card.querySelector('.sp-queue-refresh');
+  const autoPill   = card.querySelector('.sp-queue-auto-pill');
+
+  // ---- "Auto" pill: reflects the continuous engine + flashes on refill ----
+  let _autoActive = false;
+  let _flashTimer = null;
+  function _setAuto(active) {
+    _autoActive = !!active;
+    autoPill.hidden = !_autoActive;
+    if (!_autoActive) autoPill.classList.remove('is-flash');
+  }
+  function _flashAuto() {
+    if (!_autoActive) return;
+    autoPill.classList.add('is-flash');
+    clearTimeout(_flashTimer);
+    _flashTimer = setTimeout(() => autoPill.classList.remove('is-flash'), 1100);
+  }
+  const _onContState = (d) => _setAuto(!!(d && (d.activeMoodKey || d.activeVibeKey || d.activeFeeling)));
+  const _onQueueManaged = (d) => { _setAuto(true); if (d && d.added > 0) _flashAuto(); };
+  socket.on('spotify:continuous_state', _onContState);
+  socket.on('spotify:queue_managed',    _onQueueManaged);
 
   function _render(data) {
     listEl.innerHTML = '';
@@ -1725,6 +1747,9 @@ function renderSpotifyQueue(ctrl) {
   const observer = new MutationObserver(() => {
     if (!document.contains(card)) {
       _queueCardUpdaters.delete(_render);
+      socket.off('spotify:continuous_state', _onContState);
+      socket.off('spotify:queue_managed',    _onQueueManaged);
+      clearTimeout(_flashTimer);
       queueRo.disconnect();
       observer.disconnect();
     }
@@ -1732,6 +1757,12 @@ function renderSpotifyQueue(ctrl) {
   observer.observe(document.body, { childList: true, subtree: true });
 
   getSpotifyQueue().then(_render);
+
+  // Sync the Auto pill with the current engine state on creation.
+  socket.emit('spotify:get_intelligence');
+  socket.once('spotify:intelligence_state', (d) => {
+    _setAuto(!!(d && (d.activeMoodKey || d.activeVibeKey || d.activeFeeling)));
+  });
 
   return card;
 }
@@ -2187,15 +2218,13 @@ export function renderSpotifyInsights(ctrl) {
     <div class="sp-ins-wrap">
       <div class="sp-ins-tab-bar">
         <button class="sp-ins-tab active" data-tab="profile">Profile</button>
-        <button class="sp-ins-tab" data-tab="patterns">Patterns</button>
         <button class="sp-ins-tab" data-tab="vibes">Vibes</button>
         <button class="sp-ins-tab" data-tab="mood">Mood</button>
-        <button class="sp-ins-tab" data-tab="rightnow">Routine</button>
         <button class="sp-ins-tab" data-tab="tuning">Tuning</button>
       </div>
       <div class="sp-ins-content">
 
-        <!-- PROFILE -->
+        <!-- PROFILE (now also carries the listening heatmap, compressed) -->
         <div class="sp-ins-panel" data-panel="profile">
           <div class="sp-ins-stats-row">
             <div class="sp-ins-stat"><span class="sp-ins-stat-val sp-ins-total">—</span><span class="sp-ins-stat-lbl">Plays</span></div>
@@ -2203,24 +2232,35 @@ export function renderSpotifyInsights(ctrl) {
             <div class="sp-ins-stat"><span class="sp-ins-stat-val sp-ins-days">—</span><span class="sp-ins-stat-lbl">Days</span></div>
             <div class="sp-ins-stat"><span class="sp-ins-stat-val sp-ins-peak">—</span><span class="sp-ins-stat-lbl">Peak hour</span></div>
           </div>
-          <div class="sp-ins-features-section" style="display:none">
-            <div class="sp-ins-sub-title">Audio Profile <span class="sp-ins-feat-avg-bpm"></span></div>
-            <div class="sp-ins-feat-bars"></div>
+          <div class="sp-ins-profile-cols">
+            <div class="sp-ins-profile-col">
+              <div class="sp-ins-features-section" style="display:none">
+                <div class="sp-ins-sub-title">Audio Profile <span class="sp-ins-feat-avg-bpm"></span></div>
+                <div class="sp-ins-feat-bars"></div>
+              </div>
+              <div class="sp-ins-sub-title sp-ins-artists-title">Top Artists</div>
+              <div class="sp-ins-artists-list"></div>
+            </div>
+            <div class="sp-ins-profile-col">
+              <div class="sp-ins-sub-title">When you listen most</div>
+              <div class="sp-ins-heatmap-wrap">
+                <div class="sp-ins-heatmap"></div>
+              </div>
+              <div class="sp-ins-heatmap-legend">
+                <span>Less</span>
+                <span class="sp-ins-legend-boxes"></span>
+                <span>More</span>
+              </div>
+            </div>
           </div>
-          <div class="sp-ins-sub-title sp-ins-artists-title">Top Artists</div>
-          <div class="sp-ins-artists-list"></div>
-        </div>
-
-        <!-- PATTERNS -->
-        <div class="sp-ins-panel" data-panel="patterns" style="display:none">
-          <div class="sp-ins-sub-title">When you listen most</div>
-          <div class="sp-ins-heatmap-wrap">
-            <div class="sp-ins-heatmap"></div>
-          </div>
-          <div class="sp-ins-heatmap-legend">
-            <span>Less</span>
-            <span class="sp-ins-legend-boxes"></span>
-            <span>More</span>
+          <div class="sp-ins-signals" style="display:none">
+            <span class="sp-ins-signals-title">Learned signals</span>
+            <span class="sp-ins-signal-chip sp-ins-signal-trans" title="Song-to-song transitions that survived vs got skipped — used to order your queue for smoother flow">
+              <span class="sp-ins-signal-icon">⤳</span><span class="sp-ins-signal-val">0</span> flow links
+            </span>
+            <span class="sp-ins-signal-chip sp-ins-signal-feel" title="Times you told the app how a set of songs made you feel — ground truth for predicting your vibe">
+              <span class="sp-ins-signal-icon">💬</span><span class="sp-ins-signal-val">0</span> feeling labels
+            </span>
           </div>
         </div>
 
@@ -2248,23 +2288,6 @@ export function renderSpotifyInsights(ctrl) {
           </div>
         </div>
 
-        <!-- RIGHT NOW -->
-        <div class="sp-ins-panel" data-panel="rightnow" style="display:none">
-          <div class="sp-ins-rn-empty" style="display:none">
-            <div class="sp-ins-empty-icon">▶</div>
-            <div class="sp-ins-empty-msg">Keep listening to enable Routine</div>
-            <div class="sp-ins-empty-sub">Not enough data for your current time yet</div>
-          </div>
-          <div class="sp-ins-rn-content" style="display:none">
-            <div class="sp-ins-rn-time"></div>
-            <div class="sp-ins-rn-vibe-label">You usually listen to</div>
-            <div class="sp-ins-rn-vibe-name"></div>
-            <div class="sp-ins-rn-sample"></div>
-            <button class="sp-ins-action-btn sp-ins-rn-play-btn">▶ Queue this vibe</button>
-          </div>
-        </div>
-
-        <!-- FILTER -->
         <!-- TUNING -->
         <div class="sp-ins-panel" data-panel="tuning" style="display:none">
           <div class="sp-ins-tune-intro">Shape how every Spotify feature picks music — autoplay, smart shuffle, vibes, moods, routines &amp; check-ins.</div>
@@ -2413,6 +2436,23 @@ export function renderSpotifyInsights(ctrl) {
       `;
       artistsList.appendChild(row);
     });
+
+    // Learned signals strip (transition flow + feeling labels)
+    const sig = p.signals;
+    const sigEl = card.querySelector('.sp-ins-signals');
+    if (sigEl) {
+      const links  = sig ? (sig.flowLinks || 0)     : 0;
+      const labels = sig ? (sig.feelingLabels || 0)  : 0;
+      if (links > 0 || labels > 0) {
+        sigEl.querySelector('.sp-ins-signal-trans .sp-ins-signal-val').textContent = links;
+        sigEl.querySelector('.sp-ins-signal-feel  .sp-ins-signal-val').textContent = labels;
+        sigEl.querySelector('.sp-ins-signal-trans').style.display = links  > 0 ? '' : 'none';
+        sigEl.querySelector('.sp-ins-signal-feel').style.display  = labels > 0 ? '' : 'none';
+        sigEl.style.display = '';
+      } else {
+        sigEl.style.display = 'none';
+      }
+    }
   }
 
   function _renderPatterns(p) {
@@ -2512,29 +2552,6 @@ export function renderSpotifyInsights(ctrl) {
       listEl.appendChild(row);
     });
   }
-
-  function _renderRightNow(rn) {
-    const emptyEl   = card.querySelector('.sp-ins-rn-empty');
-    const contentEl = card.querySelector('.sp-ins-rn-content');
-    if (!rn.ready) {
-      emptyEl.style.display   = '';
-      contentEl.style.display = 'none';
-      return;
-    }
-    emptyEl.style.display   = 'none';
-    contentEl.style.display = '';
-    card.querySelector('.sp-ins-rn-time').textContent =
-      `${rn.dayName} · ${rn.timeLabel}`;
-    card.querySelector('.sp-ins-rn-vibe-name').textContent = rn.vibeName;
-    card.querySelector('.sp-ins-rn-sample').textContent =
-      `Based on ${rn.sampleSize} plays${rn.broad ? ' (similar time)' : ' at this time'}`;
-  }
-
-  card.querySelector('.sp-ins-rn-play-btn').addEventListener('pointerup', () => {
-    if (isEditMode()) return;
-    playNow();
-    _showFeedback('Queuing your routine vibe…');
-  });
 
   // ---- Tuning tab ----
   // Global sliders that shape every Spotify feature. Each change is debounced and
@@ -2693,7 +2710,6 @@ export function renderSpotifyInsights(ctrl) {
     _renderProfile(data.profile  || {});
     _renderPatterns(data.patterns || { grid: [], max: 1, blockNames: [], dayNames: [], total: 0 });
     _renderVibes(data.vibes      || { ready: false, needed: 20, current: 0 });
-    _renderRightNow(data.rightNow|| {});
     // Mood tab
     if (data.moods) {
       _renderMoods(data.moods, data.activeMoodKey, data.activeVibeKey, data.context);
@@ -2704,6 +2720,12 @@ export function renderSpotifyInsights(ctrl) {
     _updateContinuousState({ activeMoodKey: data.activeMoodKey, activeVibeKey: data.activeVibeKey });
   }
 
+  // Collapse the Profile two-column layout when the widget gets narrow.
+  const _insRo = new ResizeObserver(entries => {
+    card.classList.toggle('sp-ins-narrow', entries[0].contentRect.width < 360);
+  });
+  _insRo.observe(card);
+
   // Cleanup
   const _cleanObs = new MutationObserver(() => {
     if (!document.contains(card)) {
@@ -2712,6 +2734,7 @@ export function renderSpotifyInsights(ctrl) {
       socket.off('spotify:tuning',          _onTuning);
       socket.off('spotify:continuous_state', _onContinuousState);
       socket.off('spotify:insights',        _onInsights);
+      _insRo.disconnect();
       _cleanObs.disconnect();
     }
   });
@@ -2836,7 +2859,7 @@ export function renderSpotifyIntelligence(ctrl) {
   card.innerHTML = `
     <div class="sp-intel-wrap">
       <div class="sp-intel-header">
-        <span class="sp-intel-title">Music Intelligence</span>
+        <span class="sp-intel-title">Now Playing</span>
         <label class="sp-intel-auto-toggle" title="Auto check-ins — get prompted when a pattern is detected">
           <span class="sp-intel-auto-label">Auto</span>
           <input type="checkbox" class="sp-intel-auto-check" checked>
@@ -2869,9 +2892,16 @@ export function renderSpotifyIntelligence(ctrl) {
       <div class="sp-intel-divider"></div>
 
       <div class="sp-intel-context">
-        <div class="sp-intel-context-label">Predicted mood <span class="sp-intel-context-hint">· a guess from your patterns</span></div>
-        <div class="sp-intel-context-value">—</div>
-        <div class="sp-intel-autoprofile" style="display:none"></div>
+        <div class="sp-intel-context-label">The vibe you're going for <span class="sp-intel-context-hint">· learned from your patterns</span></div>
+        <div class="sp-intel-predict" style="display:none">
+          <span class="sp-intel-predict-emoji"></span>
+          <div class="sp-intel-predict-info">
+            <span class="sp-intel-predict-name">—</span>
+            <span class="sp-intel-predict-sub"></span>
+          </div>
+          <button class="sp-intel-predict-play" title="Play this vibe">▶</button>
+        </div>
+        <div class="sp-intel-context-value" style="display:none">—</div>
       </div>
 
       <div class="sp-intel-cluster">
@@ -2913,7 +2943,12 @@ export function renderSpotifyIntelligence(ctrl) {
   const feelingLabel = card.querySelector('.sp-intel-feeling-label');
   const vibeLabelEl  = card.querySelector('.sp-intel-vibe-label');
   const contextVal   = card.querySelector('.sp-intel-context-value');
-  const autoProfile  = card.querySelector('.sp-intel-autoprofile');
+  const predictEl    = card.querySelector('.sp-intel-predict');
+  const predictEmoji = card.querySelector('.sp-intel-predict-emoji');
+  const predictName  = card.querySelector('.sp-intel-predict-name');
+  const predictSub   = card.querySelector('.sp-intel-predict-sub');
+  const predictPlay  = card.querySelector('.sp-intel-predict-play');
+  let   _predictMoodKey = null;
   const clusterBar   = card.querySelector('.sp-intel-cluster-bar');
   const clusterSize  = card.querySelector('.sp-intel-cluster-size');
   const autoCheck    = card.querySelector('.sp-intel-auto-check');
@@ -2947,26 +2982,35 @@ export function renderSpotifyIntelligence(ctrl) {
       idleEl.style.display     = '';
     }
 
-    // Context suggestion — framed as a prediction, not the currently-playing track.
-    if (context?.suggestedMoodName) {
-      contextVal.textContent = `${context.suggestedMoodEmoji || ''} Maybe ${context.suggestedMoodName}`;
+    // Predicted vibe — merges your reported feelings with this slot's audio pattern
+    // into one "this is what you're going for now" + one-tap play. Falls back to the
+    // lighter time-of-day mood guess when we don't have a learned prediction yet.
+    const cp = context?.contextProfile;
+    if (cp && cp.feelingLabel) {
+      _predictMoodKey = cp.moodKey || null;
+      predictEmoji.textContent = cp.emoji || cp.moodEmoji || '🎧';
+      predictName.textContent  = cp.moodName || cp.feelingLabel;
+      const artists = (cp.topArtists || []).slice(0, 2).map(a => a.name).join(', ');
+      const basis = cp.source === 'reported'
+        ? `${cp.label} · you usually feel ${cp.feelingLabel.toLowerCase()}`
+        : `${cp.label} · usually sounds ${cp.feelingLabel.toLowerCase()}`;
+      predictSub.textContent = artists ? `${basis} · ${artists}` : basis;
+      predictPlay.style.display = _predictMoodKey ? '' : 'none';
+      predictEl.style.display = '';
+      contextVal.style.display = 'none';
+    } else if (context?.suggestedMoodName) {
+      _predictMoodKey = context.suggestedMoodKey || null;
+      predictEmoji.textContent = context.suggestedMoodEmoji || '🎧';
+      predictName.textContent  = context.suggestedMoodName;
+      predictSub.textContent   = 'a guess from your time-of-day patterns';
+      predictPlay.style.display = _predictMoodKey ? '' : 'none';
+      predictEl.style.display = '';
+      contextVal.style.display = 'none';
     } else {
-      contextVal.textContent = 'Not sure yet';
-    }
-
-    // Learned auto-profile for this slot (e.g. "Weekday mornings usually 🧘 Chill").
-    if (autoProfile) {
-      const cp = context?.contextProfile;
-      if (cp && cp.feelingLabel) {
-        const artists = (cp.topArtists || []).slice(0, 2).map(a => a.name).join(', ');
-        autoProfile.innerHTML = `<span class="sp-intel-autoprofile-text">${_esc(cp.label)} usually `
-          + `${cp.emoji || ''} <strong>${_esc(cp.feelingLabel)}</strong>`
-          + (artists ? ` · ${_esc(artists)}` : '')
-          + `</span>`;
-        autoProfile.style.display = '';
-      } else {
-        autoProfile.style.display = 'none';
-      }
+      _predictMoodKey = null;
+      predictEl.style.display = 'none';
+      contextVal.style.display = '';
+      contextVal.textContent = 'Not sure yet — keep listening';
     }
 
     // Cluster bar (confidence indicator, max display = 20 tracks)
@@ -2984,6 +3028,16 @@ export function renderSpotifyIntelligence(ctrl) {
       if (isEditMode()) return;
       stopFeeling();
     });
+  });
+
+  // Predicted-vibe play — the ONLY place a prediction starts playback, and only on
+  // an explicit tap. Answering a check-in never plays; this button does.
+  predictPlay.addEventListener('pointerup', (e) => {
+    if (isEditMode()) return;
+    e.stopPropagation();
+    if (!_predictMoodKey) return;
+    playMood(_predictMoodKey);
+    _spToast(`Playing ${predictName.textContent}`);
   });
 
   // Check-in button — manually trigger the popup

@@ -685,8 +685,8 @@ function buildControlConfig(type) {
   if (type === 'spotify_search') return { label: label || 'Search' };
   if (type === 'spotify_queue')  return { label: label || 'Queue' };
   if (type === 'spotify_stats')  return { label: label || 'Session Stats' };
-  if (type === 'spotify_insights')     return { label: label || 'Music Intelligence' };
-  if (type === 'spotify_intelligence') return { label: label || 'Now Playing Intel' };
+  if (type === 'spotify_insights')     return { label: label || 'Listening Insights' };
+  if (type === 'spotify_intelligence') return { label: label || 'Now Playing' };
   if (type === 'spotify_playlists') {
     const columns = Number.parseInt(document.getElementById('cfg-spotify-pl-cols')?.value, 10) || 3;
     const showSpecialPlaylists = document.getElementById('cfg-spotify-pl-special')?.checked ?? false;
