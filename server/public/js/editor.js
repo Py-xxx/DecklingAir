@@ -1658,9 +1658,16 @@ function startGridGesture({ mode, event, gridEl, card }) {
 
   card.classList.add('is-dragging');
   showDropPreview(original, false);
+
+  // Capture the pointer on the grid container (which is stable across
+  // re-renders) so move/up/cancel are reliably delivered even if the dragged
+  // card's DOM is replaced mid-gesture — the cause of "finger keeps dragging".
+  try { gridEl.setPointerCapture?.(event.pointerId); } catch { /* non-fatal */ }
+
   window.addEventListener('pointermove', onGridGestureMove);
   window.addEventListener('pointerup', endGridGesture);
   window.addEventListener('pointercancel', endGridGesture);
+  window.addEventListener('lostpointercapture', endGridGesture);
   event.preventDefault();
 }
 
@@ -1741,25 +1748,39 @@ function applyAlignSnap(rect, others) {
 function endGridGesture() {
   if (!_gridGesture) return;
 
-  const { card, controlId, lastValid, original } = _gridGesture;
+  // Snapshot what we need, then fully tear the gesture down BEFORE committing.
+  // Committing re-renders the layout and could throw; if teardown ran after the
+  // commit, an error would strand the gesture (card keeps following the cursor
+  // and edit mode becomes impossible to exit). Cleanup-first avoids that.
+  const { card, controlId, lastValid, original, gridEl, pointerId } = _gridGesture;
+  _gridGesture = null;
+
   card.classList.remove('is-dragging');
-
-  const control = findControl(controlId);
-  if (control && hasRectChanged(original, lastValid)) {
-    control.x = lastValid.x;
-    control.y = lastValid.y;
-    control.w = lastValid.w;
-    control.h = lastValid.h;
-    _callbacks.commitLayout?.();
-  } else {
-    _callbacks.commitLayout?.({ persist: false, rerender: true });
-  }
-
   hideDropPreview();
   window.removeEventListener('pointermove', onGridGestureMove);
   window.removeEventListener('pointerup', endGridGesture);
   window.removeEventListener('pointercancel', endGridGesture);
-  _gridGesture = null;
+  window.removeEventListener('lostpointercapture', endGridGesture);
+  try {
+    if (pointerId != null && gridEl.hasPointerCapture?.(pointerId)) {
+      gridEl.releasePointerCapture(pointerId);
+    }
+  } catch { /* capture may already be gone */ }
+
+  const control = findControl(controlId);
+  const changed = control && hasRectChanged(original, lastValid);
+  if (control && changed) {
+    control.x = lastValid.x;
+    control.y = lastValid.y;
+    control.w = lastValid.w;
+    control.h = lastValid.h;
+  }
+
+  try {
+    _callbacks.commitLayout?.(changed ? undefined : { persist: false, rerender: true });
+  } catch (err) {
+    console.error('[editor] commit after gesture failed', err);
+  }
 }
 
 function showDropPreview(rect, invalid) {

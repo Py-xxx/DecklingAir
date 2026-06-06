@@ -1101,6 +1101,7 @@ function httpsRequest(method, urlStr, opts = {}) {
           const err = new Error(message);
           err.status = res.statusCode;
           err.body = parsed;
+          err.headers = res.headers || {};
           return reject(err);
         }
 
@@ -1109,6 +1110,12 @@ function httpsRequest(method, urlStr, opts = {}) {
     });
 
     req.on('error', reject);
+
+    // Guard the serialized request chain against a hung socket: if no response
+    // arrives in time, abort so the queue can keep draining.
+    req.setTimeout(opts.timeoutMs || 15000, () => {
+      req.destroy(Object.assign(new Error('Request timed out'), { status: 0 }));
+    });
 
     if (opts.body) {
       req.write(opts.body);
@@ -1122,6 +1129,73 @@ function httpsRequest(method, urlStr, opts = {}) {
  * Spotify Web API request. Auto-refreshes token when expired.
  * opts: { body (object), params (object) }
  */
+// ---------------------------------------------------------------------------
+// Spotify request throttle
+//
+// Every Spotify Web API call is funnelled through one serialized promise chain
+// with a minimum gap between requests. The gap widens automatically on HTTP 429
+// (Too Many Requests) and relaxes on sustained success — so bursty seeding work
+// drains slowly instead of hammering the API. On a 429 we honour the server's
+// Retry-After header and pause the *entire* chain for that long, which means a
+// single rate-limit response slows every queued request, not just the one that
+// tripped it.
+// ---------------------------------------------------------------------------
+let _spotifyChain = Promise.resolve();
+let _spotifyLastTs = 0;
+let _spotifyGap = 220;                 // current spacing between requests (ms)
+const SPOTIFY_GAP_MIN = 220;
+const SPOTIFY_GAP_MAX = 8000;
+const SPOTIFY_MAX_RETRIES = 4;
+
+const _sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Serialize a unit of work behind the chain, enforcing the current min-gap.
+function _spotifyThrottle(fn) {
+  const run = _spotifyChain.then(async () => {
+    const wait = Math.max(0, _spotifyLastTs + _spotifyGap - Date.now());
+    if (wait > 0) await _sleep(wait);
+    try {
+      return await fn();
+    } finally {
+      _spotifyLastTs = Date.now();
+    }
+  });
+  _spotifyChain = run.then(() => {}, () => {}); // keep the chain alive on success or failure
+  return run;
+}
+
+// Throttled + backed-off Spotify request. Retries on 429/5xx, honouring
+// Retry-After; widens the global gap on 429 and gently relaxes it on success.
+async function _spotifySend(method, urlStr, reqOpts, label) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const data = await _spotifyThrottle(() => httpsRequest(method, urlStr, reqOpts));
+      if (_spotifyGap > SPOTIFY_GAP_MIN) {
+        _spotifyGap = Math.max(SPOTIFY_GAP_MIN, Math.round(_spotifyGap * 0.85));
+      }
+      return data;
+    } catch (err) {
+      const is429 = err.status === 429;
+      const is5xx = err.status >= 500 && err.status < 600;
+      const isTimeout = err.status === 0; // socket timeout/abort — worth one retry
+      if ((is429 || is5xx || isTimeout) && attempt <= SPOTIFY_MAX_RETRIES) {
+        let waitMs;
+        if (is429) {
+          const ra = Number(err.headers?.['retry-after']);
+          waitMs = Number.isFinite(ra) && ra >= 0 ? ra * 1000 + 250 : Math.min(SPOTIFY_GAP_MAX, 1000 * 2 ** (attempt - 1));
+          _spotifyGap = Math.min(SPOTIFY_GAP_MAX, Math.max(_spotifyGap * 2, 1000));
+          console.warn(`[Spotify] 429 on ${label} — backing off ${waitMs}ms (gap now ${_spotifyGap}ms, attempt ${attempt}/${SPOTIFY_MAX_RETRIES})`);
+        } else {
+          waitMs = Math.min(8000, 500 * 2 ** (attempt - 1));
+        }
+        await _sleep(waitMs);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 async function api(method, endpoint, opts = {}) {
   const token = await getToken();
 
@@ -1150,7 +1224,7 @@ async function api(method, endpoint, opts = {}) {
   const _noisy = method === 'GET' && (_short === '/me/player' || _short.startsWith('/me/player/queue'));
   if (!_noisy) console.log(`[Spotify] ${method} ${_short}`);
 
-  return httpsRequest(method, urlStr, { headers, body });
+  return _spotifySend(method, urlStr, { headers, body }, _short);
 }
 
 // ---------------------------------------------------------------------------
@@ -2482,6 +2556,26 @@ async function getAuthStatus() {
   const missingScopes = REQUIRED_SCOPES.filter(s => !grantedScopes.includes(s));
   const needsReauth = missingScopes.length > 0;
 
+  // Fast path: use the already-fetched profile (avoids an extra API hit,
+  // and avoids a false "not connected" when the API is temporarily rate-limited).
+  if (_userProfile) {
+    return {
+      connected: true,
+      configured: true,
+      displayName: _userProfile.display_name,
+      userId: _userProfile.id,
+      needsReauth,
+      missingScopes,
+    };
+  }
+
+  // Second fast path: if the poll loop is running, the token is valid — return
+  // connected immediately rather than risking a rate-limited live API call.
+  if (_pollTimer) {
+    return { connected: true, configured: true, needsReauth, missingScopes };
+  }
+
+  // Fallback: no cache and polling hasn't started yet — do a live check.
   try {
     const profile = await getUserProfile();
     return {
