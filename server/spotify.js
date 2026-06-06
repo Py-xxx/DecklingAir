@@ -24,10 +24,10 @@ const POLL_INTERVAL = 5000;
 // pick (manual queue adds always take priority over autoplay). See the big
 // block comment above the Smart Queue engine section for the full model.
 const SQ_POLL_INTERVAL = 2000;   // faster poll while a Smart Queue session is active
-const SQ_SPOTIFY_READ  = 10;     // Spotify discovery anchors fetched as the backbone of each window
+// Window depth (anchor count) and the extend trigger are now derived from the
+// Lookahead slider — see _sqAnchorCount() / _sqExtendAhead().
 const SQ_RATIO_MIN     = 0.40;   // our share of a window must stay within this band …
 const SQ_RATIO_MAX     = 0.60;   // … 40–60% ours / 40–60% Spotify (balanced)
-const SQ_EXTEND_AHEAD  = 4;      // when this few slots remain ahead of current, extend the window
 
 const SCOPES = [
   'user-read-playback-state',
@@ -77,21 +77,13 @@ const FEATURE_WARM_INTERVAL    = 6 * 60 * 60 * 1000; // re-scan every 6h for new
 const FEATURE_WARM_DELAY_MS    = 1200;               // gentle pause between each ReccoBeats fetch
 
 const SESSION_PRUNE_DAYS       = 90;
-// Unified queue cap: every auto-queue feature (mood, vibe, feeling, autoplay,
-// smart shuffle) keeps at most this many tracks staged upcoming. We top the
-// queue back up to this target whenever it drops below it.
-const QUEUE_TARGET                = 5;  // max upcoming tracks staged at any time
-const CONTINUOUS_REFILL_THRESHOLD = QUEUE_TARGET; // refill queue when fewer than this many tracks remain
-const CHECKIN_SEED_COUNT          = 8;  // initial kickstart queue right after a check-in is answered
-
 // ── Engagement / adaptive listening ──────────────────────────────────────────
 // We infer how the user feels about a track from how much of it they hear before
-// it changes. Skipping early = dislike; finishing = like. This nudges the
-// continuous queue to "go with the flow" of what's actually landing.
+// it changes. Skipping early = dislike; finishing = like. This nudges selection
+// toward what's actually landing (artist/track taste learning).
 // The strong/soft skip thresholds are derived from the "Skip sensitivity" tuning
 // slider (see _tSkipStrong/_tSkipSoft) rather than fixed constants.
 const FINISH_FRAC      = 0.80;  // heard ≥80% → engaged / liked
-const ADAPTIVE_LIKES_MAX = 8;   // rolling window of recently-engaged tracks that steer refills
 const ARTIST_DISLIKE_SCORE = -3; // net (skips − engaged listens) at/below this → avoid the artist
 // Durable cross-session taste profile (persisted to disk). Artist scores are clamped
 // so taste can always recover, and a track is only soft-banned once it's been hard-
@@ -120,14 +112,25 @@ function _lerp(a, b, t) { return a + (b - a) * _clampNum(t, 0, 1); }
 // Derived engine knobs — every feature reads these, never the raw slider values.
 function _tDiscoveryRatio() { return _clampNum(_tuning.freshness / 100, 0, 0.9); }
 function _tVariety()        { return _clampNum(_tuning.variety / 100, 0, 1); }
-function _tBandPad()        { return Math.round(_lerp(0, 25, _tVariety())); }      // ± widen feature band
+// Feeling-band padding. Variety sets the MAX widening (±0–25); moodFlow gates how
+// much of it actually applies. At moodFlow=0 (lock) we even TIGHTEN a little below
+// the raw mood range to keep it pure; at 100 (flow) the full Variety pad applies.
+// This is what makes "lock to mood" actually narrow the energy/valence window so a
+// low-energy sad song can't bleed into the high-energy Angsty band.
+function _tMoodPad()        { return Math.round(_lerp(-6, _lerp(0, 25, _tVariety()), _tuning.moodFlow / 100)); }
+function _tMoodFlow()       { return _clampNum(_tuning.moodFlow / 100, 0, 1); }     // 0 lock … 1 flow
 function _tDiscoveryGenres(){ return 2 + Math.round(_tVariety() * 3); }            // 2–5 genres searched
 function _tFlowOn()         { return _tuning.fadeSmooth >= 50; }                   // harmonic flow ordering
 function _tDriftThreshold() { return _lerp(0.45, 0.20, _tuning.moodFlow / 100); } // lock → flow
-function _tFlowLikeCount()  { return Math.round((_tuning.moodFlow / 100) * ADAPTIVE_LIKES_MAX); }
 function _tSkipStrong()     { return _lerp(0.08, 0.25, _tuning.skipSensitivity / 100); }
 function _tSkipSoft()       { return _lerp(0.35, 0.60, _tuning.skipSensitivity / 100); }
 function _tLookahead()      { return _clampNum(Math.round(_tuning.lookahead), 1, 10); }
+// Smart Queue window depth derives from the Lookahead slider: how many discovery
+// anchors form each window's spine, and how few slots may remain ahead of the
+// current track before we extend. Lookahead 1→10 maps to a shallow 3-anchor
+// queue … a deep 12-anchor queue.
+function _sqAnchorCount()   { return _clampNum(_tLookahead() + 2, 3, 12); }
+function _sqExtendAhead()   { return _clampNum(Math.ceil(_tLookahead() / 2), 2, 6); }
 
 // Validate + apply an incoming tuning patch, clamping each field to its range.
 function _applyTuning(patch = {}) {
@@ -216,14 +219,10 @@ function _markPlayed(id) {
   }
 }
 
-// URIs WE deliberately staged into the playback context (playFresh / rebuildUpcoming /
-// queueOnTop). Spotify's own Autoplay silently appends recommended tracks to the queue
-// once our finite uris-context nears its end; those injected tracks aren't in here. The
-// continuous engine counts only OUR upcoming tracks (ignoring autoplay) to decide when to
-// refill, and rebuildUpcoming drops anything not in here — so autoplay can't masquerade as
-// a full queue and starve the refill, and its picks get evicted on the next rebuild.
+// URIs WE deliberately staged into the playback context (queueOnTop / Smart Queue
+// window). Spotify's own Autoplay can silently append recommended tracks to the queue;
+// those injected tracks aren't in here, so we can tell our picks apart from autoplay's.
 let _stagedUris = new Set();
-let _refillFullLoggedAt = 0; // throttle for the "queue full" refill log
 function _setStaged(uris) { _stagedUris = new Set((uris || []).filter(Boolean)); }
 function _addStaged(uris) { for (const u of (uris || [])) if (u) _stagedUris.add(u); }
 
@@ -245,16 +244,12 @@ function _notePlayed(id) {
 function _isRecentlyPlayed(id) { return !!id && _recentPlayIds.includes(id); }
 
 // ── Adaptive engagement ───────────────────────────────────────────────────────
-// _recentLikes:  rolling features of tracks the user actually engaged with
-//                (finished / heard most of) — steers refills toward the flow.
-//                Session-scoped: reset when a session opens/closes.
 // _artistTaste:  lowercase artist → durable net score, PERSISTED across sessions.
 //                Each hard skip −1, each engaged listen +1 (clamped). An artist is
 //                avoided once the net hits ARTIST_DISLIKE_SCORE; later listens recover it.
 // _trackDislikes: trackId → durable hard-skip count, PERSISTED across sessions. A track
 //                is soft-banned once skipped TRACK_SOFTBAN_COUNT times; a full listen
 //                decays the count back down (recovery).
-let _recentLikes   = [];
 let _artistTaste   = new Map();
 let _trackDislikes = new Map();
 
@@ -605,10 +600,9 @@ function openActiveSession() {
     trackCount:       0,
     trackIds:         [],
   };
-  // Fresh session → fresh no-repeat memory and short-term flow signal.
+  // Fresh session → fresh no-repeat memory.
   // (Artist taste + track dislikes are durable now — they live in the taste profile.)
   _sessionTrackIds  = new Set();
-  _recentLikes      = [];
 }
 
 function closeActiveSession() {
@@ -624,7 +618,6 @@ function closeActiveSession() {
   _pendingCheckIn  = null;
   _lastCheckInAt   = 0;
   _sessionTrackIds  = new Set();
-  _recentLikes      = [];
   if (_activeFeeling) {
     _activeFeeling = null;
     if (_io) _io.emit('spotify:feeling_expired');
@@ -662,7 +655,6 @@ function saveLiveState() {
       sessionStats:     _sessionStats,
       activeSession:    _activeSession,
       sessionTrackIds:  [..._sessionTrackIds],
-      recentLikes:      _recentLikes,
       currentCluster:   _currentCluster,
       currentCentroid:  _currentCentroid,
       driftBuffer:      _driftBuffer,
@@ -697,7 +689,6 @@ function loadLiveState() {
       _sessionStats     = snap.sessionStats     || _sessionStats;
       _activeSession    = sess;
       _sessionTrackIds  = new Set(snap.sessionTrackIds  || []);
-      _recentLikes      = snap.recentLikes      || [];
       _currentCluster   = snap.currentCluster   || [];
       _currentCentroid  = snap.currentCentroid  || null;
       _driftBuffer      = snap.driftBuffer      || [];
@@ -761,7 +752,6 @@ function resetSessionState() {
   _pendingCheckIn   = null;
   _lastCheckInAt    = 0;
   _sessionTrackIds  = new Set();
-  _recentLikes      = [];
   _stagedUris       = new Set();
   _recentPlayIds    = [];     // fresh session = no recent-repeat history to guard against
   _transitionPrevId = null;   // new session = no prior track to chain a transition from
@@ -1503,28 +1493,6 @@ async function _queueTrack(t) {
   return true;
 }
 
-// Clear whatever is currently queued and start fresh playback with `tracks`.
-// Spotify has no clear-queue endpoint, so starting a new uris context is the
-// reliable way to discard the old (now-irrelevant) queue. Used when switching
-// vibe / mood / "right now" — the previous queue no longer applies.
-async function playFresh(tracks) {
-  let list = (tracks || []).filter(t => t && (t.uri || t.id));
-  if (!list.length) return 0;
-  // Stage the first track to play now + up to QUEUE_TARGET upcoming, so the
-  // queue never starts out longer than the cap. Refill tops it up later.
-  list = list.slice(0, QUEUE_TARGET + 1);
-  const uris = list.map(t => t.uri || `spotify:track:${t.id}`);
-  await play({ uris });
-  // This uris-context is now the authoritative queue; forget any previous staging
-  // (and any Spotify-autoplay tracks that may have been appended to the old context).
-  _setStaged(uris);
-  for (const t of list) {
-    const id = t.id || (t.uri && t.uri.startsWith('spotify:track:') ? t.uri.split(':').pop() : null);
-    _markPlayed(id);
-  }
-  return list.length;
-}
-
 // Put a track at the TOP of the queue (i.e. play it next, right after the
 // current song). Spotify's /queue endpoint only appends to the end and there's
 // no reorder API, so we rebuild the upcoming queue with the new track first and
@@ -1557,111 +1525,6 @@ async function queueOnTop(uri) {
   const id = uri.startsWith('spotify:track:') ? uri.split(':').pop() : null;
   _markPlayed(id);
   return true;
-}
-
-// Top the upcoming queue up to QUEUE_TARGET WITHOUT polluting Spotify's
-// user-added queue. Spotify's "Next in queue" (anything added via addToQueue)
-// can't be cleared through the API, so switching vibe/mood via play({uris})
-// leaves stale songs behind. To avoid that entirely we never addToQueue for
-// auto-features — instead we rebuild the playback context: keep the current
-// track playing (re-seeking to its position) and stage the existing upcoming
-// tracks plus enough fresh ones to reach the cap. The brief re-buffer this
-// causes lands on a track change, so it's barely noticeable.
-// Returns the number of NEW tracks staged (0 if nothing needed adding).
-async function rebuildUpcoming(freshTracks) {
-  let currentUri = null, progressMs = 0;
-  try {
-    const st = await getPlaybackState();
-    currentUri = st?.item?.uri || null;
-    progressMs = st?.progress_ms || 0;
-  } catch { /* no active playback */ }
-
-  // Existing upcoming = context tracks we previously staged (no user-queue,
-  // since we never addToQueue any more).
-  let upcoming = [];
-  try {
-    const q = await getQueue();
-    upcoming = (q?.queue || []).map(t => t && t.uri).filter(Boolean);
-  } catch { /* queue unavailable */ }
-  // Keep ONLY the upcoming tracks WE staged. Spotify Autoplay appends its own
-  // recommendations to our finite uris-context; if we preserved them they'd
-  // perpetuate (and crowd out the vibe). Dropping them here means the rebuilt
-  // context replaces autoplay's tail with our tracks.
-  // Keep only DISTINCT staged tracks. `_stagedUris` already excludes anything
-  // consumed (a track is dropped from it the moment it becomes current — see
-  // poll), so this preserves just the genuinely-upcoming staged tracks while
-  // collapsing the duplicates Spotify's looped look-ahead introduces.
-  {
-    const kept = [], seen = new Set();
-    for (const u of upcoming) {
-      if (!u || !_stagedUris.has(u) || seen.has(u)) continue;
-      seen.add(u);
-      kept.push(u);
-    }
-    upcoming = kept;
-  }
-  // Only keep as many existing upcoming as the cap allows.
-  upcoming = upcoming.slice(0, QUEUE_TARGET);
-
-  const need = QUEUE_TARGET - upcoming.length;
-  if (need <= 0) return 0; // already full — nothing to do, no rebuild/blip
-
-  const have = new Set([currentUri, ...upcoming].filter(Boolean));
-  const freshUris = [];
-  const freshByUri = new Map();
-  for (const t of (freshTracks || [])) {
-    const u = t.uri || (t.id ? `spotify:track:${t.id}` : null);
-    if (!u || have.has(u)) continue;
-    // Hard recent-repeat guard: never re-stage a song we played in the last
-    // RECENT_PLAY_GUARD tracks, even if a narrow vibe pool's never-starve fallback
-    // handed us already-played songs. Better to stage fewer than to repeat soon.
-    const id = u.startsWith('spotify:track:') ? u.split(':').pop() : null;
-    if (_isRecentlyPlayed(id)) continue;
-    freshUris.push(u); freshByUri.set(u, t); have.add(u);
-    if (freshUris.length >= need) break;
-  }
-  if (!freshUris.length) return 0; // nothing new to add — skip the rebuild/blip
-
-  // Combine the staged upcoming we kept with the fresh tracks, then — this is what
-  // keeps the queue ADAPTIVE — re-flow-order the whole upcoming run anchored to the
-  // track playing right now. A freshly found song that fits better (harmonically,
-  // BPM/energy-wise, or by a learned transition) than an already-staged one slots
-  // AHEAD of it instead of always landing at the tail. We only get here when we're
-  // adding (a play() rebuild is happening regardless), so the reorder is free.
-  const combined = [...upcoming, ...freshUris]; // ≤ QUEUE_TARGET
-  let nextUris = combined;
-  if (_tFlowOn() && combined.length > 1) {
-    const annotate = (u) => {
-      const id = u.startsWith('spotify:track:') ? u.split(':').pop() : null;
-      const t = freshByUri.get(u);
-      const f = (t && t.energy != null) ? t : (id ? _findStoredFeatures(id) : null);
-      return { uri: u, id, bpm: f?.bpm, energy: f?.energy, _cam: f ? _camelotPos(f.key, f.mode) : null };
-    };
-    const seed = currentUri ? annotate(currentUri) : null;
-    const remaining = combined.map(annotate);
-    const ordered = [];
-    let last = seed;
-    while (remaining.length) {
-      let best = 0, bestScore = -Infinity;
-      for (let i = 0; i < remaining.length; i++) {
-        const s = last ? _trackFlowScore(last, remaining[i]) : 0;
-        if (s > bestScore) { bestScore = s; best = i; }
-      }
-      ordered.push(remaining.splice(best, 1)[0]);
-      last = ordered[ordered.length - 1];
-    }
-    nextUris = ordered.map(o => o.uri);
-  }
-  if (currentUri) await play({ uris: [currentUri, ...nextUris], positionMs: progressMs });
-  else            await play({ uris: nextUris });
-
-  // This rebuilt context is now authoritative: current + the tracks we just staged.
-  _setStaged([currentUri, ...nextUris]);
-  for (const u of nextUris) {
-    const id = u.startsWith('spotify:track:') ? u.split(':').pop() : null;
-    _markPlayed(id);
-  }
-  return freshUris.length;
 }
 
 // Drop any tracks already played or queued during this session.
@@ -1723,17 +1586,9 @@ function _applyTasteBias(tracks) {
     .map(x => x.t);
 }
 
-// Remember a track the user engaged with so the next refills lean toward it.
-function _pushRecentLike(t) {
-  if (!t || t.energy == null) return;
-  _recentLikes = _recentLikes.filter(x => x.id !== t.id);
-  _recentLikes.push(t);
-  if (_recentLikes.length > ADAPTIVE_LIKES_MAX) _recentLikes.shift();
-}
-
 // Judge how the user felt about the track that just ended, from how much of it
 // they heard. `prev` is the previous poll's serialized state (the outgoing track).
-//   • finished / ≥80%      → engaged → feed _recentLikes, +1 artist score
+//   • finished / ≥80%      → engaged → +1 artist score, forgive past skips
 //   • <15%                 → strong dislike → avoid THIS song, −1 artist score
 //                            (artist only avoided once net hits a strong pattern)
 //   • 15–50%               → didn't fit the vibe → neutral (no like, no penalty)
@@ -1766,18 +1621,12 @@ function _evaluateEngagement(prev) {
 
   const frac     = pos / dur;
   const finished = frac >= FINISH_FRAC || (dur - pos) <= PROGRESS_DELTA_MAX;
-  const feat     = _findStoredFeatures(prev.track.id);
-  const likeRec  = feat ? {
-    id: prev.track.id, artist: prev.track.artist,
-    energy: feat.energy, valence: feat.valence, bpm: feat.bpm,
-  } : null;
 
   // The previous-to-this transition survived/failed based on how this track fared.
   const _prevId = _transitionPrevId;
   _transitionPrevId = prev.track.id;
 
   if (finished || frac >= _tSkipSoft()) {
-    if (likeRec) _pushRecentLike(likeRec);
     _adjustArtistScore(prev.track.artist, +1);   // engaged listen recovers the artist
     _recoverTrackDislike(prev.track.id);          // a full listen forgives a past skip
     _recordTransition(_prevId, prev.track.id, +1); // this sequencing worked — reinforce it
@@ -2765,6 +2614,36 @@ function _sqTargetOurs(anchorCount) {
   return _clampNum(ideal, Math.max(1, minU), Math.max(1, maxU));
 }
 
+// Familiar candidates drawn from the user's own library/history (the low-freshness
+// half of the search blend). Feature-bearing, ranked by durable artist taste so
+// loved artists surface first, ties shuffled. Excludes played/disliked/no-repeat.
+function _sqLibraryCandidates(count) {
+  const seen = new Set();
+  const pool = _excludeDisliked(combinedHistory().filter(t =>
+    t && t.id && t.energy != null &&
+    !_sq.noRepeat.has(t.id) && !_isRecentlyPlayed(t.id) &&
+    !seen.has(t.id) && seen.add(t.id)));
+  pool.sort((a, b) => (_artistBoost(b.artist) - _artistBoost(a.artist)) || (Math.random() - 0.5));
+  return pool.slice(0, count);
+}
+
+// Variety gate for the search/playlist path: prefer candidates whose audio features
+// sit within a Variety-scaled radius of the SEED track's sound. Low variety → songs
+// that sound like the seed; high → anything. In-radius picks come first; out-of-radius
+// and unjudgeable tracks trail as filler so we never starve.
+function _sqVarietyGate(tracks, seedId) {
+  const seedFeat = seedId ? _findStoredFeatures(seedId) : null;
+  if (!seedFeat || seedFeat.energy == null) return tracks;
+  const radius = _lerp(0.15, 1.0, _tVariety());     // _clusterDist is normalised 0..~1
+  const within = [], rest = [];
+  for (const t of tracks) {
+    const f = _trackFeatures(t);
+    if (!f || f.energy == null) { rest.push(t); continue; }   // unknown → allow as filler
+    (_clusterDist(seedFeat, f) <= radius ? within : rest).push(t);
+  }
+  return [...within, ...rest];
+}
+
 // Build a pool of OUR candidate tracks for the active session's source. Filtered
 // against this session's no-repeat memory, disliked artists and the recent-play
 // guard so nothing repeats too soon.
@@ -2779,11 +2658,23 @@ async function _sqBuildOurCandidates(count) {
       const rn = computeRightNow();
       tracks = rn.ready ? [...rn.topTracks] : [];
     } else {
-      // search / playlist / generic discovery — seed off the last-known track.
+      // search / playlist / generic discovery. The sliders shape this everyday path:
+      //   • Freshness  → split between NEW Spotify discovery and FAMILIAR library picks
+      //   • Variety    → how many seed artists we branch from, then a feature-radius gate
       const seedId = _sq.lastSeedId || _lastState?.track?.id || null;
-      const seedArtists = (_lastState?.track?.artistIds || []).slice(0, 2);
-      const raw = await getSimilarTracks(seedId ? [seedId] : [], seedArtists, count + 8);
-      tracks = _applyContextBias(raw);
+      const artistBreadth = 1 + Math.round(_tVariety() * 3);                 // 1–4 seed artists
+      const seedArtists = (_lastState?.track?.artistIds || []).slice(0, artistBreadth);
+
+      const fresh    = _tDiscoveryRatio();                                   // 0..0.9 = share NEW
+      const discCount = Math.max(0, Math.round(count * fresh));
+      const libCount  = Math.max(0, count - discCount);
+
+      const disc = discCount > 0
+        ? _applyContextBias(await getSimilarTracks(seedId ? [seedId] : [], seedArtists, discCount + 8))
+        : [];
+      const lib = libCount > 0 ? _sqLibraryCandidates(libCount + 8) : [];
+
+      tracks = _sqVarietyGate([...lib.slice(0, libCount + 4), ...disc.slice(0, discCount + 4)], seedId);
     }
   } catch (err) {
     console.error('[SmartQueue] Candidate build failed:', err.message);
@@ -2799,16 +2690,20 @@ async function _sqBuildOurCandidates(count) {
 // memory, disliked artists and the recent-play guard.
 async function _sqBuildSpotifyAnchors(count) {
   let tracks = [];
+  const seedId = _sq?.lastSeedId || _lastState?.track?.id || null;
   try {
-    const seedId = _sq?.lastSeedId || _lastState?.track?.id || null;
-    const seedArtists = (_lastState?.track?.artistIds || []).slice(0, 2);
+    const artistBreadth = 1 + Math.round(_tVariety() * 3);                 // 1–4 seed artists
+    const seedArtists = (_lastState?.track?.artistIds || []).slice(0, artistBreadth);
     const raw = await getSimilarTracks(seedId ? [seedId] : [], seedArtists, count + 10);
     tracks = raw || [];
   } catch (err) {
     console.error('[SmartQueue] Anchor build failed:', err.message);
   }
-  return _excludeDisliked(tracks || []).filter(t =>
+  const filtered = _excludeDisliked(tracks || []).filter(t =>
     t && t.id && !_sq.noRepeat.has(t.id) && !_isRecentlyPlayed(t.id));
+  // Variety also gates the discovery spine: low variety keeps anchors close to the
+  // seed's sound, high variety lets them roam.
+  return _sqVarietyGate(filtered, seedId);
 }
 
 // Plan the interleaving: keep the Spotify anchors in fixed order and insert our
@@ -2928,6 +2823,23 @@ function _sqStop(reason) {
   _sqSetFastPoll(false);
 }
 
+// Clear the playback queue on a MANUAL change (new song / playlist / mood / vibe).
+// The Spotify Web API has no "clear queue" endpoint, so the only reliable,
+// non-disruptive mechanism is the fresh `play()` the caller issues right after:
+//   • a `uris` play (search / mood / vibe / right-now seed) replaces the queue
+//     with exactly that list — anything we previously queued is dropped;
+//   • a `context_uri` play (playlist / album) starts a brand-new context.
+// This helper handles everything ELSE that must reset in lockstep: it stops any
+// running Smart Queue session and wipes our internal staged-track accounting and
+// auto-queue counter, so no stale picks from the previous selection linger in
+// our bookkeeping or get re-queued. Call it on EVERY manual change, BEFORE the
+// new play().
+function _sqClearQueue(reason) {
+  _sqStop(reason);
+  _setStaged([]);
+  _autoQueueCount = 0;
+}
+
 // Start playback from a single seed track. Playing with a fresh `uris` array
 // replaces the current context AND clears Spotify's user queue, so this is also
 // how a new session wipes the previous window's leftovers. We do NOT touch
@@ -2939,9 +2851,12 @@ async function _sqPlaySeedContext(seedUri) {
   console.log(`[SmartQueue] Seeded "${seedUri}" — queue cleared; engine will populate Up Next`);
 }
 
-// Play a single seed track and hand off to Smart Queue.
+// Play a single seed track and hand off to Smart Queue. Clears the queue first
+// (stops any prior session + wipes staged accounting) so a manual change never
+// leaves the previous selection's picks lingering in Up Next.
 async function _sqStartFromSeed(source, seedUri, seedTrack, weave = true) {
   if (!seedUri) return;
+  _sqClearQueue(`new-${source}`);
   await _sqPlaySeedContext(seedUri);
   _sqStart(source, seedTrack || { uri: seedUri, id: seedUri.split(':').pop() }, weave);
 }
@@ -2979,7 +2894,8 @@ async function _sqBuildAndEnqueueWindow(state, reason) {
   _sq.building = true;
   try {
     const cur = state.track;
-    const anchors = (await _sqBuildSpotifyAnchors(SQ_SPOTIFY_READ)).slice(0, SQ_SPOTIFY_READ).map(_sqAnnotate);
+    const anchorN = _sqAnchorCount(); // Lookahead-derived window depth
+    const anchors = (await _sqBuildSpotifyAnchors(anchorN)).slice(0, anchorN).map(_sqAnnotate);
     const targetU = _sqTargetOurs(anchors.length || 1);
     let pool = [];
     if (targetU > 0) {
@@ -3014,7 +2930,8 @@ async function _sqExtendWindow(state) {
   try {
     const last = _sq.window[_sq.window.length - 1];
     const bridgeLeft = _sqAnnotate(last?.track || state.track);
-    const anchors = (await _sqBuildSpotifyAnchors(SQ_SPOTIFY_READ)).slice(0, SQ_SPOTIFY_READ).map(_sqAnnotate);
+    const anchorN = _sqAnchorCount(); // Lookahead-derived window depth
+    const anchors = (await _sqBuildSpotifyAnchors(anchorN)).slice(0, anchorN).map(_sqAnnotate);
     if (!anchors.length) { console.log('[SmartQueue] Extend: no fresh anchors available'); return; }
     const targetU = _sqTargetOurs(anchors.length || 1);
     let pool = [];
@@ -3072,18 +2989,28 @@ async function _sqTick(state) {
     await _sqBuildAndEnqueueWindow(state, 'diverged');
     return;
   }
+  const prevPos = _sq.pos;
   _sq.pos = pos;
   for (let i = 0; i <= pos; i++) _sq.window[i].played = true;
 
   const firstSeen = _sq.lastTickTrackId !== curUri; // debounce heavy work to once/track
   _sq.lastTickTrackId = curUri;
 
+  // Song switched to a new slot in our window — log the move + the full queue so
+  // the engine's progress is visible in the console on every track change.
+  if (firstSeen && pos !== prevPos) {
+    const slot = _sq.window[pos];
+    const tag  = slot?.source === 'ours' ? 'OURS' : 'SPOTIFY';
+    console.log(`[SmartQueue] ▶ Now playing slot ${pos + 1}/${_sq.window.length} [${tag}] "${_sqName(state.track)}"`);
+    _sqLogWindow('Queue');
+  }
+
   // Keep Up Next populated (covers retries from any earlier addToQueue failure).
   await _sqEnqueueUpcoming();
 
   // Extend before we run dry.
   const remaining = _sq.window.length - 1 - pos;
-  if (firstSeen && remaining <= SQ_EXTEND_AHEAD) {
+  if (firstSeen && remaining <= _sqExtendAhead()) {
     console.log(`[SmartQueue] ${remaining} slot(s) remain → extending window`);
     await _sqExtendWindow(state);
   }
@@ -3386,10 +3313,13 @@ function moodForFeeling(feelingKey) {
 
 // Energy/valence acceptance window for a feeling, widened by the Variety tolerance.
 function _feelingBand(def) {
-  const pad = _tBandPad(); // 0 → 25, scaled off the Variety slider
+  const pad = _tMoodPad(); // moodFlow gates Variety's widening (lock tightens, flow widens)
+  // Clamp to 0–100 and guard against a negative pad inverting a narrow band.
+  const eMin = _clampNum(def.energy[0]  - pad, 0, 100), eMax = _clampNum(def.energy[1]  + pad, 0, 100);
+  const vMin = _clampNum(def.valence[0] - pad, 0, 100), vMax = _clampNum(def.valence[1] + pad, 0, 100);
   return {
-    eMin: def.energy[0]  - pad, eMax: def.energy[1]  + pad,
-    vMin: def.valence[0] - pad, vMax: def.valence[1] + pad,
+    eMin: Math.min(eMin, eMax), eMax: Math.max(eMin, eMax),
+    vMin: Math.min(vMin, vMax), vMax: Math.max(vMin, vMax),
   };
 }
 
@@ -3478,7 +3408,15 @@ async function _gateDiscovery(tracks, verdict, limit) {
     // v === false → known off-vibe, dropped
   }
   const out = onVibe.slice(0, limit);
-  for (const t of unknown) { if (out.length >= limit) break; out.push(t); }
+  // Unjudgeable (features-unknown) tracks are a gamble — they MIGHT be off-mood.
+  // moodFlow gates how many we allow as filler: locked → few (stay pure, accept a
+  // shorter batch), flow → fill freely so we never starve.
+  let unknownBudget = Math.round((limit - out.length) * _lerp(0.2, 1, _tMoodFlow()));
+  for (const t of unknown) {
+    if (out.length >= limit || unknownBudget <= 0) break;
+    out.push(t);
+    unknownBudget--;
+  }
   return out;
 }
 
@@ -4048,124 +3986,6 @@ function _updateCluster(histEntry) {
 }
 
 // ---------------------------------------------------------------------------
-// Continuous queue refill — called on every track change when a mood/vibe is active
-// ---------------------------------------------------------------------------
-
-async function maybeRefillContinuousQueue(state) {
-  if (!_activeMoodKey && !_activeVibeKey && !_activeFeeling) return;
-  const label = _activeFeeling?.label || _activeMoodKey || _activeVibeKey;
-  try {
-    const queueData = await getQueue();
-    const rawLen = queueData?.queue?.length || 0;
-    // Count only the tracks WE staged. Spotify Autoplay quietly appends its own
-    // recommendations to our finite uris-context, so the raw queue length can stay
-    // ≥ QUEUE_TARGET forever and would permanently short-circuit the refill (the
-    // user then hears autoplay's picks, not the vibe, and the cluster — fed by our
-    // feature-bearing tracks — appears frozen). Gating on OUR upcoming count fixes both.
-    // Count DISTINCT staged tracks still in the look-ahead. Spotify loops our
-    // finite uris-context, so the same staged URI shows up many times (raw=17 for
-    // 6 staged); counting occurrences pinned `ours` above QUEUE_TARGET forever and
-    // the refill never fired. `_stagedUris` only ever holds not-yet-played upcoming
-    // (each track is removed the moment it becomes the current track — see poll),
-    // so a distinct count here is the true number of fresh slots ahead, draining
-    // toward 0 as songs play.
-    const _seenUris = new Set();
-    for (const t of (queueData?.queue || [])) {
-      const uri = t?.uri;
-      if (uri && _stagedUris.has(uri)) _seenUris.add(uri);
-    }
-    const ours = _seenUris.size;
-    if (ours >= QUEUE_TARGET) {
-      // Already full of our tracks — nothing to do. Log occasionally (≤ every 30 s) so
-      // a "stuck full" state is visible without spamming.
-      const now = Date.now();
-      if (now - _refillFullLoggedAt > 30000) {
-        _refillFullLoggedAt = now;
-        console.log(`[Spotify] Refill: queue full — ${ours}/${QUEUE_TARGET} ours (raw=${rawLen}, staged=${_stagedUris.size}) (${label})`);
-      }
-      return;
-    }
-
-    const need = QUEUE_TARGET - ours;
-    console.log(`[Spotify] Refill: ${ours}/${QUEUE_TARGET} ours in queue (raw=${rawLen}, staged=${_stagedUris.size}) — need ${need} more (${label})`);
-
-    // Over-fetch so disliked/already-played drops still leave enough to reach the cap.
-    const refillCount = need + 3;
-
-    // 1) Primary source: the active vibe / mood / feeling pool.
-    let tracks;
-    if (_activeFeeling) {
-      // Feeling is the baseline, but go with the flow: blend in the tracks the user is
-      // actually engaging with right now. The Mood-lock↔Flow slider controls how many
-      // recent likes get mixed in (0 = stay locked to the feeling, more = follow the vibe).
-      const flowLikes = _recentLikes.slice(-_tFlowLikeCount());
-      const adaptive = [...flowLikes, ...(_activeFeeling.clusterTracks || [])];
-      tracks = await buildFeelingPlaylist(_activeFeeling.key, adaptive, refillCount);
-    } else if (_activeMoodKey) {
-      tracks = await buildMoodPlaylist(_activeMoodKey, refillCount);
-    } else {
-      tracks = await buildVibePlaylist(_activeVibeKey, refillCount);
-    }
-    tracks = tracks || [];
-
-    // 2) Prefer genuinely fresh (unplayed, undisliked) tracks.
-    let fresh = _excludeDisliked(_excludePlayed(tracks));
-
-    // 3) If the vibe pool can't supply enough NEW tracks — a small or already-exhausted
-    //    cluster will keep returning the same played songs — pull from similar / the
-    //    user's top tracks so the queue still reaches the cap with new material. (The old
-    //    code only did this when the builder returned *empty*; an exhausted cluster
-    //    returns played replays instead, so we never got here and the queue starved.)
-    if (fresh.length < need) {
-      const seed = state?.track?.id ? [state.track.id] : [];
-      const more = await getSimilarTracks(seed, [], need + 8).catch(() => []);
-      const moreFresh = _excludeDisliked(_excludePlayed(more));
-      const seen = new Set(fresh.map(t => t && t.id).filter(Boolean));
-      for (const t of moreFresh) {
-        if (t && t.id && !seen.has(t.id)) { fresh.push(t); seen.add(t.id); }
-      }
-    }
-
-    // 3b) Final safety net: drop anything that CONTRADICTS the active mood/vibe before
-    //     it can be staged. The builders already gate discovery, but the similar-track
-    //     top-up above (and any never-starve replay below) bypass that — this is the
-    //     backstop. Unknown-feature tracks are kept (can't judge); only proven off-vibe
-    //     songs are removed, and only when on-vibe candidates remain so we never starve.
-    const _verdict = _activeVibeVerdict();
-    if (_verdict && fresh.length) {
-      const warm = fresh
-        .filter(t => t && t.id && t.energy == null && !_findStoredFeatures(t.id))
-        .map(t => t.id).slice(0, 24);
-      if (warm.length) { try { await getBatchAudioFeatures(warm); } catch { /* best-effort */ } }
-      const onVibe = fresh.filter(t => _verdict(t) !== false); // keep on-vibe + unknown
-      if (onVibe.length) {
-        if (onVibe.length < fresh.length) {
-          console.log(`[Spotify] Refill: dropped ${fresh.length - onVibe.length} off-vibe track(s) (${label})`);
-        }
-        fresh = onVibe;
-      }
-    }
-
-    // 4) Never starve: if everything's been played, relax step by step so the music
-    //    keeps going (allow replays, then anything playable) rather than stopping dead.
-    if (!fresh.length) fresh = _excludeDisliked(tracks);
-    if (!fresh.length) fresh = tracks;
-
-    // Stage via context rebuild (no addToQueue) so the queue stays clearable.
-    const added = await rebuildUpcoming(fresh);
-    if (added > 0) {
-      console.log(`[Spotify] Continuous refill +${added} tracks (${label}) → queue now full`);
-      // Let the Queue widget flash its "Auto" pill to show it just topped up.
-      try { _io.emit('spotify:queue_managed', { active: true, added, label }); } catch {}
-    } else {
-      console.log(`[Spotify] Refill: nothing new to stage — pool exhausted for ${label} (had ${fresh.length} candidates, all already queued/played)`);
-    }
-  } catch (err) {
-    console.error('[Spotify] Continuous refill error:', err.message);
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Analysis functions
 // ---------------------------------------------------------------------------
 
@@ -4451,10 +4271,8 @@ async function poll() {
 
       // Reset progress cursor on track change to avoid a spurious delta
       if (trackChanged) {
-        // The track now playing is consumed: drop it from our staged set so the
-        // refill gate sees one fewer fresh slot ahead. Without this, Spotify's
-        // looped look-ahead keeps the played track "upcoming" and the queue never
-        // drains below QUEUE_TARGET, so the refill never fires.
+        // The track now playing is consumed: drop it from our staged set so our
+        // bookkeeping reflects one fewer fresh slot ahead.
         if (state.track?.uri) _stagedUris.delete(state.track.uri);
         // Record it in the recent-play window so it can't be re-staged for a while.
         _notePlayed(state.track?.id);
@@ -4574,20 +4392,12 @@ async function poll() {
 
       _lastTrackId = state.track.id;
 
-      // Keep the continuous queue topped up on EVERY poll (not just on track
-      // changes) so the queue can never run dry — if a change is missed or the
-      // context drains, the next poll (≤5 s) refills it. The function's own
-      // "ours >= QUEUE_TARGET" gate makes this a cheap no-op when already full,
-      // so there's no extra re-buffering versus the per-track-change call.
+      // Smart Queue owns the queue while it's active — it drives all just-in-time
+      // insertion, anomaly checks, and window recompute itself on every poll, so
+      // the queue can never run dry (a missed track change is caught ≤5 s later).
       if (state.isPlaying && _sq) {
-        // Smart Queue owns the queue while a session is active — it drives all
-        // just-in-time insertion, anomaly checks, and window recompute itself.
         await _sqTick(state).catch((err) =>
           console.error('[SmartQueue] tick error:', err.message)
-        );
-      } else if (state.isPlaying && (_activeMoodKey || _activeVibeKey || _activeFeeling)) {
-        maybeRefillContinuousQueue(state).catch((err) =>
-          console.error('[Spotify] Continuous refill error:', err.message)
         );
       }
     } else {
@@ -4682,8 +4492,10 @@ function stopPolling() {
 // Smart Queue toggle is ON, the poll loop's playlist-end detector arms a Smart
 // Queue session that weaves our picks into Spotify's native autoplay stream.
 async function playPlaylist(playlistUri /*, playlistId */) {
-  // Any prior Smart Queue session is now superseded by an explicit playlist play.
-  _sqStop('playlist-play');
+  // Manual playlist change → clear the queue (stop any Smart Queue session + wipe
+  // staged accounting) so the previous selection's picks don't linger, then start
+  // the fresh playlist context.
+  _sqClearQueue('playlist-play');
   await play({ contextUri: playlistUri });
   await setShuffle(true);
   await setRepeat('off');
@@ -4744,11 +4556,12 @@ function init(io) {
                 // ours) so the music keeps going. A bare uris-play won't autoplay
                 // via the Web API, so we source pure Spotify recommendations and
                 // enqueue them ourselves — but add nothing of our own.
-                _sqStop('toggle-off-search');
+                // (_sqStartFromSeed clears the queue first.)
                 await _sqStartFromSeed('search', args.uris[0], null, false);
               }
             } else {
-              _sqStop('multi-uri-play');
+              // Manual multi-track / context play → clear the queue, then play.
+              _sqClearQueue('multi-uri-play');
               await play(args);
             }
             setTimeout(emitQueue, 2000);
@@ -5252,7 +5065,7 @@ function init(io) {
       // A check-in answer is a LABEL, not a command. The user is telling us "I've
       // been feeling like this while listening to these songs" — so we just record
       // the association (it trains the slot prediction) and leave whatever is
-      // currently playing completely untouched. No new queue, no playFresh.
+      // currently playing completely untouched. No new queue.
       _recordFeeling(feeling, _pendingCheckIn.fingerprint, _pendingCheckIn.clusterSnapshot);
       _pendingCheckIn = null;
 

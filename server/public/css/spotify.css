@@ -1148,7 +1148,7 @@
   display: flex;
   gap: 6px;
   flex-shrink: 0;
-  justify-content: center;
+  justify-content: flex-start; /* fancy control anchored to the left corner */
 }
 
 /* ── Player responsive tiers — keep all rows inside the panel ─────────────── */
@@ -1174,29 +1174,39 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 3px;
-  padding: 2px 8px;
-  border-radius: 14px;
-  border: 1px solid rgba(255,255,255,0.12);
-  background: rgba(255,255,255,0.05);
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: 18px;
+  border: 1px solid rgba(255,255,255,0.14);
+  background: linear-gradient(135deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03));
   color: var(--text-3, #888);
-  font-size: 9px;
-  font-weight: 600;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
   cursor: pointer;
-  transition: color 0.15s, background 0.15s, border-color 0.15s;
+  transition: color 0.15s, background 0.15s, border-color 0.15s, box-shadow 0.2s;
   white-space: nowrap;
 }
 .sp-smart-btn svg {
-  width: 9px;
-  height: 9px;
+  width: 14px;
+  height: 14px;
   flex-shrink: 0;
 }
 .sp-smart-btn.active {
-  color: var(--sp-green, #1DB954);
-  background: rgba(29,185,84,0.12);
-  border-color: rgba(29,185,84,0.35);
+  color: #fff;
+  background: linear-gradient(135deg, rgba(29,185,84,0.32), rgba(29,185,84,0.12));
+  border-color: rgba(29,185,84,0.55);
+  box-shadow: 0 0 12px rgba(29,185,84,0.35), inset 0 0 6px rgba(29,185,84,0.18);
 }
-.sp-smart-btn:hover { color: var(--text, #fff); }
+.sp-smart-btn.active svg { color: var(--sp-green, #1DB954); }
+.sp-smart-btn:hover {
+  color: var(--text, #fff);
+  border-color: rgba(255,255,255,0.28);
+  box-shadow: 0 0 10px rgba(255,255,255,0.12);
+}
+.sp-smart-btn.active:hover {
+  box-shadow: 0 0 16px rgba(29,185,84,0.5), inset 0 0 6px rgba(29,185,84,0.22);
+}
 
 /* =============================================================================
    PLAYLIST DETAIL — BPM filter bar
