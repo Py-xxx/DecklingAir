@@ -168,6 +168,12 @@ let _currentPollInterval = POLL_INTERVAL; // tracks which interval _pollTimer is
 // Smart Queue engine section (window[], pos, noRepeat, ourUris, …).
 let _sq = null;
 let _sqSessionSeq = 0; // monotonically increasing session id for logging
+// Reusable hidden playlist used to seed playback. The Spotify Web API does NOT
+// trigger native autoplay when you play a bare track list (`uris`) — it only
+// continues from a *context* (album/artist/playlist). So we drop the seed track
+// into this one playlist and play it as a context; Spotify autoplay then fills
+// the queue with anchors we weave into. Created once, reused forever.
+let _sqSeedPlaylistId = null;
 
 let _userProfile = null;
 let _userId = null;
@@ -464,6 +470,7 @@ function loadUserPrefs() {
       const prefs = JSON.parse(fs.readFileSync(USER_PREFS_FILE, 'utf8'));
       if (prefs.checkInAuto != null) _checkInAutoEnabled = !!prefs.checkInAuto;
       if (prefs.smartQueue != null) _smartQueueEnabled = !!prefs.smartQueue;
+      if (prefs.sqSeedPlaylistId) _sqSeedPlaylistId = prefs.sqSeedPlaylistId;
       if (prefs.tuning && typeof prefs.tuning === 'object') {
         _applyTuning(prefs.tuning);
       }
@@ -474,7 +481,7 @@ function loadUserPrefs() {
 function saveUserPrefs() {
   try {
     fs.mkdirSync(path.dirname(USER_PREFS_FILE), { recursive: true });
-    fs.writeFileSync(USER_PREFS_FILE, JSON.stringify({ checkInAuto: _checkInAutoEnabled, smartQueue: _smartQueueEnabled, tuning: _tuning }, null, 2));
+    fs.writeFileSync(USER_PREFS_FILE, JSON.stringify({ checkInAuto: _checkInAutoEnabled, smartQueue: _smartQueueEnabled, sqSeedPlaylistId: _sqSeedPlaylistId, tuning: _tuning }, null, 2));
   } catch (err) { console.error('[Spotify] Failed to save user prefs:', err.message); }
 }
 
@@ -1796,43 +1803,6 @@ function _evaluateEngagement(prev) {
   console.log(`[Spotify] Engagement: vibe mismatch (${Math.round(frac * 100)}%) "${prev.track.title}"`);
 }
 
-/**
- * Play a single search track with continuation tracks bundled in the same
- * play() call as a mini-playlist, so Spotify has full context and keeps
- * playing when the track ends — no queue manipulation needed.
- */
-async function playWithContinuation(uri) {
-  const trackId = uri.split(':').pop();
-  let continuationUris = [];
-
-  // getSimilarTracks already has a multi-tier fallback; just unwrap URIs.
-  // Skip anything already played/queued this session so continuation doesn't repeat.
-  try {
-    const similar = await getSimilarTracks([trackId], [], QUEUE_TARGET + 10);
-    // Prefer tracks not yet played this session; but if /recommendations is dead
-    // and the top-tracks fallback is all already-played, replay rather than stop
-    // dead — a queue that keeps going beats silence.
-    let pool = _excludePlayed(similar);
-    if (!pool.length) pool = similar;
-    // Cap to QUEUE_TARGET upcoming so a search-play doesn't stage a huge queue.
-    continuationUris = pool.map(t => t.uri).filter(u => u && u !== uri).slice(0, QUEUE_TARGET);
-    if (continuationUris.length) console.log(`[Spotify] Continuation: ${continuationUris.length} similar tracks`);
-  } catch (e) {
-    console.warn('[Spotify] Continuation tracks unavailable:', e.message);
-  }
-
-  // Play selected track first; if we have continuation tracks bundle them in
-  // the same call so Spotify treats it as a playlist context
-  if (continuationUris.length) {
-    await play({ uris: [uri, ...continuationUris] });
-    _setStaged([uri, ...continuationUris]);
-  } else {
-    console.warn('[Spotify] No continuation tracks found — playing single track');
-    await play({ uris: [uri] });
-    _setStaged([uri]);
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Library API wrappers
 // ---------------------------------------------------------------------------
@@ -2186,6 +2156,13 @@ async function unlikeTrack(trackUri) {
 async function addTracksToPlaylist(playlistId, uris) {
   // Feb 2026: POST /playlists/{id}/tracks → POST /playlists/{id}/items
   return api('POST', `/playlists/${playlistId}/items`, { body: { uris } });
+}
+
+// Replace ALL items in a playlist (PUT). Used by the Smart Queue seed playlist so
+// each seed cleanly overwrites the previous one (the playlist always holds exactly
+// the current seed track).
+async function replacePlaylistItems(playlistId, uris) {
+  return api('PUT', `/playlists/${playlistId}/items`, { body: { uris } });
 }
 
 async function createPlaylist(userId, name, description = '') {
@@ -2941,12 +2918,65 @@ function _sqStop(reason) {
   _sqSetFastPoll(false);
 }
 
-// Play a single seed track and hand off to Smart Queue. Spotify autoplay
-// continues from this one track once it ends, giving us anchors to weave into.
-async function _sqStartFromSeed(source, seedUri, seedTrack) {
+// Ensure the reusable hidden seed playlist exists; return its id (or null on
+// failure). Created once and remembered in user-prefs so we never spam new ones.
+async function _sqEnsureSeedPlaylist() {
+  if (_sqSeedPlaylistId) {
+    // Cheap validity check — if it 404s (user deleted it), recreate below.
+    try { await api('GET', `/playlists/${_sqSeedPlaylistId}`, { params: { fields: 'id' } }); return _sqSeedPlaylistId; }
+    catch { _sqSeedPlaylistId = null; }
+  }
+  try {
+    if (!_userId) await getUserProfile();
+    if (!_userId) return null;
+    const pl = await createPlaylist(
+      _userId,
+      'Smart Queue seed (auto)',
+      'Used by your dashboard to seed Spotify autoplay. Safe to ignore — it only ever holds the current seed track.'
+    );
+    _sqSeedPlaylistId = pl?.id || null;
+    if (_sqSeedPlaylistId) { saveUserPrefs(); console.log(`[SmartQueue] Created seed playlist ${_sqSeedPlaylistId}`); }
+    return _sqSeedPlaylistId;
+  } catch (err) {
+    console.error('[SmartQueue] Could not create seed playlist:', err.message);
+    return null;
+  }
+}
+
+// Start playback from a single seed track in a way that triggers Spotify's native
+// autoplay. The Web API only autoplays from a *context*, so we drop the seed into
+// our reusable playlist and play that. Falls back to a bare uris-play (no autoplay)
+// only if the playlist can't be created. Used by BOTH toggle states.
+async function _sqPlaySeedContext(seedUri) {
   if (!seedUri) return;
+  const playlistId = await _sqEnsureSeedPlaylist();
+  if (playlistId) {
+    try {
+      await replacePlaylistItems(playlistId, [seedUri]);
+      // Brief pause so the playlist edit propagates before we play the context.
+      await new Promise(r => setTimeout(r, 500));
+      await play({ contextUri: `spotify:playlist:${playlistId}` });
+      // Repeat MUST be off — a single-track context on repeat loops forever and
+      // Spotify autoplay never triggers (this is the "plays one song over and
+      // over" symptom). Shuffle off too (irrelevant for one track, but tidy).
+      try { await setRepeat('off'); await setShuffle(false); } catch { /* non-fatal */ }
+      _setStaged([seedUri]);
+      console.log(`[SmartQueue] Seeded via playlist context — "${seedUri}" → Spotify autoplay will follow`);
+      return;
+    } catch (err) {
+      console.error('[SmartQueue] Seed-playlist play failed, falling back to uris:', err.message);
+    }
+  }
+  // Fallback: plain track play (Spotify will NOT autoplay from this — last resort).
   await play({ uris: [seedUri] });
   _setStaged([seedUri]);
+}
+
+// Play a single seed track and hand off to Smart Queue. Spotify autoplay
+// continues from the seed once it ends, giving us anchors to weave into.
+async function _sqStartFromSeed(source, seedUri, seedTrack) {
+  if (!seedUri) return;
+  await _sqPlaySeedContext(seedUri);
   _sqStart(source, seedTrack || { uri: seedUri, id: seedUri.split(':').pop() });
 }
 
@@ -4574,10 +4604,14 @@ async function poll() {
           // so we start weaving our picks into the autoplay stream.
           if (_smartQueueEnabled && !_sq) {
             const prevCtx = _lastState?.context?.type;
+            const prevUri = _lastState?.context?.uri;
             const nowCtx  = state.context?.type;
             const wasListContext = prevCtx === 'playlist' || prevCtx === 'album';
             const ctxDropped = !nowCtx || nowCtx !== prevCtx;
-            if (wasListContext && ctxDropped) {
+            // Never treat our own seed playlist as a "real" playlist ending — that
+            // would re-arm on every seed (and break the pure-Spotify OFF path).
+            const isOurSeed = _sqSeedPlaylistId && prevUri === `spotify:playlist:${_sqSeedPlaylistId}`;
+            if (wasListContext && ctxDropped && !isOurSeed) {
               console.log('[SmartQueue] Playlist/album ended → arming Smart Queue (playlist entry)');
               _sqStart('playlist', state.track);
             }
@@ -4766,13 +4800,15 @@ function init(io) {
             // Single track from search.
             if (args.uris?.length === 1 && !args.contextUri) {
               if (_smartQueueEnabled) {
-                // Smart Queue ON → play the seed, let Spotify autoplay fill, then
-                // weave our picks into that stream.
+                // Smart Queue ON → seed via playlist context (so Spotify autoplay
+                // fills the queue), then weave our picks into that stream.
                 await _sqStartFromSeed('search', args.uris[0]);
               } else {
-                // Toggle OFF → plain Spotify autoplay (continuation bundle).
+                // Toggle OFF → hand the wheel entirely to Spotify. We still seed
+                // via the playlist context so Spotify's NATIVE autoplay takes over
+                // (a bare uris-play would just stop). We add nothing of our own.
                 _sqStop('toggle-off-search');
-                await playWithContinuation(args.uris[0]);
+                await _sqPlaySeedContext(args.uris[0]);
               }
             } else {
               _sqStop('multi-uri-play');
