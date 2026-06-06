@@ -1157,18 +1157,25 @@ let _spotifyGap = 220;                 // current spacing between requests (ms)
 const SPOTIFY_GAP_MIN = 220;
 const SPOTIFY_GAP_MAX = 8000;
 const SPOTIFY_MAX_RETRIES = 3;
-// A 429 pauses EVERY request globally (circuit breaker) until this timestamp.
-// Capped so a punitive multi-hour Retry-After can't wedge the whole app — once
-// the cap lapses we make a single probe; if still banned we just pause again.
-let _spotifyPauseUntil = 0;
-const SPOTIFY_PAUSE_MAX = 120000;      // never pause longer than 2 min per step
+// A 429 engages a circuit-breaker pause until these timestamps. We keep the two
+// tiers SEPARATE so that a rate-limit triggered by BACKGROUND seeding (history,
+// top-tracks, library warm) only stalls more background work — the interactive
+// player / queue / playlist requests the user is staring at keep flowing. Only a
+// 429 on a high-priority request itself pauses the high tier, and even then only
+// briefly so the UI recovers fast. Both are capped so a punitive multi-hour
+// Retry-After can't wedge the app — once a cap lapses we probe again.
+let _spotifyPauseLowUntil  = 0;        // background work waits this out
+let _spotifyPauseHighUntil = 0;        // interactive work waits this out (kept short)
+const SPOTIFY_PAUSE_MAX      = 120000; // background: never pause longer than 2 min per step
+const SPOTIFY_HIGH_PAUSE_MAX = 8000;   // interactive: recover within a few seconds
 
 const _sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// True while a 429 cooldown is in effect — background jobs check this and skip
-// a cycle entirely rather than queuing work that will just be paused/dropped.
+// True while a background 429 cooldown is in effect — background jobs check this
+// and skip a cycle entirely rather than queuing work that will just be paused.
+// (Interactive requests are NOT gated by this — they always get to run.)
 function _spotifyRateLimited() {
-  return Date.now() < _spotifyPauseUntil;
+  return Date.now() < _spotifyPauseLowUntil;
 }
 
 // Two-tier priority queue. Interactive requests (queue/playlists/search/poll)
@@ -1200,15 +1207,27 @@ function _drainSpotify() {
   (async () => {
     try {
       while (_spotifyHigh.length || _spotifyLow.length) {
-        // Global circuit breaker: wait out any active rate-limit pause before
-        // touching the API at all. Re-check in slices so a pause extended by a
-        // fresh 429 is honoured too.
-        let pauseLeft = _spotifyPauseUntil - Date.now();
-        while (pauseLeft > 0) {
-          await _sleep(Math.min(pauseLeft, 1000));
-          pauseLeft = _spotifyPauseUntil - Date.now();
+        const now = Date.now();
+        // Pick the next runnable job, ALWAYS preferring the high (interactive)
+        // tier. Each tier honours only its OWN circuit-breaker pause, so a
+        // background rate-limit can't stall the player/queue/playlist requests.
+        let job = null;
+        if (_spotifyHigh.length && now >= _spotifyPauseHighUntil) {
+          job = _spotifyHigh.shift();
+        } else if (_spotifyLow.length && now >= _spotifyPauseLowUntil) {
+          job = _spotifyLow.shift();
         }
-        const job = _spotifyHigh.length ? _spotifyHigh.shift() : _spotifyLow.shift();
+        if (!job) {
+          // Everything currently queued is paused — sleep until the soonest
+          // applicable pause lifts (re-checked in ≤1 s slices so a fresh 429 that
+          // extends a pause is honoured).
+          const waits = [];
+          if (_spotifyHigh.length) waits.push(_spotifyPauseHighUntil - now);
+          if (_spotifyLow.length)  waits.push(_spotifyPauseLowUntil  - now);
+          const soonest = Math.max(0, Math.min(...waits));
+          await _sleep(Math.min(soonest || 200, 1000));
+          continue;
+        }
         const wait = Math.max(0, _spotifyLastTs + _spotifyGap - Date.now());
         if (wait > 0) await _sleep(wait);
         try {
@@ -1258,16 +1277,25 @@ async function _spotifySend(method, urlStr, reqOpts, label, priority = 'high') {
       if (is429) {
         const ra = Number(err.headers?.['retry-after']);
         const raMs = Number.isFinite(ra) && ra >= 0 ? ra * 1000 + 250 : 5000;
-        // Engage the global pause (capped) so the whole queue stops hammering.
-        const applied = Math.min(raMs, SPOTIFY_PAUSE_MAX);
-        _spotifyPauseUntil = Math.max(_spotifyPauseUntil, Date.now() + applied);
+        // Always back the BACKGROUND tier off for the full (capped) retry-after —
+        // bulk seeding is what usually trips the limit, and it can afford to wait.
+        const lowApplied = Math.min(raMs, SPOTIFY_PAUSE_MAX);
+        _spotifyPauseLowUntil = Math.max(_spotifyPauseLowUntil, Date.now() + lowApplied);
+        // Only pause the INTERACTIVE tier when a high-priority request itself is
+        // refused — and only briefly, so the player/queue/playlists recover within
+        // seconds instead of being held hostage by background rate-limits.
+        let highApplied = 0;
+        if (priority === 'high') {
+          highApplied = Math.min(raMs, SPOTIFY_HIGH_PAUSE_MAX);
+          _spotifyPauseHighUntil = Math.max(_spotifyPauseHighUntil, Date.now() + highApplied);
+        }
         _spotifyGap = Math.min(SPOTIFY_GAP_MAX, Math.max(_spotifyGap * 2, 1000));
-        console.warn(`[Spotify] 429 on ${label} — global pause ${applied}ms (server asked ${raMs}ms; gap now ${_spotifyGap}ms)`);
+        console.warn(`[Spotify] 429 on ${label} (${priority}) — pause low ${lowApplied}ms / high ${highApplied}ms (server asked ${raMs}ms; gap now ${_spotifyGap}ms)`);
         // A hard ban: shed all queued background work so it doesn't pile back on.
         if (raMs > 15000) _flushLowQueue('hard 429 cooldown');
         // Background requests are best-effort — give up rather than retry.
         if (priority === 'low' || attempt > SPOTIFY_MAX_RETRIES) throw err;
-        continue; // re-enqueue; the drainer will wait out the global pause
+        continue; // re-enqueue; the drainer will wait out the high-tier pause
       }
 
       if ((is5xx || isTimeout) && priority !== 'low' && attempt <= SPOTIFY_MAX_RETRIES) {

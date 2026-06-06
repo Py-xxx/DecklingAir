@@ -2585,6 +2585,7 @@ export function renderSpotifyInsights(ctrl) {
         if (isEditMode()) return;
         playVibe(cl.key);
         _showFeedback(`Queuing "${cl.name}"…`);
+        _spToast(`⏳ Loading "${cl.name}" — building your queue…`);
       });
       listEl.appendChild(row);
     });
@@ -2692,6 +2693,7 @@ export function renderSpotifyInsights(ctrl) {
         if (isEditMode()) return;
         playMood(mood.key);
         _showFeedback(`Building "${mood.name}" playlist…`);
+        _spToast(`⏳ Loading "${mood.name}" — building your queue…`);
       });
       grid.appendChild(card2);
     });
@@ -3087,7 +3089,7 @@ export function renderSpotifyIntelligence(ctrl) {
     e.stopPropagation();
     if (!_predictMoodKey) return;
     playMood(_predictMoodKey);
-    _spToast(`Playing ${predictName.textContent}`);
+    _spToast(`⏳ Loading ${predictName.textContent} — building your queue…`);
   });
 
   // Check-in button — manually trigger the popup
