@@ -281,19 +281,17 @@ export function disconnectSpotify() {
 }
 
 /**
- * Enable/disable auto-play recommendations.
+ * Enable/disable the Smart Queue engine (weaves our picks into Spotify autoplay
+ * for search & playlist-end; moods/vibes always use it regardless).
  * @param {boolean} enabled
  */
-export function setSpotifyAutoplay(enabled) {
-  socket.emit('spotify:set_autoplay', { enabled });
+export function setSmartQueue(enabled) {
+  socket.emit('spotify:set_smart_queue', { enabled });
 }
 
-/**
- * Enable/disable smart shuffle (recommendation pre-mixing).
- * @param {boolean} enabled
- */
-export function setSpotifySmartShuffle(enabled) {
-  socket.emit('spotify:set_smart_shuffle', { enabled });
+/** Ask the server for the current Smart Queue toggle state. */
+export function getSmartQueue() {
+  socket.emit('spotify:get_smart_queue');
 }
 
 /** Respond to a feeling check-in prompt. */

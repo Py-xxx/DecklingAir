@@ -1148,11 +1148,11 @@
   display: flex;
   gap: 6px;
   flex-shrink: 0;
-  justify-content: space-between;
+  justify-content: center;
 }
 
 /* ── Player responsive tiers — keep all rows inside the panel ─────────────── */
-/* SHORT: drop the Autoplay/Smart-Shuffle row first (lowest-priority controls). */
+/* SHORT: drop the Smart Queue row first (lowest-priority control). */
 .sp-player-short .sp-smart-row { display: none; }
 .sp-player-short .sp-player { padding-top: 6px; padding-bottom: 6px; }
 /* MINI: hide the time read-out and tighten the seek row + album art. */

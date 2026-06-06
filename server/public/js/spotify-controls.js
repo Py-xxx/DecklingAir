@@ -23,8 +23,8 @@ import {
   getSpotifyInsights,
   renameVibe,
   playVibe,
-  setSpotifyAutoplay,
-  setSpotifySmartShuffle,
+  setSmartQueue,
+  getSmartQueue,
   playMood,
   stopContinuous,
   getTuning,
@@ -655,15 +655,11 @@ function renderSpotifyPlayer(ctrl) {
         <button class="sp-toggle-btn sp-repeat-btn"  aria-label="Repeat">${SVG.repeatContext()}</button>
       </div>
 
-      <!-- Autoplay / Smart Shuffle toggles -->
+      <!-- Smart Queue toggle -->
       <div class="sp-smart-row">
-        <button class="sp-smart-btn sp-autoplay-btn" aria-label="Autoplay" title="Autoplay — queues similar tracks when your queue runs low">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3l14 9-14 9V3z"/><path d="M19 3v18"/></svg>
-          Autoplay
-        </button>
-        <button class="sp-smart-btn sp-smart-shuffle-btn" aria-label="Smart Shuffle" title="Smart Shuffle — weaves recommendations into playlists">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/></svg>
-          Smart Shuffle
+        <button class="sp-smart-btn sp-smartqueue-btn" aria-label="Smart Queue" title="Smart Queue — weaves your picks into Spotify's autoplay. On: also for search & playlist-end. Moods & vibes always use it.">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3l14 9-14 9V3z"/><polyline points="16 3 21 3 21 8"/><line x1="14" y1="10" x2="21" y2="3"/></svg>
+          Smart Queue
         </button>
       </div>
 
@@ -699,40 +695,30 @@ function renderSpotifyPlayer(ctrl) {
   const repeatBtn   = card.querySelector('.sp-repeat-btn');
   const noPlayback      = card.querySelector('.sp-no-playback');
   const playerEl        = card.querySelector('.sp-player');
-  const autoplayBtn     = card.querySelector('.sp-autoplay-btn');
-  const smartShuffleBtn = card.querySelector('.sp-smart-shuffle-btn');
+  const smartQueueBtn   = card.querySelector('.sp-smartqueue-btn');
 
-  // ── Autoplay / Smart Shuffle state (persisted in localStorage) ──────────
-  let _autoplay     = localStorage.getItem('sp_autoplay')     === 'true';
-  let _smartShuffle = localStorage.getItem('sp_smartShuffle') === 'true';
+  // ── Smart Queue toggle (state is server-owned + persisted in user prefs) ──
+  let _smartQueue = true; // optimistic; server confirms via 'spotify:smart_queue'
 
-  function _applyAutoplayState() {
-    autoplayBtn.classList.toggle('active', _autoplay);
-    setSpotifyAutoplay(_autoplay);
+  function _renderSmartQueue() {
+    smartQueueBtn.classList.toggle('active', _smartQueue);
   }
-  function _applySmartShuffleState() {
-    smartShuffleBtn.classList.toggle('active', _smartShuffle);
-    setSpotifySmartShuffle(_smartShuffle);
-  }
+  _renderSmartQueue();
 
-  // Sync state to server on card init and on every reconnect
-  _applyAutoplayState();
-  _applySmartShuffleState();
-  socket.on('connect', () => { _applyAutoplayState(); _applySmartShuffleState(); });
-
-  autoplayBtn.addEventListener('pointerup', () => {
-    if (isEditMode()) return;
-    _autoplay = !_autoplay;
-    localStorage.setItem('sp_autoplay', String(_autoplay));
-    _applyAutoplayState();
-    _spToast(_autoplay ? 'Autoplay on' : 'Autoplay off');
+  // Server is the source of truth — ask for it on init and every reconnect.
+  getSmartQueue();
+  socket.on('connect', () => { getSmartQueue(); });
+  socket.on('spotify:smart_queue', ({ enabled } = {}) => {
+    _smartQueue = !!enabled;
+    _renderSmartQueue();
   });
-  smartShuffleBtn.addEventListener('pointerup', () => {
+
+  smartQueueBtn.addEventListener('pointerup', () => {
     if (isEditMode()) return;
-    _smartShuffle = !_smartShuffle;
-    localStorage.setItem('sp_smartShuffle', String(_smartShuffle));
-    _applySmartShuffleState();
-    _spToast(_smartShuffle ? 'Smart Shuffle on' : 'Smart Shuffle off');
+    _smartQueue = !_smartQueue;
+    _renderSmartQueue();
+    setSmartQueue(_smartQueue);
+    _spToast(_smartQueue ? 'Smart Queue on' : 'Smart Queue off — search & playlists use Spotify autoplay');
   });
 
   // ---- Live state for RAF ----
@@ -1004,7 +990,7 @@ function renderSpotifyPlayer(ctrl) {
   marqueeRo.observe(trackInfoEl);
 
   // Adapt the player layout to its panel so the four rows never clip:
-  //   short → drop the Autoplay/Smart-Shuffle row
+  //   short → drop the Smart Queue row
   //   mini  → also hide the time read-out + tighten the seek row
   //   compact (narrow) → shrink album art + hide the secondary action buttons
   const _playerRo = new ResizeObserver(entries => {

@@ -15,7 +15,19 @@ const SPOTIFY_API = 'https://api.spotify.com/v1';
 const RECCOBEATS_API = 'https://api.reccobeats.com/v1';
 const SPOTIFY_ACCOUNTS = 'accounts.spotify.com';
 const POLL_INTERVAL = 5000;
-const AUTOPLAY_MIN_QUEUE = 3;
+
+// ── Smart Queue ────────────────────────────────────────────────────────────
+// The unified auto-queue engine. It lets Spotify's native Autoplay drive the
+// "spine" of upcoming songs, then weaves OUR slider-tuned picks in between them
+// — inserting ours just-in-time (only while the song right before them is the
+// current track) so they land in the correct slot ahead of the next autoplay
+// pick (manual queue adds always take priority over autoplay). See the big
+// block comment above the Smart Queue engine section for the full model.
+const SQ_POLL_INTERVAL = 2000;   // faster poll while a Smart Queue session is active
+const SQ_SPOTIFY_READ  = 10;     // autoplay anchors read as the backbone of each window
+const SQ_RATIO_MIN     = 0.40;   // our share of a window must stay within this band …
+const SQ_RATIO_MAX     = 0.60;   // … 40–60% ours / 40–60% Spotify (balanced)
+const SQ_ARM_TIMEOUT_MS = 25000; // give up "arming" if autoplay never appears (account setting off)
 
 const SCOPES = [
   'user-read-playback-state',
@@ -145,9 +157,18 @@ let _featureWarmTimer = null;
 let _lastState = null;
 let _lastTrackId = null;
 let _autoQueueCount = 0;
-let _autoplayEnabled = false;
-let _smartShuffleEnabled = false;
-let _smartShuffleTrackCount = 0; // playlist tracks heard since last injected track
+
+// ── Smart Queue state ───────────────────────────────────────────────────────
+// _smartQueueEnabled is the user toggle (Playback panel). When OFF we leave
+// searched songs / playlist-ends to Spotify's own native Autoplay untouched —
+// BUT moods & vibes ALWAYS run on Smart Queue regardless of this flag.
+let _smartQueueEnabled = true;
+let _currentPollInterval = POLL_INTERVAL; // tracks which interval _pollTimer is on
+// The single active Smart Queue session, or null. Shape documented at the
+// Smart Queue engine section (window[], pos, noRepeat, ourUris, …).
+let _sq = null;
+let _sqSessionSeq = 0; // monotonically increasing session id for logging
+
 let _userProfile = null;
 let _userId = null;
 let _sessionStats = {
@@ -442,6 +463,7 @@ function loadUserPrefs() {
     if (fs.existsSync(USER_PREFS_FILE)) {
       const prefs = JSON.parse(fs.readFileSync(USER_PREFS_FILE, 'utf8'));
       if (prefs.checkInAuto != null) _checkInAutoEnabled = !!prefs.checkInAuto;
+      if (prefs.smartQueue != null) _smartQueueEnabled = !!prefs.smartQueue;
       if (prefs.tuning && typeof prefs.tuning === 'object') {
         _applyTuning(prefs.tuning);
       }
@@ -452,7 +474,7 @@ function loadUserPrefs() {
 function saveUserPrefs() {
   try {
     fs.mkdirSync(path.dirname(USER_PREFS_FILE), { recursive: true });
-    fs.writeFileSync(USER_PREFS_FILE, JSON.stringify({ checkInAuto: _checkInAutoEnabled, tuning: _tuning }, null, 2));
+    fs.writeFileSync(USER_PREFS_FILE, JSON.stringify({ checkInAuto: _checkInAutoEnabled, smartQueue: _smartQueueEnabled, tuning: _tuning }, null, 2));
   } catch (err) { console.error('[Spotify] Failed to save user prefs:', err.message); }
 }
 
@@ -2698,82 +2720,417 @@ function isAuthed() {
   return !!(tokens && tokens.accessToken);
 }
 
+// ===========================================================================
+// Smart Queue engine
+// ===========================================================================
+//
+// One unified auto-queue engine that REPLACES the old "Autoplay" and "Smart
+// Shuffle" features. Instead of fighting Spotify's native Autoplay, it rides on
+// top of it:
+//
+//   1. We let Spotify Autoplay populate the upcoming queue (the "anchors").
+//   2. We read those anchors BEFORE touching anything → that snapshot is pure
+//      Spotify (anything in the queue we didn't stage is an autoplay pick).
+//   3. We build a bounded "window": the 10 anchors as a fixed-order spine, with
+//      OUR slider-tuned picks woven into the gaps to make the whole run flow.
+//      Our share is clamped to a balanced 40–60%.
+//   4. We insert our songs JUST-IN-TIME: a manual queue add always plays before
+//      the next autoplay pick, so we only add an our-song while the song right
+//      before it is the *current* track (a contiguous run of ours can be added
+//      together). This drops each of our songs into exactly the right slot.
+//   5. Anomaly handling looks ONLY inside the window bounds: if Spotify swaps an
+//      in-bounds anchor (often because our own insertion reseeded autoplay) we
+//      recompute the tail. Songs Spotify appends PAST the window are next-window
+//      material, never anomalies. When the last slot of the window starts, we
+//      build the next window from the freshly-appended anchors.
+//   6. No song we pick repeats within a session; the session's no-repeat memory
+//      resets when the user starts a new seed (search / playlist / mood / vibe).
+//
+// Entry points (all set up a session, then `_sqTick` drives it from `poll`):
+//   • search-play  → only when the toggle is ON
+//   • playlist end → only when the toggle is ON
+//   • mood / vibe  → ALWAYS (Smart Queue is the engine for these regardless)
+//
+// Hard prerequisite: the user's Spotify account "Autoplay" setting must be ON,
+// or there are no anchors to weave into (we log a clear warning if so).
 // ---------------------------------------------------------------------------
-// Autoplay / recommendations
-// ---------------------------------------------------------------------------
 
-async function maybeQueueRecommendations(state) {
-  if (!_autoplayEnabled) return;
-  if (!state || !state.track) return;
-  // Don't double up with a mood/vibe/feeling refill — that path owns the queue.
-  if (_activeMoodKey || _activeVibeKey || _activeFeeling) return;
+// Display helper: "Title — Artist", tolerant of both serialized (title/artist)
+// and raw Spotify (name/artists[]) track shapes.
+function _sqName(t) {
+  if (!t) return '(unknown)';
+  const title = t.title || t.name || '(unknown)';
+  let artist = t.artist || '';
+  if (!artist && Array.isArray(t.artists)) artist = t.artists.map(a => a?.name || a).filter(Boolean).join(', ');
+  return artist ? `${title} — ${artist}` : title;
+}
 
-  // Only top the queue up to the shared cap (never overshoot QUEUE_TARGET).
-  let queueLength = 0;
+// Resolve audio features onto a track (from itself or history) and add the
+// Camelot position so _trackFlowScore can rate transitions.
+function _sqAnnotate(t) {
+  if (!t) return t;
+  const f = (t.energy != null) ? t : (_trackFeatures(t) || {});
+  const key  = t.key  != null ? t.key  : f.key;
+  const mode = t.mode != null ? t.mode : f.mode;
+  return {
+    ...t,
+    bpm:    t.bpm    != null ? t.bpm    : f.bpm,
+    energy: t.energy != null ? t.energy : f.energy,
+    key, mode,
+    _cam: _camelotPos(key, mode),
+  };
+}
+
+// Flow score guarded against missing features (neutral 0.5 when unknown).
+function _sqFlow(a, b) {
+  if (!a || !b) return 0.5;
+  return _trackFlowScore(a, b);
+}
+
+// How many of OUR songs to target for a window of `anchorCount` Spotify anchors.
+// Baseline ~50%, nudged by the fade/smooth slider (smoother → more bridge songs),
+// then hard-clamped into the 40–60% band.
+function _sqTargetOurs(anchorCount) {
+  const lean  = (_tuning.fadeSmooth || 50) / 100;            // 0..1
+  const ideal = Math.round(anchorCount * _lerp(0.8, 1.4, lean));
+  const minU  = Math.ceil (anchorCount * SQ_RATIO_MIN / (1 - SQ_RATIO_MIN)); // ≈0.667·n
+  const maxU  = Math.floor(anchorCount * SQ_RATIO_MAX / (1 - SQ_RATIO_MAX)); // =1.5·n
+  return _clampNum(ideal, Math.max(1, minU), Math.max(1, maxU));
+}
+
+// Build a pool of OUR candidate tracks for the active session's source. Filtered
+// against this session's no-repeat memory, disliked artists and the recent-play
+// guard so nothing repeats too soon.
+async function _sqBuildOurCandidates(count) {
+  let tracks = [];
   try {
-    const queueData = await getQueue();
-    queueLength = queueData?.queue?.length || 0;
-  } catch { /* queue unavailable — assume empty */ }
-  const gap = QUEUE_TARGET - queueLength;
-  if (gap <= 0) return;
-
-  const seedTracks  = [state.track.id].filter(Boolean);
-  const seedArtists = (state.track.artistIds || []).slice(0, 2);
-
-  try {
-    const raw = await getSimilarTracks(seedTracks, seedArtists, gap + 8);
-    // Prefer unplayed, but never starve: if all candidates were already played
-    // this session (top-tracks fallback exhausted), replay rather than let the
-    // queue run dry and playback stop.
-    let tracks = _excludePlayed(raw);
-    if (!tracks.length) tracks = raw;
-    // Nothing is explicitly chosen here, so lean into the current time-of-day's
-    // learned profile: drift candidates that match this slot's typical energy/valence
-    // to the front before staging.
-    tracks = _applyContextBias(tracks);
-    // Stage via context rebuild (no addToQueue) so the queue stays clearable.
-    const added = await rebuildUpcoming(tracks);
-    _autoQueueCount += added;
+    if (_sq.source === 'mood' && _activeMoodKey) {
+      tracks = await buildMoodPlaylist(_activeMoodKey, count);
+    } else if (_sq.source === 'vibe' && _activeVibeKey) {
+      tracks = await buildVibePlaylist(_activeVibeKey, count);
+    } else if (_sq.source === 'rightnow') {
+      const rn = computeRightNow();
+      tracks = rn.ready ? [...rn.topTracks] : [];
+    } else {
+      // search / playlist / generic discovery — seed off the last-known track.
+      const seedId = _sq.lastSeedId || _lastState?.track?.id || null;
+      const seedArtists = (_lastState?.track?.artistIds || []).slice(0, 2);
+      const raw = await getSimilarTracks(seedId ? [seedId] : [], seedArtists, count + 8);
+      tracks = _applyContextBias(raw);
+    }
   } catch (err) {
-    console.error('[Spotify] Autoplay fetch failed:', err.message);
+    console.error('[SmartQueue] Candidate build failed:', err.message);
+  }
+  return _excludeDisliked(tracks || []).filter(t =>
+    t && t.id && !_sq.noRepeat.has(t.id) && !_isRecentlyPlayed(t.id));
+}
+
+// Plan the interleaving: keep the Spotify anchors in fixed order and insert our
+// picks into the roughest gaps (where consecutive anchors flow worst) so each of
+// our songs does the most bridging work. Returns the upcoming slot list (AFTER
+// the `currentAnn` left-edge), each { track, source:'ours'|'spotify' }.
+function _sqPlanInterleave(currentAnn, anchors, ourPool, targetU) {
+  const spine = [currentAnn, ...anchors];          // fixed order, never reordered
+  const gaps = [];
+  for (let i = 0; i < spine.length; i++) {
+    const left = spine[i], right = spine[i + 1] || null;
+    gaps.push({ left, right, rough: right ? (1 - _sqFlow(left, right)) : 0.5, picks: [] });
+  }
+  const order = [...gaps].sort((a, b) => b.rough - a.rough); // roughest first
+  const pool = [...ourPool];
+  let used = 0;
+  for (let pass = 0; pass < 2 && used < targetU && pool.length; pass++) {
+    for (const g of order) {
+      if (used >= targetU || !pool.length) break;
+      if (pass === 0 && g.picks.length >= 1) continue;            // pass 1: ≤1 per gap
+      if (pass === 1 && (g.rough < 0.45 || g.picks.length >= 2)) continue; // pass 2: a 2nd only in rough gaps
+      const left = g.picks.length ? g.picks[g.picks.length - 1] : g.left;
+      let best = 0, bestScore = -Infinity;
+      for (let i = 0; i < pool.length; i++) {
+        let s = _sqFlow(left, pool[i]);
+        if (g.right) s += _sqFlow(pool[i], g.right);
+        if (s > bestScore) { bestScore = s; best = i; }
+      }
+      g.picks.push(pool.splice(best, 1)[0]);
+      used++;
+    }
+  }
+  // Stitch: gap i's picks come AFTER spine[i] and BEFORE spine[i+1].
+  const slots = [];
+  for (let i = 1; i < spine.length; i++) {
+    for (const p of gaps[i - 1].picks) slots.push({ track: p, source: 'ours' });
+    slots.push({ track: spine[i], source: 'spotify' });
+  }
+  for (const p of gaps[spine.length - 1].picks) slots.push({ track: p, source: 'ours' });
+  return { slots, used };
+}
+
+// Turn a current track + raw anchor list into a fresh window (slot 0 = current).
+function _sqAssembleWindow(currentTrack, slots) {
+  const window = [{
+    uri: currentTrack.uri, id: currentTrack.id, track: currentTrack,
+    source: 'spotify', added: true, played: true,
+  }];
+  for (const s of slots) {
+    const uri = s.track.uri || (s.track.id ? `spotify:track:${s.track.id}` : null);
+    if (!uri) continue;
+    window.push({ uri, id: s.track.id, track: s.track, source: s.source, added: false, played: false });
+    if (s.source === 'ours' && s.track.id) _sq.noRepeat.add(s.track.id);
+  }
+  return window;
+}
+
+// Pretty-print the whole window. OUR songs are wrapped in --dashes--; Spotify's
+// are plain. ▶ marks the current slot; OURS+ means already added to the queue.
+function _sqLogWindow(label) {
+  if (!_sq) return;
+  const lines = _sq.window.map((s, i) => {
+    const cursor = i === _sq.pos ? '▶' : ' ';
+    const name = _sqName(s.track);
+    const body = s.source === 'ours' ? `--${name}--` : name;
+    const tag  = s.source === 'ours' ? (s.added ? 'OURS+ ' : 'OURS  ') : 'SPOTIFY';
+    return `        ${cursor} ${String(i + 1).padStart(2)}. [${tag}] ${body}`;
+  });
+  console.log(`[SmartQueue] ${label} — session ${_sq.id} (${_sq.window.length} slots, source=${_sq.source}):\n${lines.join('\n')}`);
+}
+
+function _sqTrimNoRepeat() {
+  const MAX = 300;
+  if (!_sq || _sq.noRepeat.size <= MAX) return;
+  const it = _sq.noRepeat.values();
+  for (let i = 0, n = _sq.noRepeat.size - MAX; i < n; i++) _sq.noRepeat.delete(it.next().value);
+}
+
+// Switch the poll cadence (fast while a session is active, normal otherwise).
+function _sqSetFastPoll(on) {
+  const want = on ? SQ_POLL_INTERVAL : POLL_INTERVAL;
+  if (want === _currentPollInterval) return;
+  _currentPollInterval = want;
+  if (_pollTimer) {
+    clearInterval(_pollTimer);
+    _pollTimer = setInterval(poll, want);
+    console.log(`[SmartQueue] Poll interval → ${want}ms`);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Smart shuffle — injects a discovery track every N playlist tracks
-// ---------------------------------------------------------------------------
+// Start a session. Mode begins as 'arming' — we wait for Spotify autoplay to
+// populate the queue before building the first window.
+function _sqStart(source, seedTrack) {
+  _sq = {
+    id: ++_sqSessionSeq,
+    source,
+    mode: 'arming',
+    window: [],
+    pos: -1,
+    noRepeat: new Set(),
+    building: false,
+    lastTickTrackId: null,
+    armedAt: Date.now(),
+    armWarned: false,
+    lastSeedId: seedTrack?.id || null,
+  };
+  if (seedTrack?.id) _sq.noRepeat.add(seedTrack.id);
+  _sqSetFastPoll(true);
+  console.log(`[SmartQueue] ★ Session ${_sq.id} started — source=${source}, seed="${_sqName(seedTrack)}". Arming, waiting for Spotify autoplay…`);
+}
 
-// Every 3 playlist tracks heard, inject one similar track that isn't in the playlist.
-// Only fires while playing inside a playlist context.
-const SMART_SHUFFLE_INJECT_EVERY = 3;
+function _sqStop(reason) {
+  if (!_sq) return;
+  console.log(`[SmartQueue] ■ Session ${_sq.id} stopped (${reason})`);
+  _sq = null;
+  _sqSetFastPoll(false);
+}
 
-async function maybeSmartShuffle(state) {
-  if (!_smartShuffleEnabled) return;
-  if (!state?.track) return;
-  // Only inject when actually inside a playlist (not an album, artist, or free-play context)
-  const contextIsPlaylist = state.context?.type === 'playlist' || state.context?.uri?.includes(':playlist:');
-  if (!contextIsPlaylist) return;
+// Play a single seed track and hand off to Smart Queue. Spotify autoplay
+// continues from this one track once it ends, giving us anchors to weave into.
+async function _sqStartFromSeed(source, seedUri, seedTrack) {
+  if (!seedUri) return;
+  await play({ uris: [seedUri] });
+  _setStaged([seedUri]);
+  _sqStart(source, seedTrack || { uri: seedUri, id: seedUri.split(':').pop() });
+}
 
-  _smartShuffleTrackCount++;
-  if (_smartShuffleTrackCount % SMART_SHUFFLE_INJECT_EVERY !== 0) return;
-
-  const seedTracks  = [state.track.id].filter(Boolean);
-  const seedArtists = (state.track.artistIds || []).slice(0, 2);
-
-  try {
-    const tracks = _excludePlayed(await getSimilarTracks(seedTracks, seedArtists, 6));
-    for (const track of tracks.slice(0, 1)) {
-      try {
-        await _queueTrack(track);
-        _autoQueueCount++;
-        console.log(`[Spotify] Smart shuffle injected: ${track.name}`);
-      } catch (err) {
-        console.error('[Spotify] Smart shuffle inject error:', err.message);
-      }
-    }
-  } catch (err) {
-    console.error('[Spotify] Smart shuffle fetch failed:', err.message);
+// While arming: poll the queue until Spotify autoplay has appended anchors, then
+// build the first window and go active.
+async function _sqTryActivate(state) {
+  if (Date.now() - _sq.armedAt > SQ_ARM_TIMEOUT_MS && !_sq.armWarned) {
+    _sq.armWarned = true;
+    console.warn('[SmartQueue] ⚠ No autoplay appeared within timeout — is Spotify\'s account "Autoplay" setting ON? Smart Queue needs it to weave. Still listening…');
   }
+  let upcoming = [];
+  try { upcoming = (await getQueue())?.queue || []; } catch { return; }
+  // Anything queued that we did NOT stage is a Spotify autoplay pick.
+  const anchors = upcoming.filter(t => t?.uri && !_stagedUris.has(t.uri));
+  if (anchors.length < 2) return; // not enough autoplay yet — keep arming
+
+  _sq.building = true;
+  try {
+    const annAnchors = anchors.slice(0, SQ_SPOTIFY_READ).map(_sqAnnotate);
+    const targetU = _sqTargetOurs(annAnchors.length || 1);
+    const pool = (await _sqBuildOurCandidates(targetU + 6)).map(_sqAnnotate);
+    const { slots, used } = _sqPlanInterleave(_sqAnnotate(state.track), annAnchors, pool, targetU);
+    _sq.window = _sqAssembleWindow(state.track, slots);
+    _sq.pos = 0;
+    _sq.mode = 'active';
+    _sq.lastTickTrackId = state.track.uri;
+    _sqTrimNoRepeat();
+    console.log(`[SmartQueue] ✔ Session ${_sq.id} ACTIVE — ${annAnchors.length} anchors, target ${targetU} ours (placed ${used}).`);
+    _sqLogWindow('Initial window');
+  } finally {
+    _sq.building = false;
+  }
+  await _sqTick(state); // do the first just-in-time insertion immediately
+}
+
+// Rebuild the window forward from the current track. Preserves our songs already
+// committed to Spotify's queue (we can't un-queue them); plans fresh ours into
+// the gaps among the newly-read anchors.
+async function _sqRecompute(state, reason) {
+  if (!_sq || _sq.building) return;
+  _sq.building = true;
+  try {
+    const cur = state.track;
+    let upcoming = [];
+    try { upcoming = (await getQueue())?.queue || []; } catch { /* keep going */ }
+
+    // Our already-added (committed) songs sit at the front of the queue; keep them.
+    const ourAdded = new Set(_sq.window.filter(s => s.source === 'ours' && s.added).map(s => s.uri));
+    const committedOurs = [];
+    let k = 0;
+    for (; k < upcoming.length; k++) {
+      const u = upcoming[k]?.uri;
+      if (u && ourAdded.has(u)) committedOurs.push(upcoming[k]); else break;
+    }
+    const anchorTracks = upcoming.slice(k).filter(t => t?.uri && !ourAdded.has(t.uri));
+    const annAnchors = anchorTracks.slice(0, SQ_SPOTIFY_READ).map(_sqAnnotate);
+    const targetU = _sqTargetOurs(annAnchors.length || 1);
+    const pool = (await _sqBuildOurCandidates(targetU + 6)).map(_sqAnnotate);
+
+    const committedAnn = committedOurs.map(_sqAnnotate);
+    const bridgeLeft = committedAnn.length ? committedAnn[committedAnn.length - 1] : _sqAnnotate(cur);
+    const { slots, used } = _sqPlanInterleave(bridgeLeft, annAnchors, pool, targetU);
+
+    // Assemble: current → committed ours (forced) → freshly planned slots.
+    const window = [{ uri: cur.uri, id: cur.id, track: cur, source: 'spotify', added: true, played: true }];
+    for (const t of committedOurs) {
+      window.push({ uri: t.uri, id: t.id, track: t, source: 'ours', added: true, played: false });
+      if (t.id) _sq.noRepeat.add(t.id);
+    }
+    for (const s of slots) {
+      const uri = s.track.uri || (s.track.id ? `spotify:track:${s.track.id}` : null);
+      if (!uri) continue;
+      window.push({ uri, id: s.track.id, track: s.track, source: s.source, added: false, played: false });
+      if (s.source === 'ours' && s.track.id) _sq.noRepeat.add(s.track.id);
+    }
+    _sq.window = window;
+    _sq.pos = 0;
+    _sq.lastTickTrackId = cur.uri;
+    _sqTrimNoRepeat();
+    console.log(`[SmartQueue] ↻ Recomputed — reason=${reason}, anchors=${annAnchors.length}, ours=${used}, committedOurs=${committedOurs.length}`);
+    _sqLogWindow('New window');
+  } catch (err) {
+    console.error('[SmartQueue] Recompute failed:', err.message);
+  } finally {
+    _sq.building = false;
+  }
+}
+
+// Compare our planned in-bounds anchors against what Spotify actually has queued.
+// A mismatch (within window bounds only) → recompute the tail.
+async function _sqCheckAnomaly(state, pos) {
+  let upcoming = [];
+  try { upcoming = ((await getQueue())?.queue || []).map(t => t?.uri).filter(Boolean); } catch { return; }
+
+  const plannedAnchors = [];
+  for (let i = pos + 1; i < _sq.window.length; i++) {
+    if (_sq.window[i].source === 'spotify') plannedAnchors.push(_sq.window[i].uri);
+  }
+  if (!plannedAnchors.length) return;
+
+  const ourUris = new Set(_sq.window.filter(s => s.source === 'ours').map(s => s.uri));
+  const actualAnchors = upcoming.filter(u => !ourUris.has(u)); // strip our priority adds
+  const n = Math.min(plannedAnchors.length, actualAnchors.length);
+  if (n === 0) return;
+  for (let i = 0; i < n; i++) {
+    if (plannedAnchors[i] !== actualAnchors[i]) {
+      console.log(`[SmartQueue] ⚠ Anomaly inside window bounds (anchor #${i + 1} changed) → recomputing tail`);
+      await _sqRecompute(state, 'anchor-drift');
+      return;
+    }
+  }
+}
+
+// The per-poll driver. Locates the current track in the window, inserts our
+// upcoming songs just-in-time, recomputes on window-end or anomaly.
+async function _sqTick(state) {
+  if (!_sq || _sq.building) return;
+  if (!state?.isPlaying || !state.track?.uri) return;
+  const curUri = state.track.uri;
+
+  if (_sq.mode === 'arming') { await _sqTryActivate(state); return; }
+
+  let pos = _sq.window.findIndex(s => s.uri === curUri);
+  if (pos === -1) {
+    // Current track left the window: we've consumed it (or it diverged). Either
+    // way, build a fresh window starting here. (Anchors appended past the old
+    // window are this session's next-window material — never an anomaly.)
+    console.log(`[SmartQueue] Current "${_sqName(state.track)}" not in window → building next window`);
+    await _sqRecompute(state, 'advanced-past-window');
+    return;
+  }
+  _sq.pos = pos;
+  for (let i = 0; i <= pos; i++) _sq.window[i].played = true;
+
+  const firstSeen = _sq.lastTickTrackId !== curUri; // debounce heavy work to once/track
+  _sq.lastTickTrackId = curUri;
+
+  // (1) Just-in-time insertion of the contiguous run of OUR songs right after current.
+  let inserted = 0;
+  for (let i = pos + 1; i < _sq.window.length; i++) {
+    const slot = _sq.window[i];
+    if (slot.source !== 'ours') break;  // stop at the next Spotify anchor
+    if (slot.added) continue;
+    try {
+      await addToQueue(slot.uri);
+      slot.added = true;
+      _addStaged([slot.uri]);
+      if (slot.id) _markPlayed(slot.id);
+      inserted++;
+    } catch (err) {
+      console.error(`[SmartQueue] addToQueue failed for ${_sqName(slot.track)}:`, err.message);
+      break;
+    }
+  }
+  if (inserted) {
+    console.log(`[SmartQueue] ➕ Inserted ${inserted} of our song(s) after "${_sqName(state.track)}"`);
+    _sqLogWindow('Queue after insertion');
+  }
+
+  // (2) Window-end → build the next window when the last slot starts playing.
+  if (pos >= _sq.window.length - 1) {
+    if (firstSeen) {
+      console.log('[SmartQueue] Reached last slot → computing next window');
+      await _sqRecompute(state, 'window-end');
+    }
+    return;
+  }
+
+  // (3) Anomaly check (once per track change).
+  if (firstSeen) await _sqCheckAnomaly(state, pos);
+}
+
+// Pick the single highest-confidence seed track for a mood/vibe so Spotify
+// autoplay can continue from it. Returns a track object (or null).
+async function _sqPickMoodVibeSeed(source, key) {
+  let pool = [];
+  try {
+    if (source === 'mood') pool = await buildMoodPlaylist(key, 12);
+    else if (source === 'vibe') pool = await buildVibePlaylist(key, 12);
+  } catch (err) {
+    console.error('[SmartQueue] Seed pick failed:', err.message);
+  }
+  pool = (pool || []).filter(t => t && (t.uri || t.id));
+  return pool.length ? pool[0] : null; // builders return best-fit first
 }
 
 // ---------------------------------------------------------------------------
@@ -4211,12 +4568,20 @@ async function poll() {
         }
 
         if (trackChanged) {
-          maybeQueueRecommendations(state).catch((err) =>
-            console.error('[Spotify] Autoplay error:', err.message)
-          );
-          maybeSmartShuffle(state).catch((err) =>
-            console.error('[Spotify] Smart shuffle error:', err.message)
-          );
+          // Smart Queue — playlist-end entry. If the user was listening to a
+          // playlist/album with the toggle ON and Spotify has now dropped the
+          // context (native autoplay has taken over), arm a Smart Queue session
+          // so we start weaving our picks into the autoplay stream.
+          if (_smartQueueEnabled && !_sq) {
+            const prevCtx = _lastState?.context?.type;
+            const nowCtx  = state.context?.type;
+            const wasListContext = prevCtx === 'playlist' || prevCtx === 'album';
+            const ctxDropped = !nowCtx || nowCtx !== prevCtx;
+            if (wasListContext && ctxDropped) {
+              console.log('[SmartQueue] Playlist/album ended → arming Smart Queue (playlist entry)');
+              _sqStart('playlist', state.track);
+            }
+          }
         }
         // Emit audio features on first track load too (not just track changes)
         if (!_lastTrackId) {
@@ -4244,7 +4609,13 @@ async function poll() {
       // context drains, the next poll (≤5 s) refills it. The function's own
       // "ours >= QUEUE_TARGET" gate makes this a cheap no-op when already full,
       // so there's no extra re-buffering versus the per-track-change call.
-      if (state.isPlaying && (_activeMoodKey || _activeVibeKey || _activeFeeling)) {
+      if (state.isPlaying && _sq) {
+        // Smart Queue owns the queue while a session is active — it drives all
+        // just-in-time insertion, anomaly checks, and window recompute itself.
+        await _sqTick(state).catch((err) =>
+          console.error('[SmartQueue] tick error:', err.message)
+        );
+      } else if (state.isPlaying && (_activeMoodKey || _activeVibeKey || _activeFeeling)) {
         maybeRefillContinuousQueue(state).catch((err) =>
           console.error('[Spotify] Continuous refill error:', err.message)
         );
@@ -4289,7 +4660,7 @@ async function poll() {
 function startPolling() {
   if (_pollTimer) return;
   poll(); // immediate first poll
-  _pollTimer = setInterval(poll, POLL_INTERVAL);
+  _pollTimer = setInterval(poll, _currentPollInterval);
   // Seed history from Spotify in the background (non-blocking)
   if (_seedTimestamp === 0) seedFromSpotify().catch(() => {});
   // Warm audio features for the whole library in the background (idle-time job).
@@ -4337,37 +4708,15 @@ function stopPolling() {
 // Smart shuffle playlist play
 // ---------------------------------------------------------------------------
 
-async function playPlaylistWithSmartShuffle(playlistUri, playlistId) {
+// Play a playlist as a plain Spotify context. When the playlist drains and the
+// Smart Queue toggle is ON, the poll loop's playlist-end detector arms a Smart
+// Queue session that weaves our picks into Spotify's native autoplay stream.
+async function playPlaylist(playlistUri /*, playlistId */) {
+  // Any prior Smart Queue session is now superseded by an explicit playlist play.
+  _sqStop('playlist-play');
   await play({ contextUri: playlistUri });
   await setShuffle(true);
   await setRepeat('off');
-
-  if (_smartShuffleEnabled && playlistId) {
-    try {
-      const tracksData = await getPlaylistTracks(playlistId, 50);
-      const items = (tracksData && tracksData.items) ? tracksData.items : [];
-      const tracks = items.map((i) => i.item || i.track).filter(Boolean);
-
-      const shuffled   = [...tracks].sort(() => Math.random() - 0.5);
-      const seedTracks = shuffled.slice(0, 3).map((t) => t.id).filter(Boolean);
-      const artistIds  = [];
-      for (const t of shuffled.slice(0, 3)) {
-        for (const a of (t.artists || [])) {
-          if (a.id && !artistIds.includes(a.id)) artistIds.push(a.id);
-        }
-      }
-      const seedArtists = artistIds.slice(0, 2);
-
-      const similar = _excludePlayed(await getSimilarTracks(seedTracks, seedArtists, 8)).slice(0, 5);
-      for (const track of similar) {
-        try { await _queueTrack(track); } catch { /* ignore */ }
-      }
-      _autoQueueCount      = similar.length;
-      _smartShuffleTrackCount = 0;
-    } catch (err) {
-      console.error('[Spotify] Smart shuffle (playlist start) error:', err.message);
-    }
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -4406,16 +4755,27 @@ function init(io) {
       socket.emit('spotify:state', _lastState);
     }
 
+    // Send the Smart Queue toggle state so the Playback panel renders correctly
+    socket.emit('spotify:smart_queue', { enabled: _smartQueueEnabled });
+
     // ----- spotify:cmd -----
     socket.on('spotify:cmd', async ({ action, ...args } = {}) => {
       try {
         switch (action) {
           case 'play':
-            // Single track from search — bundle continuation tracks so playback
-            // doesn't stop (no queue manipulation, one clean play() call)
+            // Single track from search.
             if (args.uris?.length === 1 && !args.contextUri) {
-              await playWithContinuation(args.uris[0]);
+              if (_smartQueueEnabled) {
+                // Smart Queue ON → play the seed, let Spotify autoplay fill, then
+                // weave our picks into that stream.
+                await _sqStartFromSeed('search', args.uris[0]);
+              } else {
+                // Toggle OFF → plain Spotify autoplay (continuation bundle).
+                _sqStop('toggle-off-search');
+                await playWithContinuation(args.uris[0]);
+              }
             } else {
+              _sqStop('multi-uri-play');
               await play(args);
             }
             setTimeout(emitQueue, 2000);
@@ -4486,7 +4846,7 @@ function init(io) {
 
           case 'playlist_play':
             _autoQueueCount = 0;
-            await playPlaylistWithSmartShuffle(args.playlistUri, args.playlistId);
+            await playPlaylist(args.playlistUri, args.playlistId);
             setTimeout(emitQueue, 2000);
             break;
 
@@ -4819,18 +5179,20 @@ function init(io) {
     // ----- spotify:play_vibe -----
     socket.on('spotify:play_vibe', async ({ key } = {}) => {
       try {
-        const tracks = await buildVibePlaylist(key, QUEUE_TARGET + 3);
-        if (!tracks.length) {
+        // Smart Queue is ALWAYS the engine for vibes: pick the single
+        // highest-confidence seed, play it, let Spotify autoplay continue, weave.
+        const seed = await _sqPickMoodVibeSeed('vibe', key);
+        if (!seed || !(seed.uri || seed.id)) {
           socket.emit('spotify:insights_action', { ok: false, msg: 'Not enough data for this vibe' });
           return;
         }
         _activeVibeKey = key;
         _activeMoodKey = null;
         _activeFeeling = null;
-        // Old queue no longer applies — clear it and start the vibe fresh.
-        const queued = await playFresh(tracks);
+        const seedUri = seed.uri || `spotify:track:${seed.id}`;
+        await _sqStartFromSeed('vibe', seedUri, seed);
         const label = getVibeName(key);
-        socket.emit('spotify:insights_action', { ok: true, msg: `Playing ${queued} tracks · "${label}" · keeps going ∞` });
+        socket.emit('spotify:insights_action', { ok: true, msg: `Smart Queue · "${label}" · weaving ∞` });
         _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: key });
         _emitIntelligenceState(); // push the full state (incl. activePoolSize) so the pool count shows immediately
         setTimeout(emitQueue, 1500);
@@ -4844,17 +5206,19 @@ function init(io) {
       try {
         const mood = MOOD_STATES.find(m => m.key === key);
         if (!mood) return;
-        const tracks = await buildMoodPlaylist(key, QUEUE_TARGET + 3);
-        if (!tracks.length) {
+        // Smart Queue is ALWAYS the engine for moods: single highest-confidence
+        // seed → play → Spotify autoplay continues → weave our picks in.
+        const seed = await _sqPickMoodVibeSeed('mood', key);
+        if (!seed || !(seed.uri || seed.id)) {
           socket.emit('spotify:insights_action', { ok: false, msg: 'Not enough history for this mood yet' });
           return;
         }
         _activeMoodKey = key;
         _activeVibeKey = null;
         _activeFeeling = null;
-        // Old queue no longer applies — clear it and start the mood fresh.
-        const queued = await playFresh(tracks);
-        socket.emit('spotify:insights_action', { ok: true, msg: `Playing ${queued} tracks · "${mood.name}" · keeps going ∞` });
+        const seedUri = seed.uri || `spotify:track:${seed.id}`;
+        await _sqStartFromSeed('mood', seedUri, seed);
+        socket.emit('spotify:insights_action', { ok: true, msg: `Smart Queue · "${mood.name}" · weaving ∞` });
         _io.emit('spotify:continuous_state', { activeMoodKey: key, activeVibeKey: null });
         _emitIntelligenceState(); // push the full state (incl. activePoolSize) so the pool count shows immediately
         setTimeout(emitQueue, 1500);
@@ -4865,6 +5229,7 @@ function init(io) {
 
     // ----- spotify:stop_continuous -----
     socket.on('spotify:stop_continuous', () => {
+      _sqStop('stop_continuous');
       _activeMoodKey = null;
       _activeVibeKey = null;
       _activeFeeling = null;
@@ -4937,6 +5302,7 @@ function init(io) {
 
     // ----- spotify:stop_feeling -----
     socket.on('spotify:stop_feeling', () => {
+      _sqStop('stop_feeling');
       _activeFeeling = null;
       _activeMoodKey = null;
       _activeVibeKey = null;
@@ -4980,15 +5346,16 @@ function init(io) {
       try {
         const rn = computeRightNow();
         if (!rn.ready) return;
-        // Use the vibe key from right-now to enable continuous mode
+        // Smart Queue engine: seed with the strongest right-now pick, let Spotify
+        // autoplay continue, weave more right-now picks in.
+        const seed = (rn.topTracks || []).find(t => t && (t.uri || t.id));
+        if (!seed) return;
         _activeVibeKey = rn.vibeKey || null;
         _activeMoodKey = null;
         _activeFeeling = null;
-        let pool = _excludePlayed([...rn.topTracks]).sort(() => Math.random() - 0.5).slice(0, QUEUE_TARGET + 3);
-        if (_tFlowOn()) pool = flowOrder(pool);
-        // Old queue no longer applies — clear it and start "right now" fresh.
-        const queued = await playFresh(pool);
-        socket.emit('spotify:insights_action', { ok: true, msg: `Playing ${queued} tracks for right now · keeps going ∞` });
+        const seedUri = seed.uri || `spotify:track:${seed.id}`;
+        await _sqStartFromSeed('rightnow', seedUri, seed);
+        socket.emit('spotify:insights_action', { ok: true, msg: `Smart Queue for right now · weaving ∞` });
         _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: _activeVibeKey });
         setTimeout(emitQueue, 1500);
       } catch (err) {
@@ -5064,28 +5431,37 @@ function init(io) {
 
     // ----- spotify:disconnect -----
     socket.on('spotify:disconnect', () => {
+      _sqStop('disconnect');
       stopPolling();
       deleteTokens();
       _lastState = null;
       _lastTrackId = null;
       _autoQueueCount = 0;
-      _smartShuffleTrackCount = 0;
       _userProfile = null;
       _userId = null;
       io.emit('spotify:auth_status', { connected: false, configured: true });
       io.emit('spotify:state', null);
     });
 
-    // ----- spotify:set_autoplay -----
-    socket.on('spotify:set_autoplay', ({ enabled } = {}) => {
-      _autoplayEnabled = !!enabled;
-      console.log('[Spotify] Autoplay set to:', _autoplayEnabled);
+    // ----- spotify:get_smart_queue -----
+    socket.on('spotify:get_smart_queue', () => {
+      socket.emit('spotify:smart_queue', { enabled: _smartQueueEnabled });
     });
 
-    // ----- spotify:set_smart_shuffle -----
-    socket.on('spotify:set_smart_shuffle', ({ enabled } = {}) => {
-      _smartShuffleEnabled = !!enabled;
-      console.log('[Spotify] Smart shuffle set to:', _smartShuffleEnabled);
+    // ----- spotify:set_smart_queue -----
+    // The single toggle that replaces the old Autoplay + Smart Shuffle controls.
+    // ON  → weave our picks into Spotify autoplay for search & playlist-end too.
+    // OFF → search/playlist fall back to plain Spotify autoplay; moods/vibes still
+    //       use Smart Queue (they always do).
+    socket.on('spotify:set_smart_queue', ({ enabled } = {}) => {
+      _smartQueueEnabled = !!enabled;
+      saveUserPrefs();
+      console.log('[Spotify] Smart Queue set to:', _smartQueueEnabled);
+      if (!_smartQueueEnabled && _sq && (_sq.source === 'search' || _sq.source === 'playlist')) {
+        // Turning it off mid-search/playlist session → hand control back to Spotify.
+        _sqStop('toggle-off');
+      }
+      _io.emit('spotify:smart_queue', { enabled: _smartQueueEnabled });
     });
   });
 }
