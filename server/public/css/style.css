@@ -232,9 +232,21 @@ body.has-bg-image {
 }
 .control-grid > .control-card { position: absolute; }
 
-/* Fit-to-screen: scale the whole canvas to the viewport, no scrolling */
-body.fit-screen #main-area { overflow: hidden; padding: 0; }
-body.fit-screen .control-grid { transform: scale(var(--canvas-scale, 1)); }
+/* Fit-to-screen: scale the whole canvas to the viewport, no scrolling.
+   The canvas is pulled out of flow (position:absolute) so its full logical
+   width/height can't push the container wider/taller than the viewport —
+   that's what was letting horizontal scroll through even with overflow:hidden. */
+body.fit-screen #main-area {
+  overflow: hidden;
+  padding: 0;
+}
+body.fit-screen .control-grid {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform: scale(var(--canvas-scale, 1));
+  transform-origin: top left;
+}
 
 /* Fine-snap overlay (edit mode): subtle dotted grid for alignment */
 .grid-overlay {
