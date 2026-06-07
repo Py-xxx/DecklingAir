@@ -14,7 +14,16 @@ const SPOTIFY_API = 'https://api.spotify.com/v1';
 // Takes Spotify track IDs, returns the same feature schema (0-1 floats, key 0-11, mode 0/1).
 const RECCOBEATS_API = 'https://api.reccobeats.com/v1';
 const SPOTIFY_ACCOUNTS = 'accounts.spotify.com';
-const POLL_INTERVAL = 5000;
+// Adaptive playback polling. Instead of a fixed fast interval, the monitor self-
+// schedules: a slow base cadence while a song plays through, a single precise poll
+// fired right at the predicted song-end boundary, and an immediate refresh on any
+// UI action (play/pause/skip/seek). This keeps Spotify calls minimal and well-
+// spaced while still reacting instantly to track changes.
+const POLL_BASE       = 12000;  // slow base cadence while a song is mid-play
+const POLL_IDLE       = 20000;  // nothing playing — check rarely
+const POLL_END_MARGIN = 1200;   // fire this long AFTER predicted song-end to catch the next track
+const POLL_MIN        = 4000;   // floor for scheduled polls (UI refresh bypasses this)
+const POLL_REFRESH_DEBOUNCE = 450; // coalesce a burst of UI actions into one refresh; let state settle
 
 // ── Smart Queue ────────────────────────────────────────────────────────────
 // The unified auto-queue engine. It lets Spotify's native Autoplay drive the
@@ -23,11 +32,13 @@ const POLL_INTERVAL = 5000;
 // current track) so they land in the correct slot ahead of the next autoplay
 // pick (manual queue adds always take priority over autoplay). See the big
 // block comment above the Smart Queue engine section for the full model.
-const SQ_POLL_INTERVAL = 2000;   // faster poll while a Smart Queue session is active
 // Window depth (anchor count) and the extend trigger are now derived from the
 // Lookahead slider — see _sqAnchorCount() / _sqExtendAhead().
 const SQ_RATIO_MIN     = 0.40;   // our share of a window must stay within this band …
 const SQ_RATIO_MAX     = 0.60;   // … 40–60% ours / 40–60% Spotify (balanced)
+// Local-first discovery: minimum spacing between API-backed anchor fetches. Within
+// this window the Smart Queue fills its spine from the local library only.
+const SQ_API_ANCHOR_COOLDOWN = 90 * 1000;
 
 const SCOPES = [
   'user-read-playback-state',
@@ -67,6 +78,7 @@ const TRACK_FEATURES_FILE = path.join(__dirname, 'data', 'track-features.json');
 const LIVE_STATE_FILE    = path.join(__dirname, 'data', 'live-session.json');
 const TASTE_PROFILE_FILE = path.join(__dirname, 'data', 'taste-profile.json');
 const FEELING_LOG_FILE   = path.join(__dirname, 'data', 'feeling-log.ndjson');
+const BREAKER_FILE       = path.join(__dirname, 'data', 'spotify-breaker.json');
 
 // ── Background feature warming ────────────────────────────────────────────────
 // An idle-time job that fetches audio features for the WHOLE saved library + top
@@ -74,6 +86,10 @@ const FEELING_LOG_FILE   = path.join(__dirname, 'data', 'feeling-log.ndjson');
 // can draw from the entire library instead of only recent history.
 const FEATURE_WARM_START_DELAY = 2 * 60 * 1000;      // first run 2 min after startup
 const FEATURE_WARM_INTERVAL    = 6 * 60 * 60 * 1000; // re-scan every 6h for newly-liked songs
+// Startup stagger for the other background jobs, so they don't storm Spotify
+// alongside the first interactive player/queue/playlist loads.
+const SEED_START_DELAY         = 8 * 1000;           // history seed: after the first live read settles
+const RECONCILE_START_DELAY    = 60 * 1000;          // away-listening reconcile: 1 min after startup
 const FEATURE_WARM_DELAY_MS    = 1200;               // gentle pause between each ReccoBeats fetch
 
 const SESSION_PRUNE_DAYS       = 90;
@@ -127,10 +143,11 @@ function _tSkipSoft()       { return _lerp(0.35, 0.60, _tuning.skipSensitivity /
 function _tLookahead()      { return _clampNum(Math.round(_tuning.lookahead), 1, 10); }
 // Smart Queue window depth derives from the Lookahead slider: how many discovery
 // anchors form each window's spine, and how few slots may remain ahead of the
-// current track before we extend. Lookahead 1→10 maps to a shallow 3-anchor
-// queue … a deep 12-anchor queue.
-function _sqAnchorCount()   { return _clampNum(_tLookahead() + 2, 3, 12); }
-function _sqExtendAhead()   { return _clampNum(Math.ceil(_tLookahead() / 2), 2, 6); }
+// current track before we extend. Capped small (≤5 anchors) on purpose — the app
+// is local-first now and a shallow window means rare, well-spaced discovery fetches
+// instead of building a deep queue that hammers the API.
+function _sqAnchorCount()   { return _clampNum(_tLookahead() + 1, 3, 5); }
+function _sqExtendAhead()   { return _clampNum(Math.ceil(_tLookahead() / 2), 2, 4); }
 
 // Validate + apply an incoming tuning patch, clamping each field to its range.
 function _applyTuning(patch = {}) {
@@ -148,14 +165,15 @@ function _applyTuning(patch = {}) {
 const SESSION_GAP_MS      = 10 * 60 * 1000;  // 10 min silence → close session
 const SESSION_MIN_MS      = 15 * 1000;        // ignore sessions shorter than 15s
 const RECONCILE_INTERVAL  = 30 * 60 * 1000;  // reconcile away-plays every 30 min
-const PROGRESS_DELTA_MAX  = POLL_INTERVAL * 2.5; // sanity cap on progress delta
+const PROGRESS_DELTA_MAX  = POLL_BASE * 2.5; // sanity cap on progress delta between polls
 
 // ---------------------------------------------------------------------------
 // Module state
 // ---------------------------------------------------------------------------
 
 let _io = null;
-let _pollTimer = null;
+let _pollTimeout = null;     // handle for the next self-scheduled poll (adaptive)
+let _polling = false;        // true while the playback monitor loop is active
 let _featureWarmTimer = null;
 let _lastState = null;
 let _lastTrackId = null;
@@ -166,11 +184,11 @@ let _autoQueueCount = 0;
 // searched songs / playlist-ends to Spotify's own native Autoplay untouched —
 // BUT moods & vibes ALWAYS run on Smart Queue regardless of this flag.
 let _smartQueueEnabled = true;
-let _currentPollInterval = POLL_INTERVAL; // tracks which interval _pollTimer is on
 // The single active Smart Queue session, or null. Shape documented at the
 // Smart Queue engine section (window[], pos, noRepeat, ourUris, …).
 let _sq = null;
 let _sqSessionSeq = 0; // monotonically increasing session id for logging
+let _sqLastApiAnchorFetch = 0; // last time we topped up anchors from the live API (cooldown gate)
 
 let _userProfile = null;
 let _userId = null;
@@ -193,6 +211,7 @@ let _liveSaveTick       = 0; // counter to throttle live-session snapshots to di
 let _history        = [];   // all-time log entries, loaded from file on start
 let _seededHistory  = [];   // in-memory only: entries seeded from Spotify API
 let _seedTimestamp  = 0;    // when _seededHistory was last populated
+let _seedInFlight   = false; // guard so the startup seed and the hourly refresh can't overlap
 let _librarySeeds   = [];   // whole saved library + top tracks, feature-warmed in the
                             // background so mood/vibe matching draws from the full library
 let _libraryWarmedAt = 0;   // when _librarySeeds was last (re)built
@@ -252,6 +271,20 @@ function _isRecentlyPlayed(id) { return !!id && _recentPlayIds.includes(id); }
 //                decays the count back down (recovery).
 let _artistTaste   = new Map();
 let _trackDislikes = new Map();
+// _skipSlot: trackId → the time-slot key ("weekday:evening") of its LAST hard skip.
+// Lets the engine spot a "rescued" pick: a track you skipped in one context that
+// now fits THIS context. PERSISTED alongside the taste profile.
+let _skipSlot = new Map();
+
+// _slotBias: composite context key ("weekday:evening") → { dE, dV } learned nudge
+// applied to that slot's centroid. Skips are negative signal that NEVER reach the
+// history-derived centroid (you skipped it, so it's not in history) — this is how
+// a skip at 11pm sharpens the late-night model: it pushes the slot centroid AWAY
+// from what didn't fit. Bounded so it can only refine, never hijack, the learned
+// sound. Persisted alongside the taste profile.
+const _slotBias = new Map();
+const SLOT_BIAS_MAX = 12;   // ± clamp on energy/valence (0–100 scale)
+const SLOT_BIAS_STEP = 1.5; // per-skip nudge; small so it takes a pattern to move
 
 // ── Transition learning (Feature 6) ───────────────────────────────────────────
 // _transitions: "fromId>toId" → net score. A transition that survives (the next
@@ -419,10 +452,16 @@ function loadTasteProfile() {
     for (const [k, v] of Object.entries(obj.trackDislikes || {})) {
       if (typeof v === 'number') _trackDislikes.set(k, v);
     }
+    for (const [k, v] of Object.entries(obj.skipSlot || {})) {
+      if (typeof v === 'string') _skipSlot.set(k, v);
+    }
     for (const [k, v] of Object.entries(obj.transitions || {})) {
       if (typeof v === 'number') _transitions.set(k, v);
     }
-    console.log(`[Spotify] Loaded taste profile — ${_artistTaste.size} artists, ${_trackDislikes.size} disliked tracks, ${_transitions.size} transitions`);
+    for (const [k, v] of Object.entries(obj.slotBias || {})) {
+      if (v && typeof v === 'object') _slotBias.set(k, { dE: Number(v.dE) || 0, dV: Number(v.dV) || 0 });
+    }
+    console.log(`[Spotify] Loaded taste profile — ${_artistTaste.size} artists, ${_trackDislikes.size} disliked tracks, ${_transitions.size} transitions, ${_slotBias.size} slot biases`);
   } catch (err) {
     console.error('[Spotify] loadTasteProfile error:', err.message);
   }
@@ -435,7 +474,9 @@ function saveTasteProfile() {
     const obj = {
       artistScores:  Object.fromEntries(_artistTaste),
       trackDislikes: Object.fromEntries(_trackDislikes),
+      skipSlot:      Object.fromEntries(_skipSlot),
       transitions:   Object.fromEntries(_transitions),
+      slotBias:      Object.fromEntries(_slotBias),
     };
     fs.writeFileSync(TASTE_PROFILE_FILE, JSON.stringify(obj, null, 2));
   } catch (err) {
@@ -882,6 +923,8 @@ function combinedHistory() {
  */
 async function seedFromSpotify() {
   if (!isAuthed() || _spotifyRateLimited()) return;
+  if (_seedInFlight) return; // already seeding — don't stack a second pass
+  _seedInFlight = true;
   try {
     console.log('[Spotify] Seeding history from Spotify API…');
     const seeds = [];
@@ -963,6 +1006,8 @@ async function seedFromSpotify() {
     console.log(`[Spotify] Seed complete — ${_seededHistory.length} total seeded entries`);
   } catch (err) {
     console.error('[Spotify] seedFromSpotify error:', err.message);
+  } finally {
+    _seedInFlight = false;
   }
 }
 
@@ -1042,7 +1087,7 @@ async function warmFeatureLibrary() {
     // 3. Gently fetch the missing features one at a time
     let got = 0, done = 0;
     for (const id of missing) {
-      if (!isAuthed() || !_pollTimer || _spotifyRateLimited()) break; // auth lost / shutting down / rate-limited — stop cleanly
+      if (!isAuthed() || !_polling || _spotifyRateLimited()) break; // auth lost / shutting down / rate-limited — stop cleanly
       if (_audioFeaturesCache.has(id)) { _applyFeatToSeed(byId.get(id), _audioFeaturesCache.get(id)); done++; continue; }
       try {
         const recco = await getReccoBeatsFeatures(id);
@@ -1090,10 +1135,13 @@ function httpsRequest(method, urlStr, opts = {}) {
       res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => {
         const raw = Buffer.concat(chunks).toString();
+        // In raw mode the caller wants the status + headers (for ETag / 304
+        // conditional requests), not just the parsed body.
+        const wrap = (data) => (opts.raw ? { status: res.statusCode, headers: res.headers || {}, data } : data);
 
-        // 204 No Content
-        if (res.statusCode === 204) {
-          return resolve(null);
+        // 304 Not Modified (conditional GET hit) and 204 No Content carry no body.
+        if (res.statusCode === 304 || res.statusCode === 204) {
+          return resolve(wrap(null));
         }
 
         // Try to parse JSON
@@ -1117,7 +1165,7 @@ function httpsRequest(method, urlStr, opts = {}) {
           return reject(err);
         }
 
-        resolve(parsed);
+        resolve(wrap(parsed));
       });
     });
 
@@ -1153,29 +1201,92 @@ function httpsRequest(method, urlStr, opts = {}) {
 // tripped it.
 // ---------------------------------------------------------------------------
 let _spotifyLastTs = 0;
-let _spotifyGap = 220;                 // current spacing between requests (ms)
-const SPOTIFY_GAP_MIN = 220;
+let _spotifyGap = 350;                 // current spacing between requests (ms)
+const SPOTIFY_GAP_MIN = 350;
 const SPOTIFY_GAP_MAX = 8000;
-const SPOTIFY_MAX_RETRIES = 3;
-// A 429 engages a circuit-breaker pause until these timestamps. We keep the two
-// tiers SEPARATE so that a rate-limit triggered by BACKGROUND seeding (history,
-// top-tracks, library warm) only stalls more background work — the interactive
-// player / queue / playlist requests the user is staring at keep flowing. Only a
-// 429 on a high-priority request itself pauses the high tier, and even then only
-// briefly so the UI recovers fast. Both are capped so a punitive multi-hour
-// Retry-After can't wedge the app — once a cap lapses we probe again.
-let _spotifyPauseLowUntil  = 0;        // background work waits this out
-let _spotifyPauseHighUntil = 0;        // interactive work waits this out (kept short)
-const SPOTIFY_PAUSE_MAX      = 120000; // background: never pause longer than 2 min per step
-const SPOTIFY_HIGH_PAUSE_MAX = 8000;   // interactive: recover within a few seconds
+const SPOTIFY_MAX_RETRIES = 2;
+// Two kinds of 429 response, handled very differently:
+//
+//  • SOFT limit (short Retry-After, ≤ SPOTIFY_HARD_BAN_MS): a transient burst.
+//    We pause the affected tier for the FULL Retry-After (it's short) and let the
+//    interactive tier recover on its own. Tiers are kept SEPARATE so a background
+//    rate-limit (history/top-tracks/library warm) doesn't stall the player.
+//
+//  • HARD ban (large Retry-After): the account is banned for minutes-to-hours.
+//    Probing during this window is what *extends* the ban, so we open a global
+//    CIRCUIT BREAKER (`_spotifyOpenUntil`): while it's open NOTHING touches the
+//    Spotify host — every request fails fast locally. No caps that cause early
+//    reprobing; we honour the server's full Retry-After. When it lapses, the next
+//    single request probes; if it 429s again the breaker simply re-opens.
+let _spotifyPauseLowUntil  = 0;        // background tier waits this out (soft limit)
+let _spotifyPauseHighUntil = 0;        // interactive tier waits this out (soft limit)
+let _spotifyOpenUntil      = 0;        // circuit breaker: while now < this, refuse ALL requests w/o network
+const SPOTIFY_HARD_BAN_MS  = 15000;    // a Retry-After above this is treated as a hard ban → open the breaker
+
+// ANSI colors for the at-a-glance API log: green ✓ healthy, yellow ⏳ expected
+// backoff (soft 429 / circuit open), red ✗ genuine failure needing attention.
+const _C = { grn: '\x1b[32m', yel: '\x1b[33m', red: '\x1b[31m', dim: '\x1b[2m', rst: '\x1b[0m' };
+
+// Persist the circuit-breaker deadline so a `pm2 restart` mid-ban doesn't forget
+// it and start probing Spotify again (probing is exactly what renews a hard ban).
+// We only persist the HARD-ban open deadline; the short soft-pause tiers are
+// transient and not worth surviving a restart.
+function saveBreakerState() {
+  try {
+    fs.mkdirSync(path.dirname(BREAKER_FILE), { recursive: true });
+    fs.writeFileSync(BREAKER_FILE, JSON.stringify({ openUntil: _spotifyOpenUntil }));
+  } catch (err) {
+    console.error('[Spotify] saveBreakerState error:', err.message);
+  }
+}
+
+function loadBreakerState() {
+  try {
+    if (!fs.existsSync(BREAKER_FILE)) return;
+    const obj = JSON.parse(fs.readFileSync(BREAKER_FILE, 'utf8'));
+    const until = Number(obj?.openUntil) || 0;
+    if (until > Date.now()) {
+      // Still inside a ban window — restore it and pause both tiers so the app
+      // comes back up silent instead of immediately probing into a longer ban.
+      _spotifyOpenUntil = until;
+      _spotifyPauseLowUntil = _spotifyPauseHighUntil = until;
+      console.warn(`${_C.yel}[Spotify] ⏳ Restored circuit breaker from disk — OPEN for ${Math.ceil((until - Date.now()) / 1000)}s more (no requests until then)${_C.rst}`);
+    } else if (until) {
+      // Stale ban from before the restart — clear the file so it doesn't linger.
+      try { fs.unlinkSync(BREAKER_FILE); } catch { /* best effort */ }
+    }
+  } catch (err) {
+    console.error('[Spotify] loadBreakerState error:', err.message);
+  }
+}
+
+// ── Rolling health metrics ──────────────────────────────────────────────────
+// One glanceable line per minute (skipped entirely on idle minutes) so you don't
+// have to scan the whole log to know the integration is healthy. Counters reset
+// each window; last429 persists as a rolling "how long since trouble" memory.
+const _apiMetrics = { calls: 0, ok: 0, fail: 0, soft429: 0, hard429: 0, last429: 0 };
+let _healthTimer = null;
+
+function _logHealth() {
+  const m = _apiMetrics;
+  if (m.calls === 0 && m.soft429 === 0 && m.hard429 === 0) return; // idle minute → stay quiet
+  const now = Date.now();
+  const breaker = _spotifyOpenUntil > now ? `OPEN ${Math.ceil((_spotifyOpenUntil - now) / 1000)}s` : 'closed';
+  const last429 = m.last429 ? `${Math.round((now - m.last429) / 1000)}s ago` : 'none';
+  const color = (m.fail || m.hard429) ? _C.red : (m.soft429 ? _C.yel : _C.grn);
+  const tick = (m.fail || m.hard429) ? '✗' : (m.soft429 ? '⏳' : '✓');
+  console.log(`${color}[Spotify health] ${tick} ${m.ok}/${m.calls} ok · ${m.fail} fail · 429 soft ${m.soft429}/hard ${m.hard429} · last429 ${last429} · breaker ${breaker} · gap ${_spotifyGap}ms${_C.rst}`);
+  m.calls = m.ok = m.fail = m.soft429 = m.hard429 = 0; // reset window (keep last429 timestamp)
+}
 
 const _sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// True while a background 429 cooldown is in effect — background jobs check this
-// and skip a cycle entirely rather than queuing work that will just be paused.
-// (Interactive requests are NOT gated by this — they always get to run.)
+// True while a 429 cooldown OR the hard-ban circuit breaker is in effect.
+// Background jobs check this and skip a cycle entirely rather than queuing work
+// that will just be paused/refused.
 function _spotifyRateLimited() {
-  return Date.now() < _spotifyPauseLowUntil;
+  const now = Date.now();
+  return now < _spotifyPauseLowUntil || now < _spotifyOpenUntil;
 }
 
 // Two-tier priority queue. Interactive requests (queue/playlists/search/poll)
@@ -1198,7 +1309,7 @@ function _flushLowQueue(reason) {
     const job = _spotifyLow.shift();
     job.reject(Object.assign(new Error(reason || 'dropped (rate-limited)'), { status: 429, dropped: true }));
   }
-  console.warn(`[Spotify] Dropped ${n} queued background request(s) — ${reason || 'rate-limited'}`);
+  console.warn(`${_C.yel}[Spotify] ⏳ Dropped ${n} queued background request(s) — ${reason || 'rate-limited'}${_C.rst}`);
 }
 
 function _drainSpotify() {
@@ -1262,14 +1373,28 @@ function _spotifyThrottle(fn, priority = 'high') {
 // retry — they're best-effort and re-run on their own timers.
 async function _spotifySend(method, urlStr, reqOpts, label, priority = 'high') {
   for (let attempt = 1; ; attempt++) {
+    // Circuit breaker: during a hard ban we refuse locally and never touch the
+    // network — probing is exactly what renews the ban. Checked again at execution
+    // time inside the throttled job so a burst that slipped past here still fails
+    // fast after the first re-opening 429.
+    const openFor = _spotifyOpenUntil - Date.now();
+    if (openFor > 0) {
+      throw Object.assign(new Error(`Spotify circuit open (${Math.ceil(openFor / 1000)}s left)`), { status: 429, circuitOpen: true });
+    }
     try {
-      const data = await _spotifyThrottle(() => httpsRequest(method, urlStr, reqOpts), priority);
+      const data = await _spotifyThrottle(() => {
+        const stillOpen = _spotifyOpenUntil - Date.now();
+        if (stillOpen > 0) {
+          throw Object.assign(new Error(`Spotify circuit open (${Math.ceil(stillOpen / 1000)}s left)`), { status: 429, circuitOpen: true });
+        }
+        return httpsRequest(method, urlStr, reqOpts);
+      }, priority);
       if (_spotifyGap > SPOTIFY_GAP_MIN) {
         _spotifyGap = Math.max(SPOTIFY_GAP_MIN, Math.round(_spotifyGap * 0.85));
       }
       return data;
     } catch (err) {
-      if (err.dropped) throw err; // background job intentionally discarded
+      if (err.dropped || err.circuitOpen) throw err; // discarded / breaker open — fail fast, no retry
       const is429 = err.status === 429;
       const is5xx = err.status >= 500 && err.status < 600;
       const isTimeout = err.status === 0; // socket timeout/abort — worth one retry
@@ -1277,25 +1402,34 @@ async function _spotifySend(method, urlStr, reqOpts, label, priority = 'high') {
       if (is429) {
         const ra = Number(err.headers?.['retry-after']);
         const raMs = Number.isFinite(ra) && ra >= 0 ? ra * 1000 + 250 : 5000;
-        // Always back the BACKGROUND tier off for the full (capped) retry-after —
-        // bulk seeding is what usually trips the limit, and it can afford to wait.
-        const lowApplied = Math.min(raMs, SPOTIFY_PAUSE_MAX);
-        _spotifyPauseLowUntil = Math.max(_spotifyPauseLowUntil, Date.now() + lowApplied);
-        // Only pause the INTERACTIVE tier when a high-priority request itself is
-        // refused — and only briefly, so the player/queue/playlists recover within
-        // seconds instead of being held hostage by background rate-limits.
-        let highApplied = 0;
-        if (priority === 'high') {
-          highApplied = Math.min(raMs, SPOTIFY_HIGH_PAUSE_MAX);
-          _spotifyPauseHighUntil = Math.max(_spotifyPauseHighUntil, Date.now() + highApplied);
-        }
         _spotifyGap = Math.min(SPOTIFY_GAP_MAX, Math.max(_spotifyGap * 2, 1000));
-        console.warn(`[Spotify] 429 on ${label} (${priority}) — pause low ${lowApplied}ms / high ${highApplied}ms (server asked ${raMs}ms; gap now ${_spotifyGap}ms)`);
-        // A hard ban: shed all queued background work so it doesn't pile back on.
-        if (raMs > 15000) _flushLowQueue('hard 429 cooldown');
+
+        _apiMetrics.last429 = Date.now();
+        if (raMs > SPOTIFY_HARD_BAN_MS) {
+          _apiMetrics.hard429++;
+          // HARD BAN — open the global breaker for the FULL Retry-After. Nothing
+          // touches Spotify until it lifts. Shed all queued background work and
+          // fail-fast for everyone (no retry, no probing).
+          _spotifyOpenUntil = Math.max(_spotifyOpenUntil, Date.now() + raMs);
+          _spotifyPauseLowUntil = _spotifyPauseHighUntil = _spotifyOpenUntil;
+          saveBreakerState(); // survive a restart mid-ban so we don't probe back into it
+          _flushLowQueue(`hard 429 — circuit open ${Math.ceil(raMs / 1000)}s`);
+          console.warn(`${_C.red}[Spotify] ✗ HARD 429 on ${label} (${priority}) — circuit OPEN for ${Math.ceil(raMs / 1000)}s; no requests until then (gap now ${_spotifyGap}ms)${_C.rst}`);
+          throw err;
+        }
+
+        // SOFT limit — short and recoverable. Pause the affected tier(s) for the
+        // full (short) Retry-After. Background always backs off; the interactive
+        // tier only when a high request itself was refused.
+        _spotifyPauseLowUntil = Math.max(_spotifyPauseLowUntil, Date.now() + raMs);
+        if (priority === 'high') {
+          _spotifyPauseHighUntil = Math.max(_spotifyPauseHighUntil, Date.now() + raMs);
+        }
+        _apiMetrics.soft429++;
+        console.warn(`${_C.yel}[Spotify] ⏳ soft 429 on ${label} (${priority}) — pause ${raMs}ms (gap now ${_spotifyGap}ms)${_C.rst}`);
         // Background requests are best-effort — give up rather than retry.
         if (priority === 'low' || attempt > SPOTIFY_MAX_RETRIES) throw err;
-        continue; // re-enqueue; the drainer will wait out the high-tier pause
+        continue; // re-enqueue; the drainer will wait out the tier pause
       }
 
       if ((is5xx || isTimeout) && priority !== 'low' && attempt <= SPOTIFY_MAX_RETRIES) {
@@ -1304,6 +1438,16 @@ async function _spotifySend(method, urlStr, reqOpts, label, priority = 'high') {
       }
       throw err;
     }
+  }
+}
+
+function _logApi(method, short, status, ms, outcome) {
+  if (outcome === 'ok') {
+    console.log(`${_C.grn}[Spotify] ✓ ${method} ${short} ${status} ${_C.dim}${ms}ms${_C.rst}`);
+  } else if (outcome === 'skip') {
+    console.log(`${_C.yel}[Spotify] ⏳ ${method} ${short} — skipped (circuit open)${_C.rst}`);
+  } else {
+    console.log(`${_C.red}[Spotify] ✗ ${method} ${short} ${status || 'ERR'} ${_C.dim}${ms}ms${_C.rst}`);
   }
 }
 
@@ -1325,17 +1469,36 @@ async function api(method, endpoint, opts = {}) {
   const headers = {
     Authorization: `Bearer ${token}`,
     'Content-Type': 'application/json',
+    ...(opts.headers || {}), // caller extras, e.g. If-None-Match for conditional GETs
   };
 
   const body = opts.body ? JSON.stringify(opts.body) : undefined;
 
-  // Quiet the two endpoints the 5 s poll hits every cycle — they otherwise bury
-  // every meaningful log (refill decisions, queue rebuilds, discovery) in noise.
+  // Quiet the two endpoints the poll hits every cycle on SUCCESS — they otherwise
+  // bury every meaningful log (refill decisions, queue rebuilds, discovery) in
+  // noise. Failures on these endpoints are ALWAYS logged so problems still surface.
   const _short = urlStr.replace(SPOTIFY_API, '');
   const _noisy = method === 'GET' && (_short === '/me/player' || _short.startsWith('/me/player/queue'));
-  if (!_noisy) console.log(`[Spotify] ${method} ${_short}`);
 
-  return _spotifySend(method, urlStr, { headers, body }, _short, opts.priority || 'high');
+  const _started = Date.now();
+  try {
+    const data = await _spotifySend(method, urlStr, { headers, body, raw: opts.raw }, _short, opts.priority || 'high');
+    _apiMetrics.calls++; _apiMetrics.ok++;
+    // In raw mode `data` is { status, headers, data }; surface the real status
+    // (e.g. 304 = conditional cache hit) in the log instead of a blanket 200.
+    const st = (opts.raw && data && typeof data.status === 'number') ? data.status : 200;
+    if (!_noisy) _logApi(method, _short, st, Date.now() - _started, 'ok');
+    return data;
+  } catch (err) {
+    if (err.dropped) throw err; // background work shed on a hard ban — already summarized
+    if (err.circuitOpen) {
+      if (!_noisy) _logApi(method, _short, 429, Date.now() - _started, 'skip');
+    } else {
+      _apiMetrics.calls++; _apiMetrics.fail++;
+      _logApi(method, _short, err.status, Date.now() - _started, 'fail'); // always surface real failures
+    }
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1407,17 +1570,26 @@ async function refreshAccessToken() {
 
   const basic = Buffer.from(`${cfg.clientId}:${cfg.clientSecret}`).toString('base64');
 
-  const data = await httpsRequest(
-    'POST',
-    `https://${SPOTIFY_ACCOUNTS}/api/token`,
-    {
-      headers: {
-        Authorization: `Basic ${basic}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body,
-    }
-  );
+  const _started = Date.now();
+  let data;
+  try {
+    data = await httpsRequest(
+      'POST',
+      `https://${SPOTIFY_ACCOUNTS}/api/token`,
+      {
+        headers: {
+          Authorization: `Basic ${basic}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body,
+      }
+    );
+  } catch (err) {
+    // A failed token refresh cascades into every request — always surface it loudly.
+    _logApi('POST', '/api/token (refresh)', err.status, Date.now() - _started, 'fail');
+    throw err;
+  }
+  _logApi('POST', '/api/token (refresh)', 200, Date.now() - _started, 'ok');
 
   const updated = {
     accessToken: data.access_token,
@@ -1430,13 +1602,20 @@ async function refreshAccessToken() {
   return updated.accessToken;
 }
 
+// Single-flight guard: when many queued requests cross the token-expiry boundary
+// at once, share ONE refresh instead of firing a burst of identical POST /api/token
+// calls (Spotify rate-limits the token endpoint too).
+let _tokenRefreshInflight = null;
+
 async function getToken() {
   const tokens = loadTokens();
   if (!tokens) throw new Error('Not authenticated with Spotify');
 
   // Refresh if expiring within 30 seconds
   if (Date.now() >= tokens.expiresAt - 30000) {
-    return refreshAccessToken();
+    if (_tokenRefreshInflight) return _tokenRefreshInflight;
+    _tokenRefreshInflight = refreshAccessToken().finally(() => { _tokenRefreshInflight = null; });
+    return _tokenRefreshInflight;
   }
 
   return tokens.accessToken;
@@ -1583,13 +1762,22 @@ function _artistBoost(artist) {
 function _bumpTrackDislike(id) {
   if (!id) return;
   _trackDislikes.set(id, (_trackDislikes.get(id) || 0) + 1);
+  _skipSlot.set(id, _currentSlotKey()); // remember WHEN it didn't land (for "rescued")
   _scheduleTasteSave();
 }
 function _recoverTrackDislike(id) {
   if (!id || !_trackDislikes.has(id)) return;
   const n = (_trackDislikes.get(id) || 0) - 1;
-  if (n <= 0) _trackDislikes.delete(id); else _trackDislikes.set(id, n);
+  if (n <= 0) { _trackDislikes.delete(id); _skipSlot.delete(id); } else _trackDislikes.set(id, n);
   _scheduleTasteSave();
+}
+// A track is "rescued" when it was skipped before, in a DIFFERENT time-slot than
+// now, yet survives the soft-ban (so the engine still trusts it) — i.e. it didn't
+// fit then but fits this context. Used to surface a "rescued" pick reason.
+function _isRescued(id) {
+  if (!id || _trackSoftBanned(id)) return false;
+  const prevSlot = _skipSlot.get(id);
+  return !!prevSlot && prevSlot !== _currentSlotKey();
 }
 function _trackSoftBanned(id) {
   return !!id && (_trackDislikes.get(id) || 0) >= TRACK_SOFTBAN_COUNT;
@@ -1658,12 +1846,14 @@ function _evaluateEngagement(prev) {
     _adjustArtistScore(prev.track.artist, +1);   // engaged listen recovers the artist
     _recoverTrackDislike(prev.track.id);          // a full listen forgives a past skip
     _recordTransition(_prevId, prev.track.id, +1); // this sequencing worked — reinforce it
+    _nudgeSlotBias(prev.track, +1);               // fit this slot → relax the slot's skip-nudge
     return;
   }
   if (frac < _tSkipStrong()) {
     _bumpTrackDislike(prev.track.id);            // repeated skips → durable soft-ban
     _adjustArtistScore(prev.track.artist, -1);
     _recordTransition(_prevId, prev.track.id, -1); // landing here got skipped — avoid the sequence
+    _nudgeSlotBias(prev.track, -1);               // didn't fit THIS time-of-day → push the slot away
     const banned  = _trackSoftBanned(prev.track.id);
     const avoided = _artistAvoided(prev.track.artist);
     console.log(`[Spotify] Engagement: strong dislike (${Math.round(frac * 100)}%) "${prev.track.title}"${banned ? ' — now soft-banned' : ''}${avoided ? ` — pattern detected, now avoiding ${prev.track.artist}` : ''}`);
@@ -1681,45 +1871,89 @@ async function getPlaylists(limit = 50) {
   return api('GET', '/me/playlists', { params: { limit } });
 }
 
-async function getAllPlaylists() {
-  const limit = 50;
-  let offset = 0;
-  let allItems = [];
-  const first = await api('GET', '/me/playlists', { params: { limit, offset: 0 } });
-  if (!first) return { items: [] };
-  const total = first.total || 0;
-  allItems = allItems.concat(first.items || []);
-  while (allItems.length < total) {
-    offset = allItems.length;
-    const page = await api('GET', '/me/playlists', { params: { limit, offset } });
-    if (!page || !page.items || !page.items.length) break;
-    allItems = allItems.concat(page.items);
+// Conditional GET: send If-None-Match when we hold an ETag for this resource.
+// Returns { status, etag, data }. On a 304 the body is null and the caller serves
+// its own cache — saving the entire (often multi-page) re-download. Fully
+// defensive: if Spotify doesn't return an ETag (etag stays null), the next call
+// sends no If-None-Match and behaves exactly like an unconditional fetch, so this
+// can only ever SAVE calls, never break anything.
+async function _conditionalGet(endpoint, params, etag, priority = 'high') {
+  const res = await api('GET', endpoint, {
+    params,
+    priority,
+    raw: true,
+    headers: etag ? { 'If-None-Match': etag } : undefined,
+  });
+  return {
+    status: res?.status,
+    etag: res?.headers?.etag || etag || null, // Node lowercases header names
+    data: res?.data ?? null,
+  };
+}
+
+// Local-first: the full playlist list is paginated (many calls), so cache it and
+// serve from memory unless the TTL lapsed or the caller explicitly asks to refresh.
+// An in-flight guard coalesces concurrent requests into one fetch. We also keep an
+// ETag so a periodic refresh can be answered with a cheap 304 when nothing changed.
+let _playlistsCache = { items: null, ts: 0, etag: null };
+let _playlistsInflight = null;
+const PLAYLISTS_TTL = 30 * 60 * 1000; // 30 min
+
+async function getAllPlaylists(forceRefresh = false) {
+  if (!forceRefresh && _playlistsCache.items && Date.now() - _playlistsCache.ts < PLAYLISTS_TTL) {
+    return { items: _playlistsCache.items, cached: true };
   }
-  return { items: allItems };
+  if (_playlistsInflight) return _playlistsInflight;
+  _playlistsInflight = (async () => {
+    try {
+      const limit = 50;
+      // Conditional first page: an unchanged first page (most-recently-touched
+      // playlists sit at the front) is a strong signal the list is unchanged.
+      const cond = await _conditionalGet('/me/playlists', { limit, offset: 0 }, _playlistsCache.etag);
+      if (cond.status === 304 && _playlistsCache.items) {
+        _playlistsCache.ts = Date.now(); // unchanged — keep cache fresh, skip all pages
+        console.log(`${_C.grn}[Spotify] ✓ playlists unchanged (304) — served ${_playlistsCache.items.length} from cache${_C.rst}`);
+        return { items: _playlistsCache.items, cached: true };
+      }
+      const first = cond.data;
+      if (!first) return { items: _playlistsCache.items || [] };
+      const total = first.total || 0;
+      let allItems = [].concat(first.items || []);
+      while (allItems.length < total) {
+        const page = await api('GET', '/me/playlists', { params: { limit, offset: allItems.length } });
+        if (!page || !page.items || !page.items.length) break;
+        allItems = allItems.concat(page.items);
+      }
+      _playlistsCache = { items: allItems, ts: Date.now(), etag: cond.etag };
+      return { items: allItems };
+    } finally {
+      _playlistsInflight = null;
+    }
+  })();
+  return _playlistsInflight;
 }
 
 async function getPlaylistTracks(playlistId, limit = 100) {
-  // Feb 2026: /tracks → /items; response field track → item
-  return api('GET', `/playlists/${playlistId}/items`, {
+  return api('GET', `/playlists/${playlistId}/tracks`, {
     params: {
       limit,
-      fields: 'items(item(id,uri,name,duration_ms,artists(id,name),album(name,images)))',
+      fields: 'items(track(id,uri,name,duration_ms,artists(id,name),album(name,images)))',
     },
   });
 }
 
 async function getAllPlaylistTracks(playlistId) {
   const limit = 100;
-  const fields = 'total,items(item(id,uri,name,duration_ms,artists(id,name),album(name,images)))';
-  const first = await api('GET', `/playlists/${playlistId}/items`, {
+  const fields = 'total,items(track(id,uri,name,duration_ms,artists(id,name),album(name,images)))';
+  const first = await api('GET', `/playlists/${playlistId}/tracks`, {
     params: { limit, offset: 0, fields },
   });
   if (!first) return [];
   const total = first.total || 0;
   let allItems = first.items || [];
   while (allItems.length < total) {
-    const page = await api('GET', `/playlists/${playlistId}/items`, {
-      params: { limit, offset: allItems.length, fields: 'items(item(id,uri,name,duration_ms,artists(id,name),album(name,images)))' },
+    const page = await api('GET', `/playlists/${playlistId}/tracks`, {
+      params: { limit, offset: allItems.length, fields },
     });
     if (!page || !page.items || !page.items.length) break;
     allItems = allItems.concat(page.items);
@@ -1727,22 +1961,46 @@ async function getAllPlaylistTracks(playlistId) {
   return allItems;
 }
 
-async function getAllLikedSongs(priority = 'high') {
-  const limit = 50;
-  let offset = 0;
-  let allItems = [];
-  // First page also gives total
-  const first = await getLikedSongTracks(limit, 0, priority);
-  if (!first) return [];
-  const total = first.total || 0;
-  allItems = allItems.concat(first.items || []);
-  while (allItems.length < total) {
-    offset = allItems.length;
-    const page = await getLikedSongTracks(limit, offset, priority);
-    if (!page || !page.items || !page.items.length) break;
-    allItems = allItems.concat(page.items);
+// Local-first: liked songs paginate too (often hundreds of tracks = many calls),
+// so cache and serve from memory unless the TTL lapsed or the caller forces a
+// refresh. In-flight guard coalesces concurrent requests.
+let _likedSongsCache = { items: null, ts: 0, etag: null };
+let _likedSongsInflight = null;
+const LIKED_SONGS_TTL = 30 * 60 * 1000; // 30 min
+
+async function getAllLikedSongs(priority = 'high', forceRefresh = false) {
+  if (!forceRefresh && _likedSongsCache.items && Date.now() - _likedSongsCache.ts < LIKED_SONGS_TTL) {
+    return _likedSongsCache.items;
   }
-  return allItems;
+  if (_likedSongsInflight) return _likedSongsInflight;
+  _likedSongsInflight = (async () => {
+    try {
+      const limit = 50;
+      // Conditional first page: new likes land at the FRONT (sorted by added_at
+      // desc), so an unchanged first page means no new likes → serve the cache and
+      // skip every other page.
+      const cond = await _conditionalGet('/me/tracks', { limit, offset: 0 }, _likedSongsCache.etag, priority);
+      if (cond.status === 304 && _likedSongsCache.items) {
+        _likedSongsCache.ts = Date.now(); // unchanged — keep cache fresh
+        console.log(`${_C.grn}[Spotify] ✓ liked songs unchanged (304) — served ${_likedSongsCache.items.length} from cache${_C.rst}`);
+        return _likedSongsCache.items;
+      }
+      const first = cond.data;
+      if (!first) return _likedSongsCache.items || [];
+      const total = first.total || 0;
+      let allItems = [].concat(first.items || []);
+      while (allItems.length < total) {
+        const page = await getLikedSongTracks(limit, allItems.length, priority);
+        if (!page || !page.items || !page.items.length) break;
+        allItems = allItems.concat(page.items);
+      }
+      _likedSongsCache = { items: allItems, ts: Date.now(), etag: cond.etag };
+      return allItems;
+    } finally {
+      _likedSongsInflight = null;
+    }
+  })();
+  return _likedSongsInflight;
 }
 
 // In-memory cache so we don't re-fetch features for the same track
@@ -1881,7 +2139,7 @@ async function getReccoBeatsFeatures(trackId) {
       _source: 'reccobeats',
     };
   } catch (err) {
-    console.warn('[Spotify] ReccoBeats unavailable for', trackId, '-', err.message);
+    console.warn(`${_C.red}[ReccoBeats] ✗ features unavailable for ${trackId} — ${err.message}${_C.rst}`);
     return null;
   }
 }
@@ -1894,11 +2152,6 @@ async function getReccoBeatsFeatures(trackId) {
 // act on data that hadn't been saved yet (the bug that only showed up on new songs).
 const _audioFeaturesInflight = new Map();
 
-// Spotify deprecated /audio-features for most apps (returns 403). Once we see
-// that, stop calling it for the rest of the session — every attempt still costs
-// a request against the rate limit for a result we know will fail.
-let _spotifyAudioFeaturesDead = false;
-
 async function getAudioFeatures(trackId) {
   if (!trackId) return null;
   if (_audioFeaturesCache.has(trackId)) return _audioFeaturesCache.get(trackId);
@@ -1908,21 +2161,9 @@ async function getAudioFeatures(trackId) {
   if (_audioFeaturesInflight.has(trackId)) return _audioFeaturesInflight.get(trackId);
 
   const fetchPromise = (async () => {
-    // Tier 1: Spotify's own endpoint (deprecated — 403s for most apps). Skip it
-    // entirely once it's proven dead so we don't burn quota on guaranteed 403s.
-    if (!_spotifyAudioFeaturesDead) {
-      try {
-        const data = await api('GET', `/audio-features/${trackId}`);
-        if (data && data.tempo != null) {
-          _cacheFeatures(trackId, data);
-          return data;
-        }
-      } catch (err) {
-        if (err.status === 403 || err.status === 404) _spotifyAudioFeaturesDead = true;
-        // expected for deprecated endpoint — fall through to ReccoBeats
-      }
-    }
-    // Tier 2: ReccoBeats fallback
+    // Spotify's /audio-features is permanently deprecated (Nov-2024) — it only ever
+    // returns 403/404 now and every attempt burns rate-limit quota. Go straight to
+    // ReccoBeats, never the Spotify host.
     const recco = await getReccoBeatsFeatures(trackId);
     if (recco) {
       console.log(`[Spotify] Audio features via ReccoBeats — energy=${recco.energy} valence=${recco.valence} tempo=${Math.round(recco.tempo)} id=${trackId}`);
@@ -1946,20 +2187,8 @@ async function getBatchAudioFeatures(trackIds, priority = 'high') {
   if (!trackIds || !trackIds.length) return [];
   const toFetch = trackIds.filter(id => !_audioFeaturesCache.has(id));
   if (toFetch.length) {
-    // Tier 1: Spotify batch (deprecated — usually 403s). Skip once proven dead
-    // so we don't burn quota, but ALWAYS keep the ReccoBeats fallback below.
-    if (!_spotifyAudioFeaturesDead) {
-      try {
-        const ids = toFetch.slice(0, 100).join(',');
-        const data = await api('GET', '/audio-features', { params: { ids }, priority });
-        const features = (data && data.audio_features) ? data.audio_features : [];
-        features.forEach(f => { if (f && f.id) _cacheFeatures(f.id, f); });
-      } catch (err) {
-        if (err.status === 403 || err.status === 404) _spotifyAudioFeaturesDead = true;
-        // expected — fall through to ReccoBeats
-      }
-    }
-    // Tier 2: ReccoBeats fallback for whatever's still missing.
+    // Spotify's batch /audio-features is permanently deprecated — never call the
+    // Spotify host. Enrich via ReccoBeats only.
     // Sequential + capped so one-time seeding doesn't fire a request storm.
     // Skip tracks already known to have no features (TTL-bounded).
     const stillMissing = toFetch
@@ -1978,16 +2207,29 @@ async function getBatchAudioFeatures(trackIds, priority = 'high') {
   return trackIds.map(id => _audioFeaturesCache.get(id) || null);
 }
 
+// ⚠️ ENDPOINT-CHOICE CAVEAT (read this if liked songs / playlists ever break) ⚠️
+// ───────────────────────────────────────────────────────────────────────────
+// Spotify's Feb-2026 "Development Mode" API migration was documented
+// inconsistently (their docs site is JS-heavy and returned contradictory answers
+// across fetches), so the endpoints below are an EVIDENCE-BASED BET, not a
+// certainty. The split we landed on:
+//   • READS  → classic, decade-stable endpoints:  GET /me/tracks (max 50),
+//              GET /playlists/{id}/tracks (fields=track(...))
+//   • WRITES → confirmed-migrated generic endpoints: PUT/DELETE /me/library,
+//              GET /me/library/contains  (these were confirmed by 2 sources)
+//
+// The centralized red logging in api() is the safety net: if any of these starts
+// returning 403/404 on the real Pi, you'll see a red ✗ line INSTANTLY. If that
+// happens, the fix is a one-line flip:
+//   • liked songs 4xx → try   GET /me/library/items?type=track
+//   • playlist  4xx   → try   GET /playlists/{id}/items  (fields=item(...))
+//   • saves     4xx   → revert to PUT/DELETE /me/tracks?ids= (bare IDs)
+// See the Feb-2026 migration guide + each endpoint's live reference page.
+// ───────────────────────────────────────────────────────────────────────────
 async function getLikedSongTracks(limit = 50, offset = 0, priority = 'high') {
-  // Feb 2026: /me/tracks → /me/library/items?type=track
-  // Fall back to the old endpoint if the new one returns an unexpected structure
-  try {
-    const data = await api('GET', '/me/library/items', { params: { type: 'track', limit, offset }, priority });
-    if (data && data.items) return data;
-  } catch {
-    // new endpoint failed — try legacy
-  }
-  return api('GET', '/me/tracks', { params: { limit, offset }, priority });
+  // Reading saved tracks was NOT migrated — there is no /me/library read
+  // endpoint. /me/tracks is the live, documented endpoint (max limit 50).
+  return api('GET', '/me/tracks', { params: { limit: Math.min(limit, 50), offset }, priority });
 }
 
 async function getDevices() {
@@ -2015,45 +2257,40 @@ async function checkLiked(trackUris) {
 
 async function likeTrack(trackUri) {
   // Feb 2026: PUT /me/tracks {ids:[...]} → PUT /me/library?uris=spotify:track:...
-  return api('PUT', '/me/library', { params: { uris: trackUri } });
+  const r = await api('PUT', '/me/library', { params: { uris: trackUri } });
+  _likedSongsCache = { items: null, ts: 0 }; // liked set changed — drop the cache
+  return r;
 }
 
 async function unlikeTrack(trackUri) {
   // Feb 2026: DELETE /me/tracks {ids:[...]} → DELETE /me/library?uris=spotify:track:...
-  return api('DELETE', '/me/library', { params: { uris: trackUri } });
+  const r = await api('DELETE', '/me/library', { params: { uris: trackUri } });
+  _likedSongsCache = { items: null, ts: 0 }; // liked set changed — drop the cache
+  return r;
 }
 
 async function addTracksToPlaylist(playlistId, uris) {
-  // Feb 2026: POST /playlists/{id}/tracks → POST /playlists/{id}/items
-  return api('POST', `/playlists/${playlistId}/items`, { body: { uris } });
+  return api('POST', `/playlists/${playlistId}/tracks`, { body: { uris } });
 }
 
 async function createPlaylist(userId, name, description = '') {
-  return api('POST', `/users/${userId}/playlists`, {
+  const r = await api('POST', `/users/${userId}/playlists`, {
     body: { name, description, public: false },
   });
-}
-
-async function getRecommendations({ seedTracks = [], seedArtists = [], limit = 5 } = {}) {
-  const params = { limit };
-  if (seedTracks.length > 0) params.seed_tracks = seedTracks.slice(0, 5).join(',');
-  if (seedArtists.length > 0) params.seed_artists = seedArtists.slice(0, 5).join(',');
-  return api('GET', '/recommendations', { params });
+  _playlistsCache = { items: null, ts: 0 }; // playlist set changed — drop the cache
+  return r;
 }
 
 /**
  * Get tracks similar to the given seeds.
- * Two-tier fallback because /recommendations is deprecated and 404s for many apps:
- *   1. /recommendations  (still works for some; fastest)
- *   2. user's own short-term top tracks shuffled  (last resort)
  *
- * (A related-artists tier used to sit between these, but /artists/{id}/related-artists
- *  was deprecated in the same Nov-2024 batch as /recommendations, so it only burned
- *  API calls that 404'd. Removed.)
+ * Spotify's /recommendations and /artists/{id}/related-artists were both killed in
+ * the Nov-2024 deprecation batch (they only 404 now and burn rate-limit quota), so
+ * we never call them. Genuine discovery happens via /search-based helpers elsewhere;
+ * this function's job is the cheap fallback: the user's own short-term top tracks.
  *
  * Returns an array of raw Spotify track objects (with .uri, .id, .name, .artists …).
  */
-let _recommendationsDeadLogged = false;
 async function getSimilarTracks(seedTrackIds = [], seedArtistIds = [], limit = 5) {
   const dedupe = (tracks, excludeUris = new Set()) => {
     const seen = new Set(excludeUris);
@@ -2066,23 +2303,7 @@ async function getSimilarTracks(seedTrackIds = [], seedArtistIds = [], limit = 5
 
   const excludeUris = new Set(seedTrackIds.map(id => `spotify:track:${id}`));
 
-  // ── Tier 1: /recommendations ────────────────────────────────────────────────
-  try {
-    const recs = await getRecommendations({ seedTracks: seedTrackIds, seedArtists: seedArtistIds, limit });
-    const tracks = dedupe(recs?.tracks || [], excludeUris);
-    if (tracks.length > 0) {
-      console.log(`[Spotify] getSimilarTracks: ${tracks.length} from /recommendations`);
-      return tracks.slice(0, limit);
-    }
-  } catch (err) {
-    // /recommendations is deprecated and 404s for most apps — log once, then stay quiet
-    if (!_recommendationsDeadLogged) {
-      console.warn('[Spotify] /recommendations unavailable, falling back to top-tracks:', err.message);
-      _recommendationsDeadLogged = true;
-    }
-  }
-
-  // ── Tier 2: user's own short-term top tracks ────────────────────────────────
+  // User's own short-term top tracks (the only live source here).
   try {
     const top = await api('GET', '/me/top/tracks', { params: { time_range: 'short_term', limit: 50 } });
     const tracks = dedupe(top?.items || [], excludeUris).sort(() => Math.random() - 0.5);
@@ -2530,7 +2751,7 @@ async function getAuthStatus() {
 
   // Second fast path: if the poll loop is running, the token is valid — return
   // connected immediately rather than risking a rate-limited live API call.
-  if (_pollTimer) {
+  if (_polling) {
     return { connected: true, configured: true, needsReauth, missingScopes };
   }
 
@@ -2651,8 +2872,46 @@ function _sqLibraryCandidates(count) {
     t && t.id && t.energy != null &&
     !_sq.noRepeat.has(t.id) && !_isRecentlyPlayed(t.id) &&
     !seen.has(t.id) && seen.add(t.id)));
-  pool.sort((a, b) => (_artistBoost(b.artist) - _artistBoost(a.artist)) || (Math.random() - 0.5));
-  return pool.slice(0, count);
+
+  // Rank familiar picks by durable artist taste BLENDED with how well each track
+  // matches the time-of-day the user is actually in right now (the learned context
+  // centroid). The context term is the "how did it know?" factor — late-night picks
+  // skew to your late-night sound, mornings skew bright — at ZERO API cost. Scores
+  // are computed once per track (the random jitter must stay OUT of the comparator,
+  // or the sort becomes inconsistent); the jitter keeps successive runs from being
+  // identical. With no learned profile yet, ctx is neutral and this reduces to the
+  // old artist-taste-first ordering, so nothing regresses on a cold start.
+  const prof = _currentContextProfile();
+  const centroid = (prof?.centroid && prof.centroid.energy != null) ? prof.centroid : null;
+  const setCloser = _sqSetCloserActive();
+  let maxBoost = 0;
+  for (const t of pool) { const b = _artistBoost(t.artist); if (b > maxBoost) maxBoost = b; }
+  const ranked = pool.map(t => {
+    const artist = maxBoost > 0 ? _artistBoost(t.artist) / maxBoost : 0;       // 0..1
+    const ctx = centroid ? Math.max(0, 1 - _clusterDist(centroid, t)) : 0.5;   // 0..1 (neutral w/o profile)
+    // Set-closer (#8): when winding down, fold in a "calmer is better" term so the
+    // tail of the night eases off rather than spiking back up.
+    const cool = setCloser ? (1 - (t.energy != null ? t.energy : 50) / 100) : 0;
+    const s = setCloser
+      ? artist * 0.40 + ctx * 0.35 + cool * 0.25 + Math.random() * 0.10
+      : artist * 0.55 + ctx * 0.45 + Math.random() * 0.12;
+    return { t, s };
+  });
+  ranked.sort((a, b) => b.s - a.s);
+  const picks = ranked.slice(0, count).map(x => x.t);
+
+  // Anti-rut (#7): if this slot is stuck in a tight cluster, swap the weakest pick
+  // for the best "stretch" candidate — fresh-sounding (further from centroid) yet
+  // still adjacent enough to be pleasant. Tagged so the UI can say "stretching your
+  // sound". Cloned so the _stretch flag never leaks back onto the shared history.
+  if (centroid && picks.length && _slotInRut()) {
+    const inSlice = new Set(picks.map(p => p.id));
+    const stretch = ranked
+      .map(x => ({ t: x.t, d: _clusterDist(centroid, x.t) }))
+      .filter(x => !inSlice.has(x.t.id) && x.d >= 0.25 && x.d <= 0.55)[0]; // ranked order preserved
+    if (stretch) picks[picks.length - 1] = { ...stretch.t, _stretch: true };
+  }
+  return picks;
 }
 
 // Variety gate for the search/playlist path: prefer candidates whose audio features
@@ -2694,12 +2953,20 @@ async function _sqBuildOurCandidates(count) {
       const seedArtists = (_lastState?.track?.artistIds || []).slice(0, artistBreadth);
 
       const fresh    = _tDiscoveryRatio();                                   // 0..0.9 = share NEW
-      const discCount = Math.max(0, Math.round(count * fresh));
+      // Local-first: only spend an API call on NEW discovery when we're outside the
+      // anchor cooldown and not rate-limited. Otherwise fold the discovery share back
+      // into familiar library picks so the window still fills with zero API cost.
+      const cooled    = Date.now() - _sqLastApiAnchorFetch > SQ_API_ANCHOR_COOLDOWN;
+      const canApi    = cooled && !_spotifyRateLimited();
+      const discCount = canApi ? Math.max(0, Math.round(count * fresh)) : 0;
       const libCount  = Math.max(0, count - discCount);
 
-      const disc = discCount > 0
-        ? _applyContextBias(await getSimilarTracks(seedId ? [seedId] : [], seedArtists, discCount + 8))
-        : [];
+      let disc = [];
+      if (discCount > 0) {
+        const raw = await getSimilarTracks(seedId ? [seedId] : [], seedArtists, discCount + 4);
+        if (raw?.length) _sqLastApiAnchorFetch = Date.now();
+        disc = _applyContextBias(raw);
+      }
       const lib = libCount > 0 ? _sqLibraryCandidates(libCount + 8) : [];
 
       tracks = _sqVarietyGate([...lib.slice(0, libCount + 4), ...disc.slice(0, discCount + 4)], seedId);
@@ -2717,16 +2984,33 @@ async function _sqBuildOurCandidates(count) {
 // off the last-known track/artists. Filtered against this session's no-repeat
 // memory, disliked artists and the recent-play guard.
 async function _sqBuildSpotifyAnchors(count) {
-  let tracks = [];
   const seedId = _sq?.lastSeedId || _lastState?.track?.id || null;
-  try {
-    const artistBreadth = 1 + Math.round(_tVariety() * 3);                 // 1–4 seed artists
-    const seedArtists = (_lastState?.track?.artistIds || []).slice(0, artistBreadth);
-    const raw = await getSimilarTracks(seedId ? [seedId] : [], seedArtists, count + 10);
-    tracks = raw || [];
-  } catch (err) {
-    console.error('[SmartQueue] Anchor build failed:', err.message);
+  // Local-first: fill the discovery spine from the warmed library/history (zero
+  // API cost) before reaching for the live API.
+  let tracks = _sqLibraryCandidates(count + 4);
+
+  // Only top up from the API when local can't fill the window AND we're outside the
+  // cooldown — and never while rate-limited. This keeps API-backed discovery rare
+  // and well-spaced, which is the whole point of local-first.
+  const needApi = tracks.length < count;
+  const cooled  = Date.now() - _sqLastApiAnchorFetch > SQ_API_ANCHOR_COOLDOWN;
+  if (needApi && cooled && !_spotifyRateLimited()) {
+    try {
+      const artistBreadth = 1 + Math.round(_tVariety() * 3);              // 1–4 seed artists
+      const seedArtists = (_lastState?.track?.artistIds || []).slice(0, artistBreadth);
+      const raw = await getSimilarTracks(seedId ? [seedId] : [], seedArtists, count + 4);
+      if (raw?.length) {
+        _sqLastApiAnchorFetch = Date.now();
+        const have = new Set(tracks.map(t => t.id));
+        tracks = [...tracks, ...raw.filter(t => t && t.id && !have.has(t.id))];
+      }
+    } catch (err) {
+      console.error('[SmartQueue] Anchor API fetch failed:', err.message);
+    }
+  } else if (needApi) {
+    console.log(`[SmartQueue] Anchors local-only (${tracks.length}/${count}) — ${_spotifyRateLimited() ? 'rate-limited' : 'API cooldown'}`);
   }
+
   const filtered = _excludeDisliked(tracks || []).filter(t =>
     t && t.id && !_sq.noRepeat.has(t.id) && !_isRecentlyPlayed(t.id));
   // Variety also gates the discovery spine: low variety keeps anchors close to the
@@ -2774,19 +3058,160 @@ function _sqPlanInterleave(currentAnn, anchors, ourPool, targetU) {
   return { slots, used };
 }
 
+// Short, human adjectives for the current time-of-day, used in pick reasons
+// ("late-night match"). Mirrors _timeSlotFor's buckets.
+const SLOT_ADJ = {
+  latenight: 'late-night', earlyam: 'early-morning', morning: 'morning',
+  midday: 'midday', afternoon: 'afternoon', evening: 'evening', night: 'night',
+};
+
+// Set-closer (#8): late in the day AND your recent real plays are cooling down →
+// ease the queue toward calmer tracks and label the tail "landing the set".
+function _sqSetCloserActive() {
+  const slot = _timeSlotFor(new Date().getHours());
+  if (slot !== 'night' && slot !== 'latenight') return false;
+  const recent = _history.filter(e => e.energy != null).slice(-6);
+  if (recent.length < 4) return false;
+  const mid = Math.floor(recent.length / 2);
+  const avg = (a) => a.reduce((s, e) => s + e.energy, 0) / a.length;
+  return avg(recent.slice(mid)) < avg(recent.slice(0, mid)) - 8; // meaningfully falling
+}
+
+// Anti-rut (#7): when THIS slot's recent history is tightly clustered around its
+// centroid, the model risks looping one sound. Returns true so the candidate
+// picker deliberately injects one adjacent-but-fresh "stretch" track.
+function _slotInRut() {
+  const prof = _computeContextProfiles()[_currentSlotKey()];
+  if (!prof || !prof.centroid || prof.count < 12) return false;
+  const slot = _timeSlotFor(new Date().getHours());
+  const recent = _history.filter(e =>
+    e.energy != null && e.valence != null && _timeSlotFor(e.h) === slot).slice(-12);
+  if (recent.length < 8) return false;
+  const spread = recent.reduce((s, e) => s + _clusterDist(prof.centroid, e), 0) / recent.length;
+  return spread < 0.18; // very tight = rut
+}
+
+// Explain — in the user's language — WHY this song earned its slot, and flag a
+// harmonically smooth transition from the previous slot. This is the "magic
+// factor": it surfaces the harmonic mixing + context learning the engine already
+// does. `left` is the annotated previous slot's track (or null for slot 0);
+// `opts.setCloser` tags the wind-down tail.
+function _sqReasonFor(track, source, left, opts = {}) {
+  const reasons = [];
+  let smoothMix = false;
+  if (left && track) {
+    const cam  = _camelotScore(left._cam, track._cam); // 0..1 (≥0.8 = same/adjacent/parallel key)
+    const flow = _sqFlow(left, track);                 // 0..1 harmonic+bpm+energy smoothness
+    if (cam >= 0.8 || flow >= 0.8) { smoothMix = true; reasons.push('smooth mix'); }
+    else if (flow >= 0.68) reasons.push('bridges the gap');
+  }
+  if (source === 'ours') {
+    const loved = _artistBoost(track.artist) > 0;
+    if (loved) reasons.push('loved artist');
+    // Context fit drives both the "evening match" badge and discovery confidence.
+    const prof = _currentContextProfile();
+    let ctxFit = null;
+    if (prof?.centroid && track.energy != null && track.valence != null) {
+      ctxFit = _clusterDist(prof.centroid, track); // 0 = dead-on the learned sound
+      if (ctxFit <= 0.35) reasons.push(`${SLOT_ADJ[_timeSlotFor(new Date().getHours())]} match`);
+    }
+    if (opts.setCloser)   reasons.push('landing the set');   // #8
+    if (track._stretch)   reasons.push('stretching your sound'); // #7
+    if (_isRescued(track.id)) reasons.push('rescued');       // #3
+    if (!reasons.length) {
+      // Discovery confidence (#6): a fresh pick is an honest "fresh discovery", but
+      // when it lands right on your learned sound it's a confident "safe bet".
+      reasons.push(ctxFit != null && ctxFit <= 0.45 ? 'safe bet · new sound' : 'fresh discovery');
+    }
+  } else if (!reasons.length) {
+    reasons.push('on your station');
+  }
+  return { reason: [...new Set(reasons)].slice(0, 3).join(' · '), smoothMix };
+}
+
 // Turn a current track + raw anchor list into a fresh window (slot 0 = current).
 function _sqAssembleWindow(currentTrack, slots) {
   const window = [{
     uri: currentTrack.uri, id: currentTrack.id, track: currentTrack,
     source: 'spotify', added: true, played: true,
+    reason: '', smoothMix: false,
   }];
-  for (const s of slots) {
+  // Set-closer tags only the LAST of our picks so the queue reads as winding down
+  // toward a close rather than every slot shouting "landing the set".
+  const setCloser = _sqSetCloserActive();
+  let lastOursIdx = -1;
+  for (let i = 0; i < slots.length; i++) if (slots[i].source === 'ours') lastOursIdx = i;
+  let left = _sqAnnotate(currentTrack);
+  for (let i = 0; i < slots.length; i++) {
+    const s = slots[i];
     const uri = s.track.uri || (s.track.id ? `spotify:track:${s.track.id}` : null);
     if (!uri) continue;
-    window.push({ uri, id: s.track.id, track: s.track, source: s.source, added: false, played: false });
+    const ann = (s.track._cam !== undefined) ? s.track : _sqAnnotate(s.track);
+    const { reason, smoothMix } = _sqReasonFor(ann, s.source, left, {
+      setCloser: setCloser && i === lastOursIdx,
+    });
+    window.push({ uri, id: s.track.id, track: s.track, source: s.source, added: false, played: false, reason, smoothMix });
     if (s.source === 'ours' && s.track.id) _sq.noRepeat.add(s.track.id);
+    left = ann;
   }
   return window;
+}
+
+// Build a uri/id → { source, reason, smoothMix } lookup over the live Smart
+// Queue window, so emitQueue() can decorate the real Spotify queue with our
+// per-pick explanations (the real /me/player/queue carries none of our metadata).
+function _sqWindowAnnotations() {
+  const map = new Map();
+  if (!_sq || !Array.isArray(_sq.window)) return map;
+  for (const slot of _sq.window) {
+    if (!slot.reason && !slot.smoothMix && slot.source !== 'ours') continue;
+    const entry = { source: slot.source, reason: slot.reason || '', smoothMix: !!slot.smoothMix };
+    if (slot.uri) map.set(slot.uri, entry);
+    if (slot.id)  map.set(slot.id, entry);
+  }
+  return map;
+}
+
+// A compact, holistic summary of the UPCOMING Smart Queue window for the queue
+// card's header strip: a streak callout (#1), the harmonic key-journey (#2), an
+// energy sparkline (#4) and the set-closer state (#8). Returns null when there's
+// no active session so the strip stays hidden during plain playback.
+function _sqInsightStrip() {
+  if (!_sq || !Array.isArray(_sq.window)) return null;
+  const upcoming = _sq.window.filter(s => !s.played);
+  if (upcoming.length < 2) return null;
+
+  // #4 — energy per upcoming slot (0..100; null where features are unknown).
+  const energy = upcoming.map(s => {
+    const e = s.track && s.track.energy;
+    return (e != null) ? Math.round(e) : null;
+  });
+
+  // #2 — Camelot codes of consecutive slots, consecutive repeats collapsed.
+  const keys = [];
+  for (const s of upcoming) {
+    const cam = (s.track && s.track._cam) || _camelotPos(s.track && s.track.key, s.track && s.track.mode);
+    if (cam && cam.code) keys.push(cam.code);
+  }
+  const journey = keys.filter((c, i) => i === 0 || c !== keys[i - 1]).slice(0, 6);
+
+  // #1 — pick the single most interesting streak/callout to show.
+  let lovedRun = 0;
+  for (const s of upcoming) {
+    if (s.source === 'ours' && _artistBoost(s.track && s.track.artist) > 0) lovedRun++;
+    else break;
+  }
+  const oursCount   = upcoming.filter(s => s.source === 'ours').length;
+  const smoothCount = upcoming.filter(s => s.smoothMix).length;
+  const setCloser   = _sqSetCloserActive();
+
+  let streak = '';
+  if (lovedRun >= 2)            streak = `${lovedRun} loved-artist picks in a row`;
+  else if (setCloser)          streak = 'easing down to close the set';
+  else if (smoothCount >= 3)   streak = `${smoothCount} smooth transitions ahead`;
+  else if (oursCount >= 1)     streak = `${oursCount} of ${upcoming.length} hand-picked`;
+
+  return { streak, journey, energy, smoothCount, setCloser };
 }
 
 // Pretty-print the whole window. OUR songs are wrapped in --dashes--; Spotify's
@@ -2810,18 +3235,6 @@ function _sqTrimNoRepeat() {
   for (let i = 0, n = _sq.noRepeat.size - MAX; i < n; i++) _sq.noRepeat.delete(it.next().value);
 }
 
-// Switch the poll cadence (fast while a session is active, normal otherwise).
-function _sqSetFastPoll(on) {
-  const want = on ? SQ_POLL_INTERVAL : POLL_INTERVAL;
-  if (want === _currentPollInterval) return;
-  _currentPollInterval = want;
-  if (_pollTimer) {
-    clearInterval(_pollTimer);
-    _pollTimer = setInterval(poll, want);
-    console.log(`[SmartQueue] Poll interval → ${want}ms`);
-  }
-}
-
 // Start a session. The first poll tick builds the window immediately — there is
 // no "arming" wait because we source the discovery anchors ourselves (the Web
 // API never autoplays a bare track). `weave` controls whether OUR picks are
@@ -2840,7 +3253,8 @@ function _sqStart(source, seedTrack, weave = true) {
     lastSeedId: seedTrack?.id || null,
   };
   if (seedTrack?.id) _sq.noRepeat.add(seedTrack.id);
-  _sqSetFastPoll(true);
+  // Build the window right away rather than waiting for the next slow base tick.
+  refreshNow('smart-queue start');
   console.log(`[SmartQueue] ★ Session ${_sq.id} started — source=${source}, weave=${weave}, seed="${_sqName(seedTrack)}". Building window on next tick…`);
 }
 
@@ -2848,7 +3262,6 @@ function _sqStop(reason) {
   if (!_sq) return;
   console.log(`[SmartQueue] ■ Session ${_sq.id} stopped (${reason})`);
   _sq = null;
-  _sqSetFastPoll(false);
 }
 
 // Clear the playback queue on a MANUAL change (new song / playlist / mood / vibe).
@@ -3068,21 +3481,29 @@ async function emitQueue() {
   if (!_io) return;
   try {
     const data = await getQueue();
+    const ann = _sqWindowAnnotations();
     const items =
       data && data.queue
-        ? data.queue.slice(0, 30).map((t) => ({
-            id: t.id,
-            uri: t.uri,
-            title: t.name,
-            artist: t.artists ? t.artists.map((a) => a.name).join(', ') : '',
-            albumArt:
-              t.album && t.album.images && t.album.images.length > 0
-                ? t.album.images[0].url
-                : null,
-            duration: t.duration_ms,
-          }))
+        ? data.queue.slice(0, 30).map((t) => {
+            const a = ann.get(t.uri) || ann.get(t.id) || null;
+            return {
+              id: t.id,
+              uri: t.uri,
+              title: t.name,
+              artist: t.artists ? t.artists.map((x) => x.name).join(', ') : '',
+              albumArt:
+                t.album && t.album.images && t.album.images.length > 0
+                  ? t.album.images[0].url
+                  : null,
+              duration: t.duration_ms,
+              // Smart Queue "why-picked" decoration (absent for non-SQ items).
+              source: a ? a.source : undefined,
+              reason: a ? a.reason : undefined,
+              smoothMix: a ? a.smoothMix : undefined,
+            };
+          })
         : [];
-    _io.emit('spotify:queue', { items });
+    _io.emit('spotify:queue', { items, meta: _sqInsightStrip() });
   } catch (err) {
     console.error('[Spotify] Auto queue emit error:', err.message);
   }
@@ -3662,14 +4083,59 @@ function _computeContextProfiles() {
   return profiles;
 }
 
+// The composite context key for "right now" (weekday/weekend + time slot).
+function _currentSlotKey() {
+  const now = new Date();
+  const weekend = (now.getDay() === 0 || now.getDay() === 6);
+  return `${weekend ? 'weekend' : 'weekday'}:${_timeSlotFor(now.getHours())}`;
+}
+
+// Learn from skips that never reach the history centroid: a strong skip pushes the
+// current slot's centroid AWAY from what didn't fit; an engaged listen relaxes the
+// nudge back toward 0 (the history centroid already captures the positive case).
+// Bounded + debounce-persisted, so it can only REFINE the learned sound, not hijack it.
+function _nudgeSlotBias(track, dir) {
+  if (!track) return;
+  const f = (track.energy != null && track.valence != null) ? track : _trackFeatures(track);
+  if (!f || f.energy == null || f.valence == null) return;
+  const key  = _currentSlotKey();
+  const c    = _computeContextProfiles()[key]?.centroid;
+  const bias = _slotBias.get(key) || { dE: 0, dV: 0 };
+  if (dir < 0) {
+    const refE = c ? c.energy : 50, refV = c ? c.valence : 50;
+    bias.dE += (f.energy  < refE ? +SLOT_BIAS_STEP : -SLOT_BIAS_STEP); // push centroid away from the skip
+    bias.dV += (f.valence < refV ? +SLOT_BIAS_STEP : -SLOT_BIAS_STEP);
+  } else {
+    bias.dE *= 0.8; bias.dV *= 0.8; // fit → decay the nudge toward neutral
+  }
+  bias.dE = _clampNum(bias.dE, -SLOT_BIAS_MAX, SLOT_BIAS_MAX);
+  bias.dV = _clampNum(bias.dV, -SLOT_BIAS_MAX, SLOT_BIAS_MAX);
+  _slotBias.set(key, bias);
+  _contextProfilesAt = 0; // invalidate the profile cache so the nudge applies immediately
+  _scheduleTasteSave();
+}
+
 // Best profile for the current moment: composite (weekday/weekend + slot) first,
-// then slot-only, else null when there isn't enough history yet.
+// then slot-only, else null when there isn't enough history yet. The learned
+// per-slot skip-nudge is folded onto the centroid here so every consumer
+// (_applyContextBias, _sqLibraryCandidates, _predictForNow) benefits automatically.
 function _currentContextProfile() {
   const profiles = _computeContextProfiles();
   const now = new Date();
   const weekend = (now.getDay() === 0 || now.getDay() === 6);
   const slot = _timeSlotFor(now.getHours());
-  return profiles[`${weekend ? 'weekend' : 'weekday'}:${slot}`] || profiles[`slot:${slot}`] || null;
+  const prof = profiles[`${weekend ? 'weekend' : 'weekday'}:${slot}`] || profiles[`slot:${slot}`] || null;
+  if (!prof || !prof.centroid) return prof;
+  const bias = _slotBias.get(`${weekend ? 'weekend' : 'weekday'}:${slot}`);
+  if (!bias || (!bias.dE && !bias.dV)) return prof;
+  return {
+    ...prof,
+    centroid: {
+      ...prof.centroid,
+      energy:  _clampNum(prof.centroid.energy  + bias.dE, 0, 100),
+      valence: _clampNum(prof.centroid.valence + bias.dV, 0, 100),
+    },
+  };
 }
 
 // Stable re-rank that drifts tracks closest to the current slot's learned centroid
@@ -4240,13 +4706,80 @@ function buildStats() {
 }
 
 // ---------------------------------------------------------------------------
+// Portraits + Time-machine  (magic-factor #9 and #5)
+// ---------------------------------------------------------------------------
+
+// #9 — Per-context taste portraits: "Your weekday late nights sound like…".
+// Built purely from the learned context profiles (composite buckets), so it's a
+// zero-API, shareable mirror of what each time-of-day actually sounds like.
+function buildPortraits() {
+  const profiles = _computeContextProfiles();
+  const out = [];
+  for (const [key, p] of Object.entries(profiles)) {
+    if (key.startsWith('slot:') || !p.centroid) continue; // composite buckets only
+    const [scope, slot] = key.split(':');
+    const def = FEELING_DEFS[_guessFeeling(p.centroid)] || {};
+    out.push({
+      key,
+      title: `${scope === 'weekend' ? 'Weekend' : 'Weekday'} ${SLOT_LABELS[slot] || slot}`,
+      emoji: def.emoji || '🎧',
+      feeling: def.label || '—',
+      energy:  Math.round(p.centroid.energy),
+      valence: Math.round(p.centroid.valence),
+      bpm:     p.centroid.bpm != null ? Math.round(p.centroid.bpm) : null,
+      count:   p.count,
+      topArtists: (p.topArtists || []).slice(0, 3).map(a => a.name),
+    });
+  }
+  out.sort((a, b) => b.count - a.count);
+  return out.slice(0, 6);
+}
+
+// #5 — Time-machine: "It's Friday 11pm — your late nights lean chill, often X."
+// Plus a concrete seed track (most recent same-slot play) the user can replay,
+// which routes through the Smart Queue engine like any other seed.
+function buildTimeMachine() {
+  const [scope, slot] = _currentSlotKey().split(':');
+  const inSlot = (e) => e.h != null && e.energy != null && _timeSlotFor(e.h) === slot;
+  const composite = _history.filter(e => inSlot(e) &&
+    ((e.dow === 0 || e.dow === 6) ? 'weekend' : 'weekday') === scope);
+  const pool = composite.length >= 5 ? composite : _history.filter(inSlot);
+  if (pool.length < 5) return null;
+
+  const recent   = pool.slice(-40);
+  const centroid = _computeCentroid(recent);
+  const def      = centroid ? (FEELING_DEFS[_guessFeeling(centroid)] || {}) : {};
+  const counts   = new Map();
+  for (const e of recent) if (e.artist) counts.set(e.artist, (counts.get(e.artist) || 0) + 1);
+  const topArtist = [...counts.entries()].sort((a, b) => b[1] - a[1])[0];
+  const seedEntry = [...recent].reverse().find(e => e.id || e.uri);
+
+  const now = new Date();
+  const hr = now.getHours();
+  const hour12 = ((hr + 11) % 12) + 1;
+  const ampm = hr < 12 ? 'am' : 'pm';
+  return {
+    emoji: def.emoji || '🕰️',
+    headline: `It's ${now.toLocaleDateString([], { weekday: 'long' })} ${hour12}${ampm}`,
+    sub: `Your ${SLOT_LABELS[slot] || slot} usually lean ${def.label ? def.label.toLowerCase() : 'familiar'}${topArtist ? ` — often ${topArtist[0]}` : ''}`,
+    sampleSize: recent.length,
+    seed: seedEntry ? {
+      uri: seedEntry.uri || (seedEntry.id ? `spotify:track:${seedEntry.id}` : null),
+      id: seedEntry.id || null,
+      title: seedEntry.title || '',
+      artist: seedEntry.artist || '',
+    } : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Polling
 // ---------------------------------------------------------------------------
 
 let _pollInFlight = false;
 
 async function poll() {
-  // Never let poll cycles overlap. The 5 s interval can fire again while a slow
+  // Never let poll cycles overlap. A boundary poll can fire while a slow
   // (rate-limited) cycle is still draining; without this guard each tick stacks
   // another getPlaybackState + checkLiked + refill onto the queue, so the backlog
   // grows without bound and interactive requests never get a turn.
@@ -4465,34 +4998,81 @@ async function poll() {
   }
 }
 
-function startPolling() {
-  if (_pollTimer) return;
-  poll(); // immediate first poll
-  _pollTimer = setInterval(poll, _currentPollInterval);
-  // Seed history from Spotify in the background (non-blocking)
-  if (_seedTimestamp === 0) seedFromSpotify().catch(() => {});
-  // Warm audio features for the whole library in the background (idle-time job).
-  // Delayed so it yields to the initial seed + the first live plays, then re-scans
-  // periodically for newly-liked songs.
-  if (!_featureWarmTimer) {
-    setTimeout(() => warmFeatureLibrary().catch(() => {}), FEATURE_WARM_START_DELAY);
-    _featureWarmTimer = setInterval(() => warmFeatureLibrary().catch(() => {}), FEATURE_WARM_INTERVAL);
+// ── Adaptive playback monitor ───────────────────────────────────────────────
+// Self-scheduling poll loop. After each poll we derive the next delay from the
+// fresh state: a slow base while a song plays through, one precise poll at the
+// predicted song-end boundary, and a rare cadence when idle. UI actions call
+// refreshNow() to poll immediately instead of waiting for the next tick.
+function _nextPollDelay() {
+  const s = _lastState;
+  if (!s || !s.track || !s.isPlaying) return POLL_IDLE;
+  const dur = s.track.duration;
+  const prog = s.progress;
+  if (dur != null && prog != null && dur > prog) {
+    // _lastState was captured moments ago, so (dur - prog) ≈ time-from-now until
+    // this track ends. If that lands inside the next base window, fire one precise
+    // poll just past the boundary to catch the new track right away.
+    const toEnd = dur - prog + POLL_END_MARGIN;
+    if (toEnd < POLL_BASE) return Math.max(POLL_MIN, toEnd);
   }
-  // Reconcile away-listening every 30 minutes
+  return POLL_BASE;
+}
+
+function _scheduleNextPoll() {
+  if (!_polling) return;
+  clearTimeout(_pollTimeout);
+  _pollTimeout = setTimeout(_pollTick, _nextPollDelay());
+}
+
+async function _pollTick() {
+  await poll();
+  _scheduleNextPoll();
+}
+
+// Poll Spotify right now (debounced) — call on any UI action that changes
+// playback (play/pause/skip/seek). The debounce coalesces command bursts and
+// gives Spotify's state a moment to settle before we read it back.
+function refreshNow(reason) {
+  if (!_polling) return;
+  clearTimeout(_pollTimeout);
+  _pollTimeout = setTimeout(_pollTick, POLL_REFRESH_DEBOUNCE);
+  if (reason) console.log(`[Spotify] immediate refresh (${reason})`);
+}
+
+function startPolling() {
+  if (_polling) return;
+  _polling = true;
+  _pollTick(); // immediate first poll, then self-schedules adaptively
+
+  // Background jobs are STAGGERED so they never storm Spotify alongside the first
+  // interactive loads (player/queue/playlists). Each job also self-gates on
+  // _spotifyRateLimited() so a ban pauses them. The seed is delayed (not fired
+  // immediately) to give the live player a clean first read; its own in-flight
+  // guard prevents overlap with the hourly refresh.
+  if (_seedTimestamp === 0) {
+    setTimeout(() => seedFromSpotify().catch(() => {}), SEED_START_DELAY);
+  }
+  // Reconcile away-listening, first run ~1 min after startup, then on its interval.
   if (!_reconcileTimer) {
-    // First reconcile shortly after startup, then on the regular interval
-    setTimeout(() => reconcileRecentlyPlayed().catch(() => {}), 60 * 1000);
+    setTimeout(() => reconcileRecentlyPlayed().catch(() => {}), RECONCILE_START_DELAY);
     _reconcileTimer = setInterval(
       () => reconcileRecentlyPlayed().catch(() => {}),
       RECONCILE_INTERVAL
     );
   }
+  // Warm audio features for the whole library — the heaviest job, last and latest,
+  // then re-scans every few hours for newly-liked songs.
+  if (!_featureWarmTimer) {
+    setTimeout(() => warmFeatureLibrary().catch(() => {}), FEATURE_WARM_START_DELAY);
+    _featureWarmTimer = setInterval(() => warmFeatureLibrary().catch(() => {}), FEATURE_WARM_INTERVAL);
+  }
 }
 
 function stopPolling() {
-  if (_pollTimer) {
-    clearInterval(_pollTimer);
-    _pollTimer = null;
+  _polling = false;
+  if (_pollTimeout) {
+    clearTimeout(_pollTimeout);
+    _pollTimeout = null;
   }
   if (_reconcileTimer) {
     clearInterval(_reconcileTimer);
@@ -4543,7 +5123,15 @@ function init(io) {
   loadFeaturesDB();
   loadTasteProfile();
   loadFeelingLog();
+  loadBreakerState(); // restore an in-progress hard ban so a restart stays quiet
   loadLiveState(); // after loadSessions so stale-session finalize can de-dupe
+
+  // One health line per minute (idle minutes skipped). unref so it never keeps
+  // the process alive on its own.
+  if (!_healthTimer) {
+    _healthTimer = setInterval(_logHealth, 60000);
+    if (_healthTimer.unref) _healthTimer.unref();
+  }
 
   // Start polling if already authed
   if (isAuthed()) {
@@ -4670,8 +5258,9 @@ function init(io) {
             return;
         }
 
-        // Delayed poll to pick up changes
-        setTimeout(() => poll(), 800);
+        // Refresh immediately (debounced) to pick up the change and re-anchor the
+        // adaptive poll schedule around the new playback state.
+        refreshNow(action);
       } catch (err) {
         const status = err.status ? ` (HTTP ${err.status})` : '';
         console.error(`[Spotify] Command error (${action})${status}:`, err.message);
@@ -4683,7 +5272,7 @@ function init(io) {
         }
         socket.emit('spotify:error', { message: `${action} failed${status}: ${err.message}` });
         // Re-poll so any optimistically-toggled UI (shuffle, repeat) snaps back to real state
-        setTimeout(() => poll(), 300);
+        refreshNow(`${action}-failed`);
       }
     });
 
@@ -4745,12 +5334,12 @@ function init(io) {
     // ----- spotify:get_playlists -----
     // ownedOnly=true  → filter to playlists the user can modify (for the "add to playlist" picker)
     // ownedOnly=false → return all playlists (for the playlist browser card)
-    socket.on('spotify:get_playlists', async ({ ownedOnly = false } = {}) => {
+    socket.on('spotify:get_playlists', async ({ ownedOnly = false, refresh = false } = {}) => {
       try {
         if (!_userId) await getUserProfile();
-        console.log(`[Spotify] get_playlists: userId=${_userId} ownedOnly=${ownedOnly}`);
+        console.log(`[Spotify] get_playlists: userId=${_userId} ownedOnly=${ownedOnly} refresh=${refresh}`);
 
-        const data = await getAllPlaylists();
+        const data = await getAllPlaylists(refresh);
         const playlists =
           data && data.items
             ? data.items
@@ -4801,9 +5390,9 @@ function init(io) {
     });
 
     // ----- spotify:get_liked_songs -----
-    socket.on('spotify:get_liked_songs', async () => {
+    socket.on('spotify:get_liked_songs', async ({ refresh = false } = {}) => {
       try {
-        const allItems = await getAllLikedSongs();
+        const allItems = await getAllLikedSongs('high', refresh);
         const tracks = allItems
           // Feb 2026: response field renamed track → item; keep both for safety
           .map((entry) => entry.item || entry.track)
@@ -5071,6 +5660,40 @@ function init(io) {
       });
     });
 
+    // ----- spotify:get_portraits -----  (Portraits tab: #9 + #5)
+    socket.on('spotify:get_portraits', () => {
+      try {
+        socket.emit('spotify:portraits', {
+          timeMachine: buildTimeMachine(),
+          portraits:   buildPortraits(),
+        });
+      } catch (err) {
+        console.error('[Spotify] get_portraits error:', err.message);
+        socket.emit('spotify:portraits', { timeMachine: null, portraits: [] });
+      }
+    });
+
+    // ----- spotify:time_machine_play -----  seed the engine from a past same-slot play
+    socket.on('spotify:time_machine_play', async () => {
+      try {
+        const tm = buildTimeMachine();
+        const seed = tm && tm.seed;
+        if (!seed || !seed.uri) {
+          socket.emit('spotify:insights_action', { ok: false, msg: 'Not enough history for this time slot yet' });
+          return;
+        }
+        _activeMoodKey = null; _activeVibeKey = null; _activeFeeling = null;
+        await _sqStartFromSeed('rightnow', seed.uri, {
+          uri: seed.uri, id: seed.id, title: seed.title, artist: seed.artist,
+        });
+        socket.emit('spotify:insights_action', { ok: true, msg: `Time machine · ${seed.title || 'your past vibe'} 🕰️` });
+        _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: null });
+        setTimeout(emitQueue, 1500);
+      } catch (err) {
+        socket.emit('spotify:insights_action', { ok: false, msg: err.message });
+      }
+    });
+
     // ----- spotify:checkin_response -----
     socket.on('spotify:checkin_response', async ({ feeling } = {}) => {
       if (!_pendingCheckIn || !FEELING_DEFS[feeling]) return;
@@ -5195,21 +5818,28 @@ function init(io) {
     socket.on('spotify:get_queue', async () => {
       try {
         const data = await getQueue();
+        const ann = _sqWindowAnnotations();
         const items =
           data && data.queue
-            ? data.queue.slice(0, 30).map((t) => ({
-                id: t.id,
-                uri: t.uri,
-                title: t.name,
-                artist: t.artists ? t.artists.map((a) => a.name).join(', ') : '',
-                albumArt:
-                  t.album && t.album.images && t.album.images.length > 0
-                    ? t.album.images[0].url
-                    : null,
-                duration: t.duration_ms,
-              }))
+            ? data.queue.slice(0, 30).map((t) => {
+                const a = ann.get(t.uri) || ann.get(t.id) || null;
+                return {
+                  id: t.id,
+                  uri: t.uri,
+                  title: t.name,
+                  artist: t.artists ? t.artists.map((x) => x.name).join(', ') : '',
+                  albumArt:
+                    t.album && t.album.images && t.album.images.length > 0
+                      ? t.album.images[0].url
+                      : null,
+                  duration: t.duration_ms,
+                  source: a ? a.source : undefined,
+                  reason: a ? a.reason : undefined,
+                  smoothMix: a ? a.smoothMix : undefined,
+                };
+              })
             : [];
-        socket.emit('spotify:queue', { items });
+        socket.emit('spotify:queue', { items, meta: _sqInsightStrip() });
       } catch (err) {
         console.error('[Spotify] Get queue error:', err.message);
         socket.emit('spotify:error', { message: err.message });

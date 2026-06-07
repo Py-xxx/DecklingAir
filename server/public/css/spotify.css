@@ -853,7 +853,71 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* "Why-picked" reason line — the magic factor: shows WHY the engine chose this
+   song (loved artist · late-night match · smooth mix · fresh discovery). */
+.sp-queue-row-reason {
+  font-size: 10px;
+  line-height: 1.3;
+  color: var(--accent, #1db954);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0.85;
+  margin-top: 1px;
+}
+/* Subtle left accent on our own picks so they read as curated, not random. */
+.sp-queue-row--ours {
+  box-shadow: inset 2px 0 0 var(--accent, #1db954);
+}
+.sp-queue-row--smooth .sp-queue-row-reason { color: #7ad0ff; }
+.sp-smooth-dot {
+  font-weight: 700;
+  color: #7ad0ff;
+}
+.sp-queue-compact .sp-queue-row-reason { display: none; }
+
+/* Header insight strip: streak callout + energy sparkline + key journey.
+   The "magic factor" at a glance — hidden entirely when no Smart Queue is live. */
+.sp-queue-strip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 6px 6px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--border, #2a2a2a);
+}
+.sp-queue-strip-streak {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent, #1db954);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sp-queue-strip.is-closing .sp-queue-strip-streak { color: #b48cff; }
+.sp-queue-strip-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sp-queue-spark {
+  color: var(--accent, #1db954);
+  flex-shrink: 0;
+  opacity: 0.9;
+}
+.sp-queue-strip.is-closing .sp-queue-spark { color: #b48cff; }
+.sp-queue-journey {
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  color: var(--text-3, #888);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* Compact queue (narrow card) — hide art and duration, shrink text */
+.sp-queue-compact .sp-queue-strip { display: none; }
 .sp-queue-compact .sp-thumb {
   display: none;
 }
@@ -1853,6 +1917,68 @@
   color: var(--text-2, #aaa);
   flex-shrink: 0;
 }
+
+/* ---- Portraits tab: time-machine banner (#5) + context portrait grid (#9) ---- */
+.sp-ins-tm {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  margin-bottom: 10px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgba(180,140,255,0.16), rgba(29,185,84,0.10));
+  border: 1px solid rgba(180,140,255,0.25);
+}
+.sp-ins-tm-emoji { font-size: 22px; flex-shrink: 0; }
+.sp-ins-tm-info { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.sp-ins-tm-headline { font-size: 12px; font-weight: 700; color: var(--text, #fff); }
+.sp-ins-tm-sub {
+  font-size: 11px; color: var(--text-2, #bbb);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sp-ins-tm-play {
+  flex-shrink: 0;
+  width: 30px; height: 30px;
+  border-radius: 50%;
+  border: none;
+  background: var(--sp-green, #1DB954);
+  color: #fff; font-size: 13px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+}
+.sp-ins-tm-play:hover { filter: brightness(1.1); }
+
+.sp-ins-portraits-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 8px;
+  margin-top: 6px;
+}
+.sp-ins-portrait {
+  padding: 8px;
+  border-radius: 8px;
+  background: var(--bg-2, #1c1c1c);
+  border: 1px solid var(--border, #2a2a2a);
+}
+.sp-ins-portrait-head { display: flex; align-items: center; gap: 6px; }
+.sp-ins-portrait-emoji { font-size: 14px; }
+.sp-ins-portrait-title {
+  font-size: 11px; font-weight: 700; color: var(--text, #fff);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sp-ins-portrait-feel { font-size: 10px; color: var(--text-2, #aaa); margin: 3px 0 5px; }
+.sp-ins-portrait-bars { display: flex; flex-direction: column; gap: 3px; }
+.sp-ins-portrait-bar {
+  display: block; height: 4px; border-radius: 2px;
+  background: var(--bg-3, #2a2a2a); overflow: hidden;
+}
+.sp-ins-portrait-bar i { display: block; height: 100%; background: var(--sp-green, #1DB954); }
+.sp-ins-portrait-bar--v i { background: #f0a93b; }
+.sp-ins-portrait-artists {
+  font-size: 10px; color: var(--text-2, #aaa); margin-top: 5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sp-ins-portrait-count { font-size: 9px; color: var(--text-3, #777); margin-top: 3px; }
+.sp-ins-portraits-empty { font-size: 11px; color: var(--text-2, #999); padding: 12px 4px; }
 
 /* Shared action button */
 .sp-ins-action-btn {

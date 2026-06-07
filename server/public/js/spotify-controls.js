@@ -1723,6 +1723,13 @@ function renderSpotifyQueue(ctrl) {
         </span>
         <button class="sp-icon-btn sp-queue-refresh" aria-label="Refresh queue">${SVG.refresh()}</button>
       </div>
+      <div class="sp-queue-strip" hidden>
+        <div class="sp-queue-strip-streak"></div>
+        <div class="sp-queue-strip-meta">
+          <svg class="sp-queue-spark" width="64" height="16" viewBox="0 0 64 16" preserveAspectRatio="none" aria-hidden="true"></svg>
+          <span class="sp-queue-journey" title="Harmonic key journey of the upcoming queue"></span>
+        </div>
+      </div>
       <div class="sp-queue-list"></div>
     </div>
   `;
@@ -1734,6 +1741,48 @@ function renderSpotifyQueue(ctrl) {
   const listEl     = card.querySelector('.sp-queue-list');
   const refreshBtn = card.querySelector('.sp-queue-refresh');
   const autoPill   = card.querySelector('.sp-queue-auto-pill');
+  const stripEl    = card.querySelector('.sp-queue-strip');
+  const streakEl   = card.querySelector('.sp-queue-strip-streak');
+  const sparkEl    = card.querySelector('.sp-queue-spark');
+  const journeyEl  = card.querySelector('.sp-queue-journey');
+
+  // Render the header insight strip from the Smart Queue meta summary. Hidden
+  // entirely when no session is active, so plain playback stays clean.
+  function _renderStrip(meta) {
+    if (!meta || (!meta.streak && !(meta.journey && meta.journey.length) && !(meta.energy && meta.energy.length))) {
+      stripEl.hidden = true;
+      return;
+    }
+    stripEl.hidden = false;
+    stripEl.classList.toggle('is-closing', !!meta.setCloser);
+
+    streakEl.textContent = meta.streak || '';
+    streakEl.style.display = meta.streak ? '' : 'none';
+
+    // #2 — key journey "8A → 9A → 10A"
+    const j = (meta.journey || []).filter(Boolean);
+    journeyEl.textContent = j.length ? j.join(' → ') : '';
+    journeyEl.style.display = j.length ? '' : 'none';
+
+    // #4 — energy sparkline: map non-null energies to a 0..16 polyline across 64px.
+    const pts = (meta.energy || []);
+    const valid = pts.filter(v => v != null);
+    if (valid.length >= 2) {
+      const n = pts.length;
+      const coords = [];
+      pts.forEach((v, i) => {
+        if (v == null) return;
+        const x = n > 1 ? (i / (n - 1)) * 62 + 1 : 32;
+        const y = 15 - (Math.max(0, Math.min(100, v)) / 100) * 14; // 1..15, higher energy = higher
+        coords.push(`${x.toFixed(1)},${y.toFixed(1)}`);
+      });
+      sparkEl.innerHTML = `<polyline points="${coords.join(' ')}" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>`;
+      sparkEl.style.display = '';
+    } else {
+      sparkEl.innerHTML = '';
+      sparkEl.style.display = 'none';
+    }
+  }
 
   // ---- "Auto" pill: reflects the continuous engine + flashes on refill ----
   let _autoActive = false;
@@ -1756,6 +1805,7 @@ function renderSpotifyQueue(ctrl) {
 
   function _render(data) {
     listEl.innerHTML = '';
+    _renderStrip(data && data.meta);
     const items = (data && data.items) ? data.items : [];
     if (!items.length) {
       listEl.innerHTML = '<div class="sp-queue-empty">Queue empty</div>';
@@ -1764,6 +1814,13 @@ function renderSpotifyQueue(ctrl) {
     items.forEach((track) => {
       const row = document.createElement('div');
       row.className = 'sp-queue-row';
+      if (track.source === 'ours') row.classList.add('sp-queue-row--ours');
+      if (track.smoothMix) row.classList.add('sp-queue-row--smooth');
+      // "Why-picked" line: surfaces the engine's reasoning (loved artist · late-night
+      // match · smooth mix · fresh discovery). Only Smart Queue picks carry a reason.
+      const reasonHtml = track.reason
+        ? `<div class="sp-queue-row-reason">${track.smoothMix ? '<span class="sp-smooth-dot" title="Harmonically smooth transition">∿</span> ' : ''}${_esc(track.reason)}</div>`
+        : '';
       row.innerHTML = `
         ${track.albumArt
           ? `<img src="${track.albumArt}" class="sp-thumb sp-thumb--sm" width="32" height="32" alt="">`
@@ -1771,6 +1828,7 @@ function renderSpotifyQueue(ctrl) {
         <div class="sp-queue-row-info">
           <div class="sp-queue-row-title">${_esc(track.title)}</div>
           <div class="sp-queue-row-artist">${_esc(track.artist)}</div>
+          ${reasonHtml}
         </div>
         <div class="sp-queue-row-duration">${fmtMs(track.duration)}</div>
       `;
@@ -2255,6 +2313,7 @@ export function renderSpotifyInsights(ctrl) {
     <div class="sp-ins-wrap">
       <div class="sp-ins-tab-bar">
         <button class="sp-ins-tab active" data-tab="profile">Profile</button>
+        <button class="sp-ins-tab" data-tab="portraits">Portraits</button>
         <button class="sp-ins-tab" data-tab="vibes">Vibes</button>
         <button class="sp-ins-tab" data-tab="mood">Mood</button>
         <button class="sp-ins-tab" data-tab="tuning">Tuning</button>
@@ -2299,6 +2358,21 @@ export function renderSpotifyInsights(ctrl) {
               <span class="sp-ins-signal-icon">💬</span><span class="sp-ins-signal-val">0</span> feeling labels
             </span>
           </div>
+        </div>
+
+        <!-- PORTRAITS (#9 per-context taste portraits + #5 time-machine) -->
+        <div class="sp-ins-panel" data-panel="portraits" style="display:none">
+          <div class="sp-ins-tm" style="display:none">
+            <span class="sp-ins-tm-emoji">🕰️</span>
+            <div class="sp-ins-tm-info">
+              <span class="sp-ins-tm-headline">—</span>
+              <span class="sp-ins-tm-sub"></span>
+            </div>
+            <button class="sp-ins-tm-play" title="Play this time-of-day vibe">▶</button>
+          </div>
+          <div class="sp-ins-portraits-title sp-ins-sub-title">Your sound, by time of day</div>
+          <div class="sp-ins-portraits-grid"></div>
+          <div class="sp-ins-portraits-empty" style="display:none">Keep listening — portraits appear once each part of your day has a few plays.</div>
         </div>
 
         <!-- VIBES -->
@@ -2386,7 +2460,59 @@ export function renderSpotifyInsights(ctrl) {
     tabBar.querySelectorAll('.sp-ins-tab').forEach(t => t.classList.remove('active'));
     btn.classList.add('active');
     panels.forEach(p => p.style.display = p.dataset.panel === btn.dataset.tab ? '' : 'none');
+    if (btn.dataset.tab === 'portraits') socket.emit('spotify:get_portraits');
   });
+
+  // ---- Portraits tab (#9) + time-machine (#5) ----
+  const tmEl       = card.querySelector('.sp-ins-tm');
+  const tmHeadline = card.querySelector('.sp-ins-tm-headline');
+  const tmSub      = card.querySelector('.sp-ins-tm-sub');
+  const tmEmoji    = card.querySelector('.sp-ins-tm-emoji');
+  const tmPlay     = card.querySelector('.sp-ins-tm-play');
+  const portraitsGrid  = card.querySelector('.sp-ins-portraits-grid');
+  const portraitsEmpty = card.querySelector('.sp-ins-portraits-empty');
+
+  tmPlay.addEventListener('pointerup', () => {
+    if (isEditMode()) return;
+    socket.emit('spotify:time_machine_play');
+  });
+
+  function _renderPortraits(data) {
+    const tm = data && data.timeMachine;
+    if (tm) {
+      tmEl.style.display = '';
+      tmEmoji.textContent = tm.emoji || '🕰️';
+      tmHeadline.textContent = tm.headline || '';
+      tmSub.textContent = tm.sub || '';
+      tmPlay.style.display = (tm.seed && tm.seed.uri) ? '' : 'none';
+    } else {
+      tmEl.style.display = 'none';
+    }
+    const list = (data && data.portraits) ? data.portraits : [];
+    portraitsGrid.innerHTML = '';
+    portraitsEmpty.style.display = list.length ? 'none' : '';
+    list.forEach((p) => {
+      const cell = document.createElement('div');
+      cell.className = 'sp-ins-portrait';
+      const artists = (p.topArtists || []).slice(0, 2).join(', ');
+      cell.innerHTML = `
+        <div class="sp-ins-portrait-head">
+          <span class="sp-ins-portrait-emoji">${p.emoji || '🎧'}</span>
+          <span class="sp-ins-portrait-title">${_esc(p.title)}</span>
+        </div>
+        <div class="sp-ins-portrait-feel">${_esc(p.feeling)}${p.bpm ? ` · ${p.bpm} bpm` : ''}</div>
+        <div class="sp-ins-portrait-bars">
+          <span class="sp-ins-portrait-bar" title="Energy"><i style="width:${Math.max(0, Math.min(100, p.energy))}%"></i></span>
+          <span class="sp-ins-portrait-bar sp-ins-portrait-bar--v" title="Positivity"><i style="width:${Math.max(0, Math.min(100, p.valence))}%"></i></span>
+        </div>
+        ${artists ? `<div class="sp-ins-portrait-artists">${_esc(artists)}</div>` : ''}
+        <div class="sp-ins-portrait-count">${p.count} plays</div>
+      `;
+      portraitsGrid.appendChild(cell);
+    });
+  }
+  const _onPortraits = (data) => _renderPortraits(data);
+  socket.on('spotify:portraits', _onPortraits);
 
   // ---- Feedback helper ----
   function _showFeedback(msg, ok = true) {
@@ -2773,6 +2899,7 @@ export function renderSpotifyInsights(ctrl) {
       socket.off('spotify:tuning',          _onTuning);
       socket.off('spotify:continuous_state', _onContinuousState);
       socket.off('spotify:insights',        _onInsights);
+      socket.off('spotify:portraits',       _onPortraits);
       _insRo.disconnect();
       _cleanObs.disconnect();
     }
