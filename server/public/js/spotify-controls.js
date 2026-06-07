@@ -589,6 +589,20 @@ function _applyMarquee(containerEl) {
   }));
 }
 
+// Set the text of a marquee clip (a container holding one inner <span>) and
+// (re)measure it, exactly like the player does for long titles/artists. Creates
+// the inner span if missing. Only re-applies the marquee when the text changes.
+function _setMarqueeText(clipEl, text) {
+  if (!clipEl) return;
+  let span = clipEl.querySelector(':scope > span');
+  if (!span) { span = document.createElement('span'); clipEl.appendChild(span); }
+  const str = text == null ? '' : String(text);
+  if (span.textContent !== str) {
+    span.textContent = str;
+    _applyMarquee(clipEl);
+  }
+}
+
 // Recently-played playlist IDs — tracked client-side for the "Recent" sort
 let _recentPlaylistIds = [];
 
@@ -1820,11 +1834,15 @@ function renderSpotifyQueue(ctrl) {
       const row = document.createElement('div');
       row.className = 'sp-queue-row';
       if (track.source === 'ours') row.classList.add('sp-queue-row--ours');
+      if (track.source === 'manual') row.classList.add('sp-queue-row--manual');
       if (track.smoothMix) row.classList.add('sp-queue-row--smooth');
       // "Why-picked" line: surfaces the engine's reasoning (loved artist · late-night
       // match · smooth mix · fresh discovery). Only Smart Queue picks carry a reason.
+      // Wrap the reason in a marquee clip (clip div → one inner span) so long
+      // "one of your most-played · loved artist · evening match" lines scroll
+      // instead of clipping — exactly like the player's title/artist.
       const reasonHtml = track.reason
-        ? `<div class="sp-queue-row-reason">${track.smoothMix ? '<span class="sp-smooth-dot" title="Harmonically smooth transition">∿</span> ' : ''}${_esc(track.reason)}</div>`
+        ? `<div class="sp-queue-row-reason"><span>${track.smoothMix ? '<span class="sp-smooth-dot" title="Harmonically smooth transition">∿</span> ' : ''}${_esc(track.reason)}</span></div>`
         : '';
       row.innerHTML = `
         ${track.albumArt
@@ -1838,6 +1856,9 @@ function renderSpotifyQueue(ctrl) {
         <div class="sp-queue-row-duration">${fmtMs(track.duration)}</div>
       `;
       listEl.appendChild(row);
+      // Scroll long reason lines once they're laid out in the DOM.
+      const reasonClip = row.querySelector('.sp-queue-row-reason');
+      if (reasonClip) _applyMarquee(reasonClip);
     });
   }
 
@@ -1850,9 +1871,15 @@ function renderSpotifyQueue(ctrl) {
   });
 
   // Compact mode: hide art + duration when card is narrow
+  let _reasonMarqueeTimer = null;
   const queueRo = new ResizeObserver(entries => {
     const w = entries[0].contentRect.width;
     card.classList.toggle('sp-queue-compact', w < 160);
+    // Re-measure reason marquees on width change, like the player does.
+    clearTimeout(_reasonMarqueeTimer);
+    _reasonMarqueeTimer = setTimeout(() => {
+      listEl.querySelectorAll('.sp-queue-row-reason').forEach(_applyMarquee);
+    }, 60);
   });
   queueRo.observe(card);
 
@@ -3206,8 +3233,8 @@ export function renderSpotifyIntelligence(ctrl) {
         <div class="sp-intel-predict" style="display:none">
           <span class="sp-intel-predict-emoji"></span>
           <div class="sp-intel-predict-info">
-            <span class="sp-intel-predict-name">—</span>
-            <span class="sp-intel-predict-sub"></span>
+            <div class="sp-intel-predict-name"><span>—</span></div>
+            <div class="sp-intel-predict-sub"><span></span></div>
             <div class="sp-intel-predict-bars" style="display:none">
               <span class="sp-intel-predict-bar" title="Energy"><i class="sp-intel-predict-bar-e"></i></span>
               <span class="sp-intel-predict-bar sp-intel-predict-bar--v" title="Positivity"><i class="sp-intel-predict-bar-v"></i></span>
@@ -3321,12 +3348,15 @@ export function renderSpotifyIntelligence(ctrl) {
     if (cp && cp.feelingLabel) {
       _predictMoodKey = cp.moodKey || null;
       predictEmoji.textContent = cp.emoji || cp.moodEmoji || '🎧';
-      predictName.textContent  = cp.moodName || cp.feelingLabel;
+      _setMarqueeText(predictName, cp.moodName || cp.feelingLabel);
       const artists = (cp.topArtists || []).slice(0, 2).map(a => a.name).join(', ');
-      const basis = cp.source === 'reported'
-        ? `${cp.label} · you usually feel ${cp.feelingLabel.toLowerCase()}`
-        : `${cp.label} · usually sounds ${cp.feelingLabel.toLowerCase()}`;
-      predictSub.textContent = artists ? `${basis} · ${artists}` : basis;
+      // Personal, Portraits-style line from the server (timezone-aware clock),
+      // e.g. "It's 7pm, your nights usually feel angsty · Sleep Token, …".
+      const basis = cp.personal
+        || (cp.source === 'reported'
+              ? `${cp.label} · you usually feel ${cp.feelingLabel.toLowerCase()}`
+              : `${cp.label} · usually sounds ${cp.feelingLabel.toLowerCase()}`);
+      _setMarqueeText(predictSub, artists ? `${basis} · ${artists}` : basis);
       // Portraits-style energy / positivity bars + taste-drift for this slot.
       if (cp.energy != null && cp.valence != null) {
         predictBarE.style.width = Math.max(0, Math.min(100, cp.energy)) + '%';
@@ -3347,8 +3377,8 @@ export function renderSpotifyIntelligence(ctrl) {
     } else if (context?.suggestedMoodName) {
       _predictMoodKey = context.suggestedMoodKey || null;
       predictEmoji.textContent = context.suggestedMoodEmoji || '🎧';
-      predictName.textContent  = context.suggestedMoodName;
-      predictSub.textContent   = 'a guess from your time-of-day patterns';
+      _setMarqueeText(predictName, context.suggestedMoodName);
+      _setMarqueeText(predictSub, 'a guess from your time-of-day patterns');
       predictBars.style.display = 'none';
       predictDrift.style.display = 'none';
       predictPlay.style.display = _predictMoodKey ? '' : 'none';
@@ -3478,6 +3508,7 @@ export function renderSpotifyIntelligence(ctrl) {
   // Adapt the layout to the card's footprint so nothing clips on small grids
   // (e.g. a 3×2 cell). `compact` tightens spacing + drops the listening-pattern
   // bar; `tiny` collapses the prediction sub-line and check-in label too.
+  let _predictMarqueeTimer = null;
   const _intelRo = new ResizeObserver(entries => {
     const { height, width } = entries[0].contentRect;
     // Progressive collapse so the card always fits its panel instead of clipping:
@@ -3489,6 +3520,13 @@ export function renderSpotifyIntelligence(ctrl) {
     card.classList.toggle('sp-intel-tiny',    height < 210);
     card.classList.toggle('sp-intel-micro',   height < 165);
     card.classList.toggle('sp-intel-narrow',  width  < 210);
+    // Re-measure the prediction marquees when the card width changes, just like
+    // the player re-measures its title/artist on resize.
+    clearTimeout(_predictMarqueeTimer);
+    _predictMarqueeTimer = setTimeout(() => {
+      _applyMarquee(predictName);
+      _applyMarquee(predictSub);
+    }, 60);
   });
   _intelRo.observe(card);
 

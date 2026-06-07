@@ -860,15 +860,26 @@
   line-height: 1.3;
   color: var(--accent, #1db954);
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow: hidden;          /* marquee clip — long reason chains scroll */
   opacity: 0.85;
   margin-top: 1px;
+}
+/* Inner span scrolls inside the reason clip, like the player title/artist. */
+.sp-queue-row-reason > span {
+  display: inline-block;
+  white-space: nowrap;
+  will-change: transform;
+  --sp-scroll-shift: 0px;
 }
 /* Subtle left accent on our own picks so they read as curated, not random. */
 .sp-queue-row--ours {
   box-shadow: inset 2px 0 0 var(--accent, #1db954);
 }
+/* Manually-added tracks (queued from search) get a distinct amber accent. */
+.sp-queue-row--manual {
+  box-shadow: inset 2px 0 0 #f0a93b;
+}
+.sp-queue-row--manual .sp-queue-row-reason { color: #f0a93b; }
 .sp-queue-row--smooth .sp-queue-row-reason { color: #7ad0ff; }
 .sp-smooth-dot {
   font-weight: 700;
@@ -2939,15 +2950,22 @@
   font-weight: 700;
   color: var(--text, #fff);
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow: hidden;          /* marquee clip — long mood names scroll */
 }
 .sp-intel-predict-sub {
   font-size: 10px;
   color: var(--text-3, #9a9a9a);
-  white-space: normal;       /* let the full "you usually go for…" line wrap */
-  overflow-wrap: break-word;
+  white-space: nowrap;       /* marquee clip — the personal line scrolls if long */
+  overflow: hidden;
   line-height: 1.3;
+}
+/* Inner spans scroll inside their clip, exactly like the player title/artist. */
+.sp-intel-predict-name > span,
+.sp-intel-predict-sub > span {
+  display: inline-block;
+  white-space: nowrap;
+  will-change: transform;
+  --sp-scroll-shift: 0px;
 }
 /* Portraits-style energy / positivity bars + taste-drift, surfaced inline so
    the current slot's personal portrait lives here instead of the Portraits grid. */
