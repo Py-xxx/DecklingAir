@@ -895,6 +895,10 @@
   text-overflow: ellipsis;
 }
 .sp-queue-strip.is-closing .sp-queue-strip-streak { color: #b48cff; }
+/* #3 explore/exploit momentum: restless leans warm, locked leans confident green */
+.sp-queue-strip.is-restless .sp-queue-strip-streak { color: #ffb454; }
+.sp-queue-strip.is-restless .sp-queue-spark { color: #ffb454; }
+.sp-queue-strip.is-locked .sp-queue-strip-streak { color: #1ed760; }
 .sp-queue-strip-meta {
   display: flex;
   align-items: center;
@@ -1978,7 +1982,31 @@
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .sp-ins-portrait-count { font-size: 9px; color: var(--text-3, #777); margin-top: 3px; }
+/* #5 taste-drift line */
+.sp-ins-portrait-drift {
+  font-size: 9px; font-weight: 600; color: #7ad0ff; margin-top: 3px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .sp-ins-portraits-empty { font-size: 11px; color: var(--text-2, #999); padding: 12px 4px; }
+
+/* #7 your day in music recap */
+.sp-ins-recap {
+  background: var(--bg-2, #1c1c1c);
+  border: 1px solid var(--border, #2a2a2a);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+}
+.sp-ins-recap-head { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.sp-ins-recap-emoji { font-size: 16px; }
+.sp-ins-recap-title { font-size: 12px; font-weight: 700; color: var(--text, #fff); }
+.sp-ins-recap-body { display: flex; flex-wrap: wrap; gap: 5px; }
+.sp-ins-recap-stat {
+  font-size: 10px; color: var(--text-2, #bbb);
+  background: var(--bg-3, #2a2a2a); border-radius: 10px; padding: 2px 8px;
+}
+.sp-ins-recap-stat b { color: var(--text, #fff); }
+.sp-ins-recap-find { color: #7ad0ff; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Shared action button */
 .sp-ins-action-btn {

@@ -296,6 +296,7 @@ let _transitionPrevId = null;    // id of the track that played immediately befo
 const TRANSITION_KEY = (from, to) => `${from}>${to}`;
 const TRANSITION_CLAMP = 5;      // bound each pair so one outlier can't dominate
 const TRANSITION_WEIGHT = 0.20;  // how much a learned transition can shift a flow score
+const REDISCOVER_MIN_AGE_MS = 21 * 24 * 60 * 60 * 1000; // "haven't heard in a while" floor (#2)
 
 // ── Cluster & feeling detection ───────────────────────────────────────────────
 let _currentCluster    = [];     // tracks in the current emerging cluster (with features)
@@ -1758,6 +1759,54 @@ function _artistBoost(artist) {
   return Math.max(0, _artistTaste.get(artist.toLowerCase()) || 0);
 }
 
+// Per-artist "sound" centroid (energy/valence/bpm) learned from real listening
+// history, cached briefly since history grows slowly. This is the backbone of the
+// "because you love X" anchoring (#1): it lets us measure how close a fresh pick
+// sits to an artist you already love.
+const ARTIST_CENTROID_TTL = 10 * 60 * 1000;
+let _artistCentroidCache = null;
+let _artistCentroidAt = 0;
+function _artistCentroids() {
+  if (_artistCentroidCache && Date.now() - _artistCentroidAt < ARTIST_CENTROID_TTL) return _artistCentroidCache;
+  const groups = new Map();
+  for (const e of _history) {
+    if (!e.artist || e.energy == null) continue;
+    const k = e.artist.toLowerCase();
+    let g = groups.get(k);
+    if (!g) { g = []; groups.set(k, g); }
+    g.push(e);
+  }
+  const out = new Map();
+  for (const [k, entries] of groups) {
+    if (entries.length < 3) continue;           // need a few plays for a stable sound
+    const c = _computeCentroid(entries);
+    if (c) out.set(k, { centroid: c, name: entries[entries.length - 1].artist, count: entries.length });
+  }
+  _artistCentroidCache = out;
+  _artistCentroidAt = Date.now();
+  return out;
+}
+function _artistCentroid(artist) {
+  if (!artist) return null;
+  return _artistCentroids().get(artist.toLowerCase()) || null;
+}
+// "Because you love X" (#1): for a pick whose OWN artist isn't loved yet, find the
+// loved artist whose representative sound sits closest to this track — that's the
+// honest reason it earned a slot. Returns the loved artist's display name when the
+// match is tight enough to feel meaningful, else null.
+function _anchorLovedArtist(track) {
+  if (!track || track.energy == null || track.valence == null) return null;
+  if (_artistBoost(track.artist) > 0) return null;       // own artist already loved
+  const self = (track.artist || '').toLowerCase();
+  let best = null, bestD = 0.33;                          // must be reasonably close
+  for (const [k, info] of _artistCentroids()) {
+    if (k === self || (_artistTaste.get(k) || 0) <= 0) continue; // loved artists only
+    const d = _clusterDist(info.centroid, track);
+    if (d < bestD) { bestD = d; best = info.name; }
+  }
+  return best;
+}
+
 // Durable per-track dislike count. A hard skip bumps it; a full listen decays it.
 function _bumpTrackDislike(id) {
   if (!id) return;
@@ -1829,6 +1878,45 @@ function _transitionBias(a, b) {
   return v / TRANSITION_CLAMP;
 }
 
+// Bonded pairs (#4): true when a→b is a durably-reinforced sequence — the learned
+// transition score has climbed to most of the clamp from repeated engaged listens
+// in this order. Threshold is high so we only ever surface a genuine habit.
+const BOND_MIN = Math.max(2, Math.ceil(TRANSITION_CLAMP * 0.6));
+function _bondStrong(a, b) {
+  if (!a || !b || !a.id || !b.id || a.id === b.id) return false;
+  return (_transitions.get(TRANSITION_KEY(a.id, b.id)) || 0) >= BOND_MIN;
+}
+
+// Explore vs. exploit momentum (#3): a short rolling log of recent engagement
+// outcomes (+1 engaged listen, −1 strong skip). When you're consistently finishing
+// tracks you're "locked in" → exploit (lean familiar, less jitter); when you're
+// skipping you're "restless" → explore (inject more variety into the library pool).
+const ENGAGE_LOG_MAX = 8;
+let _engageLog = [];
+function _recordEngagement(outcome) {
+  _engageLog.push(outcome);
+  if (_engageLog.length > ENGAGE_LOG_MAX) _engageLog.shift();
+}
+function _engagementMomentum() {
+  const recent = _engageLog.slice(-6);
+  if (recent.length < 4) return { mode: 'neutral', score: 0, n: recent.length };
+  const score = recent.reduce((s, v) => s + v, 0);
+  const mode = score >= 2 ? 'locked' : score <= -2 ? 'restless' : 'neutral';
+  return { mode, score, n: recent.length };
+}
+
+// Most-recent play timestamp per track id, from real listening history. Backs the
+// re-discovery feature (#2): how long it's been since you last heard a track.
+function _lastPlayedById() {
+  const m = new Map();
+  for (const e of _history) {
+    if (!e.id || e.ts == null) continue;
+    const prev = m.get(e.id);
+    if (prev == null || e.ts > prev) m.set(e.id, e.ts);
+  }
+  return m;
+}
+
 function _evaluateEngagement(prev) {
   if (!prev || !prev.track || !prev.track.id || !prev.isPlaying) return;
   const dur = prev.track.duration;
@@ -1847,6 +1935,7 @@ function _evaluateEngagement(prev) {
     _recoverTrackDislike(prev.track.id);          // a full listen forgives a past skip
     _recordTransition(_prevId, prev.track.id, +1); // this sequencing worked — reinforce it
     _nudgeSlotBias(prev.track, +1);               // fit this slot → relax the slot's skip-nudge
+    _recordEngagement(+1);                        // #3 momentum: you're locked in
     return;
   }
   if (frac < _tSkipStrong()) {
@@ -1854,6 +1943,7 @@ function _evaluateEngagement(prev) {
     _adjustArtistScore(prev.track.artist, -1);
     _recordTransition(_prevId, prev.track.id, -1); // landing here got skipped — avoid the sequence
     _nudgeSlotBias(prev.track, -1);               // didn't fit THIS time-of-day → push the slot away
+    _recordEngagement(-1);                        // #3 momentum: you're restless
     const banned  = _trackSoftBanned(prev.track.id);
     const avoided = _artistAvoided(prev.track.artist);
     console.log(`[Spotify] Engagement: strong dislike (${Math.round(frac * 100)}%) "${prev.track.title}"${banned ? ' — now soft-banned' : ''}${avoided ? ` — pattern detected, now avoiding ${prev.track.artist}` : ''}`);
@@ -1933,26 +2023,32 @@ async function getAllPlaylists(forceRefresh = false) {
   return _playlistsInflight;
 }
 
+// Mar-2026 migration: GET /playlists/{id}/tracks was REMOVED (403 for Dev-Mode
+// apps). The live endpoint is GET /playlists/{id}/items and the per-entry field
+// renamed track → item, so the fields filter uses item(...) and consumers read
+// entry.item. Note: this endpoint only works for playlists the user OWNS or
+// collaborates on — Spotify-owned/editorial playlists (Discover Weekly, Daily
+// Mix, etc.) are no longer track-readable via the API and will 403/404.
 async function getPlaylistTracks(playlistId, limit = 100) {
-  return api('GET', `/playlists/${playlistId}/tracks`, {
+  return api('GET', `/playlists/${playlistId}/items`, {
     params: {
       limit,
-      fields: 'items(track(id,uri,name,duration_ms,artists(id,name),album(name,images)))',
+      fields: 'items(item(id,uri,name,duration_ms,artists(id,name),album(name,images)))',
     },
   });
 }
 
 async function getAllPlaylistTracks(playlistId) {
   const limit = 100;
-  const fields = 'total,items(track(id,uri,name,duration_ms,artists(id,name),album(name,images)))';
-  const first = await api('GET', `/playlists/${playlistId}/tracks`, {
+  const fields = 'total,items(item(id,uri,name,duration_ms,artists(id,name),album(name,images)))';
+  const first = await api('GET', `/playlists/${playlistId}/items`, {
     params: { limit, offset: 0, fields },
   });
   if (!first) return [];
   const total = first.total || 0;
   let allItems = first.items || [];
   while (allItems.length < total) {
-    const page = await api('GET', `/playlists/${playlistId}/tracks`, {
+    const page = await api('GET', `/playlists/${playlistId}/items`, {
       params: { limit, offset: allItems.length, fields },
     });
     if (!page || !page.items || !page.items.length) break;
@@ -2207,24 +2303,23 @@ async function getBatchAudioFeatures(trackIds, priority = 'high') {
   return trackIds.map(id => _audioFeaturesCache.get(id) || null);
 }
 
-// ⚠️ ENDPOINT-CHOICE CAVEAT (read this if liked songs / playlists ever break) ⚠️
+// ⚠️ ENDPOINT-CHOICE NOTES (read this if liked songs / playlists ever break) ⚠️
 // ───────────────────────────────────────────────────────────────────────────
-// Spotify's Feb-2026 "Development Mode" API migration was documented
-// inconsistently (their docs site is JS-heavy and returned contradictory answers
-// across fetches), so the endpoints below are an EVIDENCE-BASED BET, not a
-// certainty. The split we landed on:
-//   • READS  → classic, decade-stable endpoints:  GET /me/tracks (max 50),
-//              GET /playlists/{id}/tracks (fields=track(...))
-//   • WRITES → confirmed-migrated generic endpoints: PUT/DELETE /me/library,
-//              GET /me/library/contains  (these were confirmed by 2 sources)
+// Spotify's Feb/Mar-2026 "Development Mode" API migration. CONFIRMED live (the
+// Pi started returning red ✗ 403s on the old reads, exactly as this note warned):
+//   • Liked songs READ → GET /me/tracks (max 50). NOT migrated — there is no
+//     /me/library read endpoint, /me/tracks is still the live one.
+//   • Playlist tracks READ → GET /playlists/{id}/ITEMS (was /tracks, now 403).
+//     Per-entry field renamed track → item: fields use item(...), consumers read
+//     entry.item (with `|| entry.track` fallback). ONLY works for playlists the
+//     user owns/collaborates on — editorial/Spotify-owned playlists 403/404 now.
+//   • Several tracks READ → GET /tracks/{id} per id. The batch GET /tracks?ids=
+//     was REMOVED (403). resolveTrackIds is local-first + capped to avoid storms.
+//   • WRITES → generic endpoints: PUT/DELETE /me/library, GET /me/library/contains.
 //
 // The centralized red logging in api() is the safety net: if any of these starts
-// returning 403/404 on the real Pi, you'll see a red ✗ line INSTANTLY. If that
-// happens, the fix is a one-line flip:
-//   • liked songs 4xx → try   GET /me/library/items?type=track
-//   • playlist  4xx   → try   GET /playlists/{id}/items  (fields=item(...))
-//   • saves     4xx   → revert to PUT/DELETE /me/tracks?ids= (bare IDs)
-// See the Feb-2026 migration guide + each endpoint's live reference page.
+// returning 403/404 again, you'll see a red ✗ line INSTANTLY. Check the live
+// migration guide + each endpoint's reference page before changing paths.
 // ───────────────────────────────────────────────────────────────────────────
 async function getLikedSongTracks(limit = 50, offset = 0, priority = 'high') {
   // Reading saved tracks was NOT migrated — there is no /me/library read
@@ -2553,7 +2648,7 @@ async function getCuratedTracks(seedArtistNames = [], seedGenres = [], excludeId
       let items = [];
       try {
         const data = await getPlaylistTracks(pid, 50);
-        items = (data?.items || []).map(i => i.item).filter(Boolean);
+        items = (data?.items || []).map(i => i.item || i.track).filter(Boolean);
       } catch { continue; }
       for (const raw of _shuffle(items)) {
         if (out.length >= limit) break;
@@ -2637,6 +2732,10 @@ function serializeTrack(item) {
 // user has played are pulled straight from local history; any others are fetched
 // from Spotify's /tracks endpoint (still live) in batches of 50. Original order
 // is preserved.
+// Cap on live per-track fetches when resolving a past session's track IDs (the
+// batch endpoint is gone post-Mar-2026, so each miss is one request).
+const RESOLVE_FETCH_MAX = 20;
+
 async function resolveTrackIds(ids = []) {
   const uniq = [...new Set((ids || []).filter(Boolean))];
   if (!uniq.length) return [];
@@ -2654,14 +2753,16 @@ async function resolveTrackIds(ids = []) {
     }
   }
 
-  const missing = uniq.filter(id => !map.has(id));
-  for (let i = 0; i < missing.length; i += 50) {
-    const chunk = missing.slice(i, i + 50);
+  // Mar-2026 migration: the batch GET /tracks?ids= endpoint was REMOVED (403).
+  // The only replacement is per-id GET /tracks/{id}. Since this resolver is already
+  // local-first (history covers almost everything above), the misses are few — we
+  // still CAP the live fetches and run them at LOW priority so a session view can
+  // never trigger a request storm against the rate limiter.
+  const missing = uniq.filter(id => !map.has(id)).slice(0, RESOLVE_FETCH_MAX);
+  for (const id of missing) {
     try {
-      const data = await api('GET', '/tracks', { params: { ids: chunk.join(',') } });
-      for (const item of (data?.tracks || [])) {
-        if (item && item.id) map.set(item.id, serializeTrack(item));
-      }
+      const item = await api('GET', `/tracks/${id}`, { priority: 'low' });
+      if (item && item.id) map.set(item.id, serializeTrack(item));
     } catch (err) {
       console.error('[Spotify] resolveTrackIds fetch failed:', err.message);
     }
@@ -2884,6 +2985,11 @@ function _sqLibraryCandidates(count) {
   const prof = _currentContextProfile();
   const centroid = (prof?.centroid && prof.centroid.energy != null) ? prof.centroid : null;
   const setCloser = _sqSetCloserActive();
+  // Explore/exploit momentum (#3): when you're locked in, trust the ranking and add
+  // almost no jitter (exploit your proven sound); when you're restless, widen the
+  // jitter so the familiar pool reshuffles toward more variety (explore).
+  const mode = _engagementMomentum().mode;
+  const jitter = mode === 'restless' ? 0.30 : mode === 'locked' ? 0.05 : 0.12;
   let maxBoost = 0;
   for (const t of pool) { const b = _artistBoost(t.artist); if (b > maxBoost) maxBoost = b; }
   const ranked = pool.map(t => {
@@ -2893,23 +2999,52 @@ function _sqLibraryCandidates(count) {
     // tail of the night eases off rather than spiking back up.
     const cool = setCloser ? (1 - (t.energy != null ? t.energy : 50) / 100) : 0;
     const s = setCloser
-      ? artist * 0.40 + ctx * 0.35 + cool * 0.25 + Math.random() * 0.10
-      : artist * 0.55 + ctx * 0.45 + Math.random() * 0.12;
+      ? artist * 0.40 + ctx * 0.35 + cool * 0.25 + Math.random() * jitter
+      : artist * 0.55 + ctx * 0.45 + Math.random() * jitter;
     return { t, s };
   });
   ranked.sort((a, b) => b.s - a.s);
   const picks = ranked.slice(0, count).map(x => x.t);
+  const taken = new Set(); // slot indices already given a "special" pick this build
 
-  // Anti-rut (#7): if this slot is stuck in a tight cluster, swap the weakest pick
-  // for the best "stretch" candidate — fresh-sounding (further from centroid) yet
-  // still adjacent enough to be pleasant. Tagged so the UI can say "stretching your
-  // sound". Cloned so the _stretch flag never leaks back onto the shared history.
+  // Re-discovery (#2): surface one track you clearly enjoy but haven't heard in a
+  // long while, that STILL fits the current sound — the queue's "haven't heard this
+  // in N days" moment. Picks the oldest qualifying candidate. Cloned + tagged so the
+  // flag never leaks onto shared history objects.
+  if (centroid && picks.length >= 2) {
+    const lastTs = _lastPlayedById();
+    const now = Date.now();
+    const inSlice = new Set(picks.map(p => p.id));
+    let oldest = null, oldestAge = REDISCOVER_MIN_AGE_MS;
+    for (const x of ranked) {
+      const t = x.t;
+      if (inSlice.has(t.id) || t.energy == null || t.valence == null) continue;
+      const ts = lastTs.get(t.id);
+      if (ts == null) continue;
+      const age = now - ts;
+      if (age <= oldestAge) continue;
+      if (_clusterDist(centroid, t) > 0.25) continue; // must still fit the current vibe
+      oldestAge = age; oldest = t;
+    }
+    if (oldest) {
+      const idx = picks.length - 1;
+      picks[idx] = { ...oldest, _rediscovery: true, _rediscoverDays: Math.round(oldestAge / 86400000) };
+      taken.add(idx);
+    }
+  }
+
+  // Anti-rut (#7): if this slot is stuck in a tight cluster, swap the weakest free
+  // pick for the best "stretch" candidate — fresh-sounding (further from centroid)
+  // yet still adjacent enough to be pleasant. Tagged so the UI can say "stretching
+  // your sound". Cloned so the _stretch flag never leaks back onto shared history.
   if (centroid && picks.length && _slotInRut()) {
     const inSlice = new Set(picks.map(p => p.id));
     const stretch = ranked
       .map(x => ({ t: x.t, d: _clusterDist(centroid, x.t) }))
       .filter(x => !inSlice.has(x.t.id) && x.d >= 0.25 && x.d <= 0.55)[0]; // ranked order preserved
-    if (stretch) picks[picks.length - 1] = { ...stretch.t, _stretch: true };
+    let idx = picks.length - 1;
+    while (idx >= 0 && taken.has(idx)) idx--;
+    if (stretch && idx >= 0) picks[idx] = { ...stretch.t, _stretch: true };
   }
   return picks;
 }
@@ -3065,11 +3200,49 @@ const SLOT_ADJ = {
   midday: 'midday', afternoon: 'afternoon', evening: 'evening', night: 'night',
 };
 
-// Set-closer (#8): late in the day AND your recent real plays are cooling down →
+// Learned stop-time (#6): the hour you usually wind down. For each distinct local
+// day in history, take the hour of that day's LAST play; the median of those is
+// your typical stop hour. Late nights (0–5h) are unwrapped to 24–29 first so a few
+// 1am finishes don't drag the median back to midday. Cached; null until enough data.
+const STOP_HOUR_TTL = 30 * 60 * 1000;
+let _stopHourCache;            // undefined = uncomputed; null = thin data; number = hour
+let _stopHourAt = 0;
+function _learnedStopHour() {
+  if (_stopHourCache !== undefined && Date.now() - _stopHourAt < STOP_HOUR_TTL) return _stopHourCache;
+  const lastByDay = new Map(); // dayKey → { ts, h }
+  for (const e of _history) {
+    if (e.ts == null || e.h == null) continue;
+    const d = new Date(e.ts);
+    const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+    const prev = lastByDay.get(key);
+    if (!prev || e.ts > prev.ts) lastByDay.set(key, { ts: e.ts, h: e.h });
+  }
+  const hours = [...lastByDay.values()].map(v => v.h);
+  let result = null;
+  if (hours.length >= 5) {
+    const adj = hours.map(h => (h < 6 ? h + 24 : h)).sort((a, b) => a - b);
+    result = adj[Math.floor(adj.length / 2)] % 24;
+  }
+  _stopHourCache = result;
+  _stopHourAt = Date.now();
+  return result;
+}
+
+// Set-closer (#8 + #6): approaching your learned wind-down hour (or, before we've
+// learned one, simply late at night) AND your recent real plays are cooling down →
 // ease the queue toward calmer tracks and label the tail "landing the set".
 function _sqSetCloserActive() {
-  const slot = _timeSlotFor(new Date().getHours());
-  if (slot !== 'night' && slot !== 'latenight') return false;
+  const h = new Date().getHours();
+  const stop = _learnedStopHour();
+  let near;
+  if (stop != null) {
+    const diff = (stop - h + 24) % 24;            // hours until the learned stop hour
+    near = diff <= 2 || (24 - diff) <= 1;         // ~2h before … up to 1h past
+  } else {
+    const slot = _timeSlotFor(h);
+    near = (slot === 'night' || slot === 'latenight');
+  }
+  if (!near) return false;
   const recent = _history.filter(e => e.energy != null).slice(-6);
   if (recent.length < 4) return false;
   const mid = Math.floor(recent.length / 2);
@@ -3104,10 +3277,17 @@ function _sqReasonFor(track, source, left, opts = {}) {
     const flow = _sqFlow(left, track);                 // 0..1 harmonic+bpm+energy smoothness
     if (cam >= 0.8 || flow >= 0.8) { smoothMix = true; reasons.push('smooth mix'); }
     else if (flow >= 0.68) reasons.push('bridges the gap');
+    // Bonded pairs (#4): you reliably play these two back-to-back — the learned
+    // transition score says this exact ordering keeps landing.
+    if (_bondStrong(left, track)) reasons.push('you play these back-to-back');
   }
   if (source === 'ours') {
     const loved = _artistBoost(track.artist) > 0;
     if (loved) reasons.push('loved artist');
+    else {
+      const anchor = _anchorLovedArtist(track);        // #1 because you love X
+      if (anchor) reasons.push(`because you love ${anchor}`);
+    }
     // Context fit drives both the "evening match" badge and discovery confidence.
     const prof = _currentContextProfile();
     let ctxFit = null;
@@ -3117,7 +3297,11 @@ function _sqReasonFor(track, source, left, opts = {}) {
     }
     if (opts.setCloser)   reasons.push('landing the set');   // #8
     if (track._stretch)   reasons.push('stretching your sound'); // #7
-    if (_isRescued(track.id)) reasons.push('rescued');       // #3
+    if (track._rediscovery) {                                // #2 re-discovery
+      const d = track._rediscoverDays;
+      reasons.push(d ? `haven't heard in ${d} days` : "haven't heard in a while");
+    }
+    if (_isRescued(track.id)) reasons.push('rescued');       // rescued badge
     if (!reasons.length) {
       // Discovery confidence (#6): a fresh pick is an honest "fresh discovery", but
       // when it lands right on your learned sound it's a confident "safe bet".
@@ -3205,13 +3389,17 @@ function _sqInsightStrip() {
   const smoothCount = upcoming.filter(s => s.smoothMix).length;
   const setCloser   = _sqSetCloserActive();
 
-  let streak = '';
-  if (lovedRun >= 2)            streak = `${lovedRun} loved-artist picks in a row`;
-  else if (setCloser)          streak = 'easing down to close the set';
-  else if (smoothCount >= 3)   streak = `${smoothCount} smooth transitions ahead`;
-  else if (oursCount >= 1)     streak = `${oursCount} of ${upcoming.length} hand-picked`;
+  const momentum = _engagementMomentum().mode; // #3
 
-  return { streak, journey, energy, smoothCount, setCloser };
+  let streak = '';
+  if (lovedRun >= 2)               streak = `${lovedRun} loved-artist picks in a row`;
+  else if (momentum === 'restless') streak = 'mixing it up — more variety ahead';
+  else if (setCloser)              streak = 'easing down to close the set';
+  else if (momentum === 'locked')  streak = "you're locked in — leaning into your sound";
+  else if (smoothCount >= 3)       streak = `${smoothCount} smooth transitions ahead`;
+  else if (oursCount >= 1)         streak = `${oursCount} of ${upcoming.length} hand-picked`;
+
+  return { streak, journey, energy, smoothCount, setCloser, momentum };
 }
 
 // Pretty-print the whole window. OUR songs are wrapped in --dashes--; Spotify's
@@ -4712,6 +4900,28 @@ function buildStats() {
 // #9 — Per-context taste portraits: "Your weekday late nights sound like…".
 // Built purely from the learned context profiles (composite buckets), so it's a
 // zero-API, shareable mirror of what each time-of-day actually sounds like.
+// Taste-drift (#5): split a context bucket's plays into an older half and a recent
+// half and compare their centroids. If the sound has shifted meaningfully, return a
+// short human label ("trending mellower") so each portrait can show how your taste
+// for that slot is moving — not just where it sits. Null when stable / thin data.
+function _portraitDrift(scope, slot) {
+  const entries = _history.filter(e =>
+    e.h != null && e.energy != null && e.valence != null &&
+    _timeSlotFor(e.h) === slot &&
+    (((e.dow === 0 || e.dow === 6) ? 'weekend' : 'weekday') === scope));
+  if (entries.length < 12) return null;            // _history is chronological → halves are older/recent
+  const mid    = Math.floor(entries.length / 2);
+  const older  = _computeCentroid(entries.slice(0, mid));
+  const recent = _computeCentroid(entries.slice(mid));
+  if (!older || !recent) return null;
+  const dE = recent.energy  - older.energy;
+  const dV = recent.valence - older.valence;
+  const TH = 8;
+  if (Math.abs(dE) < TH && Math.abs(dV) < TH) return null;
+  if (Math.abs(dE) >= Math.abs(dV)) return dE > 0 ? 'trending higher-energy' : 'trending mellower';
+  return dV > 0 ? 'trending brighter' : 'trending moodier';
+}
+
 function buildPortraits() {
   const profiles = _computeContextProfiles();
   const out = [];
@@ -4729,6 +4939,7 @@ function buildPortraits() {
       bpm:     p.centroid.bpm != null ? Math.round(p.centroid.bpm) : null,
       count:   p.count,
       topArtists: (p.topArtists || []).slice(0, 3).map(a => a.name),
+      drift:   _portraitDrift(scope, slot), // #5 taste-drift
     });
   }
   out.sort((a, b) => b.count - a.count);
@@ -4769,6 +4980,55 @@ function buildTimeMachine() {
       title: seedEntry.title || '',
       artist: seedEntry.artist || '',
     } : null,
+  };
+}
+
+// "Your day in music" (#7) — a zero-API recap of TODAY's listening: track count,
+// the energy arc (did the day ramp up or wind down), the mood you opened and closed
+// on, the day's most-played artist, and a standout discovery (a track heard for the
+// first time ever today). Returns null until there's a meaningful amount logged.
+function buildDayRecap() {
+  const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
+  const startMs  = dayStart.getTime();
+  const today    = _history.filter(e => e.ts != null && e.ts >= startMs);
+  if (today.length < 4) return null;
+
+  const trackCount = new Set(today.map(e => e.id).filter(Boolean)).size;
+  const artistCounts = new Map();
+  for (const e of today) if (e.artist) artistCounts.set(e.artist, (artistCounts.get(e.artist) || 0) + 1);
+  const topArtist = [...artistCounts.entries()].sort((a, b) => b[1] - a[1])[0];
+
+  // Energy arc + opening/closing mood from the day's first vs last third.
+  const feat = today.filter(e => e.energy != null && e.valence != null);
+  let arc = null, startMood = null, endMood = null;
+  if (feat.length >= 4) {
+    const third = Math.max(1, Math.floor(feat.length / 3));
+    const avgE  = (a) => a.reduce((s, e) => s + e.energy, 0) / a.length;
+    const head  = avgE(feat.slice(0, third));
+    const tail  = avgE(feat.slice(-third));
+    arc = tail > head + 8 ? 'ramped up' : tail < head - 8 ? 'wound down' : 'held steady';
+    const hc = _computeCentroid(feat.slice(0, third));
+    const tc = _computeCentroid(feat.slice(-third));
+    startMood = hc ? (FEELING_DEFS[_guessFeeling(hc)] || {}).label || null : null;
+    endMood   = tc ? (FEELING_DEFS[_guessFeeling(tc)] || {}).label || null : null;
+  }
+
+  // Standout discovery: a track whose earliest-ever play in history is today.
+  const earliest = new Map();
+  for (const e of _history) {
+    if (!e.id || e.ts == null) continue;
+    if (!earliest.has(e.id) || e.ts < earliest.get(e.id)) earliest.set(e.id, e.ts);
+  }
+  let discovery = null;
+  for (const e of today) {
+    if (e.id && earliest.get(e.id) >= startMs) { discovery = { title: e.title || '', artist: e.artist || '' }; break; }
+  }
+
+  return {
+    trackCount,
+    arc, startMood, endMood,
+    topArtist: topArtist ? { name: topArtist[0], count: topArtist[1] } : null,
+    discovery,
   };
 }
 
@@ -5666,10 +5926,11 @@ function init(io) {
         socket.emit('spotify:portraits', {
           timeMachine: buildTimeMachine(),
           portraits:   buildPortraits(),
+          dayRecap:    buildDayRecap(),   // #7 your day in music
         });
       } catch (err) {
         console.error('[Spotify] get_portraits error:', err.message);
-        socket.emit('spotify:portraits', { timeMachine: null, portraits: [] });
+        socket.emit('spotify:portraits', { timeMachine: null, portraits: [], dayRecap: null });
       }
     });
 

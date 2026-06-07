@@ -1755,6 +1755,9 @@ function renderSpotifyQueue(ctrl) {
     }
     stripEl.hidden = false;
     stripEl.classList.toggle('is-closing', !!meta.setCloser);
+    // #3 — explore/exploit momentum colouring (restless = explore, locked = exploit).
+    stripEl.classList.toggle('is-restless', meta.momentum === 'restless');
+    stripEl.classList.toggle('is-locked',   meta.momentum === 'locked');
 
     streakEl.textContent = meta.streak || '';
     streakEl.style.display = meta.streak ? '' : 'none';
@@ -2370,6 +2373,14 @@ export function renderSpotifyInsights(ctrl) {
             </div>
             <button class="sp-ins-tm-play" title="Play this time-of-day vibe">▶</button>
           </div>
+          <!-- DAY RECAP (#7 your day in music) -->
+          <div class="sp-ins-recap" style="display:none">
+            <div class="sp-ins-recap-head">
+              <span class="sp-ins-recap-emoji">📻</span>
+              <span class="sp-ins-recap-title">Your day in music</span>
+            </div>
+            <div class="sp-ins-recap-body"></div>
+          </div>
           <div class="sp-ins-portraits-title sp-ins-sub-title">Your sound, by time of day</div>
           <div class="sp-ins-portraits-grid"></div>
           <div class="sp-ins-portraits-empty" style="display:none">Keep listening — portraits appear once each part of your day has a few plays.</div>
@@ -2471,6 +2482,8 @@ export function renderSpotifyInsights(ctrl) {
   const tmPlay     = card.querySelector('.sp-ins-tm-play');
   const portraitsGrid  = card.querySelector('.sp-ins-portraits-grid');
   const portraitsEmpty = card.querySelector('.sp-ins-portraits-empty');
+  const recapEl        = card.querySelector('.sp-ins-recap');
+  const recapBody      = card.querySelector('.sp-ins-recap-body');
 
   tmPlay.addEventListener('pointerup', () => {
     if (isEditMode()) return;
@@ -2488,6 +2501,28 @@ export function renderSpotifyInsights(ctrl) {
     } else {
       tmEl.style.display = 'none';
     }
+
+    // #7 — Your day in music recap.
+    const recap = data && data.dayRecap;
+    if (recap && recapEl && recapBody) {
+      const bits = [];
+      bits.push(`<span class="sp-ins-recap-stat"><b>${recap.trackCount}</b> tracks</span>`);
+      if (recap.arc) bits.push(`<span class="sp-ins-recap-stat">${_esc(recap.arc)}</span>`);
+      if (recap.startMood && recap.endMood) {
+        bits.push(recap.startMood === recap.endMood
+          ? `<span class="sp-ins-recap-stat">stayed ${_esc(recap.startMood.toLowerCase())}</span>`
+          : `<span class="sp-ins-recap-stat">${_esc(recap.startMood.toLowerCase())} → ${_esc(recap.endMood.toLowerCase())}</span>`);
+      }
+      if (recap.topArtist) bits.push(`<span class="sp-ins-recap-stat">most: ${_esc(recap.topArtist.name)}</span>`);
+      if (recap.discovery && recap.discovery.title) {
+        bits.push(`<span class="sp-ins-recap-stat sp-ins-recap-find">🔎 ${_esc(recap.discovery.title)}${recap.discovery.artist ? ` · ${_esc(recap.discovery.artist)}` : ''}</span>`);
+      }
+      recapBody.innerHTML = bits.join('');
+      recapEl.style.display = '';
+    } else if (recapEl) {
+      recapEl.style.display = 'none';
+    }
+
     const list = (data && data.portraits) ? data.portraits : [];
     portraitsGrid.innerHTML = '';
     portraitsEmpty.style.display = list.length ? 'none' : '';
@@ -2506,6 +2541,7 @@ export function renderSpotifyInsights(ctrl) {
           <span class="sp-ins-portrait-bar sp-ins-portrait-bar--v" title="Positivity"><i style="width:${Math.max(0, Math.min(100, p.valence))}%"></i></span>
         </div>
         ${artists ? `<div class="sp-ins-portrait-artists">${_esc(artists)}</div>` : ''}
+        ${p.drift ? `<div class="sp-ins-portrait-drift">↗ ${_esc(p.drift)}</div>` : ''}
         <div class="sp-ins-portrait-count">${p.count} plays</div>
       `;
       portraitsGrid.appendChild(cell);
