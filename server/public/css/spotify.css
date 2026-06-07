@@ -2465,6 +2465,61 @@
   border-color: rgba(255,255,255,0.3);
 }
 
+/* ---------- TIMEZONE OVERRIDE (Tuning tab) ---------- */
+.sp-ins-tz {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--sp-border, rgba(255,255,255,0.08));
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sp-ins-tz-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.sp-ins-tz-saved {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--sp-green, #1DB954);
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+.sp-ins-tz-saved.show { opacity: 1; }
+.sp-ins-tz-sub {
+  font-size: 10px;
+  color: var(--text-3, #9a9a9a);
+  line-height: 1.35;
+}
+.sp-ins-tz-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.sp-ins-tz-select {
+  flex: 1;
+  min-width: 0;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 6px;
+  color: var(--text, #fff);
+  font-size: 12px;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+.sp-ins-tz-select:focus {
+  outline: none;
+  border-color: var(--sp-green, #1DB954);
+}
+.sp-ins-tz-apply { flex-shrink: 0; }
+.sp-ins-tz-status {
+  font-size: 10px;
+  color: var(--text-2, #aaa);
+  min-height: 12px;
+  line-height: 1.3;
+}
+
 /* ---------- VIBES TOOLBAR (continuous badge) ---------- */
 .sp-ins-vibes-toolbar {
   display: flex;

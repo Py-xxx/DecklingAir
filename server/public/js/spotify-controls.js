@@ -29,6 +29,8 @@ import {
   stopContinuous,
   getTuning,
   setTuning,
+  getTimezone,
+  setTimezone,
   respondToCheckIn,
   dismissCheckIn,
   getIntelligence,
@@ -2489,6 +2491,18 @@ export function renderSpotifyInsights(ctrl) {
               <div class="sp-ins-tune-ends"><span>Adapt fast</span><span>Stage ahead</span></div>
             </div>
           </div>
+          <div class="sp-ins-tz">
+            <div class="sp-ins-tz-head">
+              <span class="sp-ins-tune-label">Timezone override</span>
+              <span class="sp-ins-tz-saved">Saved ✓</span>
+            </div>
+            <div class="sp-ins-tz-sub">Corrects hour-of-day &amp; weekday for vibes, slots &amp; the heatmap when the host clock is off. Applies to past data too.</div>
+            <div class="sp-ins-tz-row">
+              <select class="sp-ins-tz-select"></select>
+              <button class="sp-ins-action-btn sp-ins-tz-apply">Apply</button>
+            </div>
+            <div class="sp-ins-tz-status"></div>
+          </div>
           <div class="sp-ins-tune-footer">
             <span class="sp-ins-tune-saved">Saved ✓</span>
             <button class="sp-ins-action-btn sp-ins-tune-reset">Reset to defaults</button>
@@ -2854,6 +2868,55 @@ export function renderSpotifyInsights(ctrl) {
   getTuning();
   _updateTuneLabels();
 
+  // ---- Timezone override ----
+  const tzSelect = card.querySelector('.sp-ins-tz-select');
+  const tzApply  = card.querySelector('.sp-ins-tz-apply');
+  const tzStatus = card.querySelector('.sp-ins-tz-status');
+  const tzSaved  = card.querySelector('.sp-ins-tz-saved');
+  // A compact, curated zone list plus whatever the host reports, so the common
+  // cases are one click away without shipping the full IANA database.
+  const TZ_COMMON = [
+    'UTC',
+    'Europe/London', 'Europe/Amsterdam', 'Europe/Berlin', 'Europe/Paris',
+    'Europe/Madrid', 'Europe/Rome', 'Europe/Athens', 'Europe/Moscow',
+    'Africa/Johannesburg', 'Africa/Cairo', 'Africa/Lagos',
+    'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles',
+    'America/Sao_Paulo', 'Asia/Dubai', 'Asia/Kolkata', 'Asia/Singapore',
+    'Asia/Tokyo', 'Australia/Sydney', 'Pacific/Auckland',
+  ];
+  function _fillTzOptions(active, host) {
+    if (!tzSelect) return;
+    const zones = new Set(TZ_COMMON);
+    if (host) zones.add(host);
+    if (active) zones.add(active);
+    const cur = active || host || 'UTC';
+    tzSelect.innerHTML = [...zones].sort().map(z =>
+      `<option value="${_esc(z)}"${z === cur ? ' selected' : ''}>${_esc(z)}${z === host ? ' (host)' : ''}</option>`
+    ).join('');
+  }
+  const _onTimezone = ({ timeZone, hostZone, migrated } = {}) => {
+    _fillTzOptions(timeZone, hostZone);
+    if (tzStatus) {
+      if (migrated) {
+        const h = migrated.history || {}, f = migrated.feelings || {};
+        tzStatus.textContent = `Now ${timeZone || hostZone || 'UTC'} · fixed ${(h.migrated||0)+(f.migrated||0)} of ${(h.total||0)+(f.total||0)} past entries`;
+        if (tzSaved) { tzSaved.classList.add('show'); setTimeout(() => tzSaved.classList.remove('show'), 2000); }
+        getSpotifyInsights(); // refresh heatmap / portraits with corrected data
+      } else {
+        tzStatus.textContent = timeZone
+          ? `Active: ${timeZone}`
+          : `Using host clock${hostZone ? ` (${hostZone})` : ''} — no override set`;
+      }
+    }
+  };
+  socket.on('spotify:timezone', _onTimezone);
+  tzApply?.addEventListener('pointerup', () => {
+    if (isEditMode()) return;
+    const tz = tzSelect && tzSelect.value;
+    if (tz) { if (tzStatus) tzStatus.textContent = 'Applying & repairing past data…'; setTimezone(tz, true); }
+  });
+  getTimezone();
+
   // ---- Mood tab ----
   let _moodsCache = [];
   function _renderMoods(moods, activeMoodKey, activeVibeKey, context) {
@@ -2977,6 +3040,7 @@ export function renderSpotifyInsights(ctrl) {
       socket.off('spotify:insights_action', _onAction);
       socket.off('spotify:vibe_renamed',    _onVibeRenamed);
       socket.off('spotify:tuning',          _onTuning);
+      socket.off('spotify:timezone',        _onTimezone);
       socket.off('spotify:continuous_state', _onContinuousState);
       socket.off('spotify:insights',        _onInsights);
       socket.off('spotify:portraits',       _onPortraits);

@@ -187,6 +187,19 @@ export function setTuning(tuning) {
   socket.emit('spotify:set_tuning', { tuning });
 }
 
+/** Ask the server for the active display timezone (and the detected host zone). */
+export function getTimezone() {
+  socket.emit('spotify:get_timezone');
+}
+
+/**
+ * Override the display timezone (authoritative IANA name, e.g. "Europe/Amsterdam").
+ * By default also repairs past log entries so historical analytics are corrected.
+ */
+export function setTimezone(timeZone, migrate = true) {
+  socket.emit('spotify:set_timezone', { timeZone, migrate });
+}
+
 /**
  * Save a session as a playlist.
  * @param {string} [name]        Optional playlist name.

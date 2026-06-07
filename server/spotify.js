@@ -307,6 +307,26 @@ let _activeFeeling     = null;   // { key, label, emoji, confirmedAt, centroid, 
 let _lastCheckInAt     = 0;      // cluster size when last check-in was triggered
 let _checkInAutoEnabled = true;  // user preference
 
+// ── Display timezone ──────────────────────────────────────────────────────
+// The Raspberry Pi host may be left on UTC, which skews every hour-of-day (`h`)
+// and day-of-week (`dow`) field we derive — vibes, time-slots, the heatmap and
+// learned stop-time all read those. Since every log entry also stores an
+// absolute `ts`, we can be authoritative: setting process.env.TZ makes ALL Date
+// local methods (getHours/getDay/setHours/toLocaleString) operate in this zone
+// regardless of the host clock, and migrateHistoryTimezone() repairs past
+// entries by recomputing h/dow from their ts. IANA names handle DST per-instant.
+let _displayTZ = null;
+function _tzValid(tz) {
+  if (!tz || typeof tz !== 'string') return false;
+  try { Intl.DateTimeFormat(undefined, { timeZone: tz }); return true; } catch { return false; }
+}
+function applyDisplayTZ(tz) {
+  if (!_tzValid(tz)) return false;
+  _displayTZ = tz;
+  process.env.TZ = tz; // Node re-reads TZ for Date objects constructed afterwards
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Config / token storage
 // ---------------------------------------------------------------------------
@@ -376,6 +396,52 @@ function loadHistory() {
     console.error('[Spotify] Failed to load history:', err.message);
     _history = [];
   }
+}
+
+// Rewrite one NDJSON log file in place, recomputing each entry's h/dow from its
+// absolute ts in the active timezone. Backs up to <file>.bak first. Returns
+// { migrated, total } (entries changed / entries with a ts), or null on failure.
+function _migrateNdjsonTZ(file) {
+  try {
+    if (!fs.existsSync(file)) return { migrated: 0, total: 0 };
+    const lines = fs.readFileSync(file, 'utf8').split('\n');
+    let migrated = 0, total = 0;
+    const out = lines.map((line) => {
+      const s = line.trim();
+      if (!s) return line;
+      let e;
+      try { e = JSON.parse(s); } catch { return line; }
+      if (!e || e.ts == null) return line;
+      total++;
+      const d = new Date(e.ts);
+      const nh = d.getHours();
+      const nd = d.getDay();
+      if (e.h !== nh || e.dow !== nd) { e.h = nh; e.dow = nd; migrated++; }
+      return JSON.stringify(e);
+    });
+    fs.copyFileSync(file, `${file}.bak`);
+    fs.writeFileSync(file, out.join('\n'));
+    return { migrated, total };
+  } catch (err) {
+    console.error(`[Spotify] TZ migration failed for ${file}:`, err.message);
+    return null;
+  }
+}
+
+// One-time repair across both timestamped logs after the display timezone is
+// (re)configured, then reload them so the corrected h/dow take effect at once.
+function migrateHistoryTimezone() {
+  const hist = _migrateNdjsonTZ(HISTORY_FILE);
+  const feel = _migrateNdjsonTZ(FEELING_LOG_FILE);
+  loadHistory();
+  loadFeelingLog();
+  const sum = {
+    timeZone: _displayTZ,
+    history: hist || { migrated: 0, total: 0 },
+    feelings: feel || { migrated: 0, total: 0 },
+  };
+  console.log(`[Spotify] TZ migration → zone=${_displayTZ} history ${sum.history.migrated}/${sum.history.total}, feelings ${sum.feelings.migrated}/${sum.feelings.total}`);
+  return sum;
 }
 
 function loadVibeNames() {
@@ -3583,11 +3649,25 @@ async function _sqExtendWindow(state) {
         .map(_sqAnnotate);
     }
     const { slots, used } = _sqPlanInterleave(bridgeLeft, anchors, pool, targetU);
-    for (const s of slots) {
+    // Decorate each new slot with its "why-picked" reason just like
+    // _sqAssembleWindow does, so the queue panel keeps explaining picks as the
+    // window extends (otherwise extended slots arrive reason-less and the
+    // annotations gradually disappear from Up Next).
+    const setCloser = _sqSetCloserActive();
+    let lastOursIdx = -1;
+    for (let i = 0; i < slots.length; i++) if (slots[i].source === 'ours') lastOursIdx = i;
+    let left = bridgeLeft;
+    for (let i = 0; i < slots.length; i++) {
+      const s = slots[i];
       const uri = s.track.uri || (s.track.id ? `spotify:track:${s.track.id}` : null);
       if (!uri) continue;
-      _sq.window.push({ uri, id: s.track.id, track: s.track, source: s.source, added: false, played: false });
+      const ann = (s.track._cam !== undefined) ? s.track : _sqAnnotate(s.track);
+      const { reason, smoothMix } = _sqReasonFor(ann, s.source, left, {
+        setCloser: setCloser && i === lastOursIdx,
+      });
+      _sq.window.push({ uri, id: s.track.id, track: s.track, source: s.source, added: false, played: false, reason, smoothMix });
       if (s.source === 'ours' && s.track.id) _sq.noRepeat.add(s.track.id);
+      left = ann;
     }
     _sqTrimNoRepeat();
     console.log(`[SmartQueue] ⤢ Extended window — +${slots.length} slots (${anchors.length} anchors, ${used} ours).`);
@@ -5399,6 +5479,16 @@ async function playPlaylist(playlistUri /*, playlistId */) {
 function init(io) {
   _io = io;
 
+  // Apply the configured display timezone FIRST so every Date local method runs
+  // in the right zone for the rest of the process (vibes, slots, heatmap, etc.).
+  try {
+    const cfg = loadCfg();
+    if (cfg && cfg.timeZone) {
+      if (applyDisplayTZ(cfg.timeZone)) console.log(`[Spotify] Display timezone: ${_displayTZ}`);
+      else console.warn(`[Spotify] Ignoring invalid configured timeZone "${cfg.timeZone}"`);
+    }
+  } catch (err) { console.error('[Spotify] timezone init error:', err.message); }
+
   loadHistory();
   loadSessions();
   loadVibeNames();
@@ -6150,10 +6240,47 @@ function init(io) {
     // ----- spotify:save_config -----
     socket.on('spotify:save_config', ({ clientId, clientSecret } = {}) => {
       try {
-        saveCfg({ clientId, clientSecret });
+        // Merge so other settings (e.g. timeZone) survive a credentials save.
+        const cur = loadCfg() || {};
+        saveCfg({ ...cur, clientId, clientSecret });
         socket.emit('spotify:config_saved', { success: true });
       } catch (err) {
         console.error('[Spotify] Save config error:', err.message);
+        socket.emit('spotify:error', { message: err.message });
+      }
+    });
+
+    // ----- spotify:get_timezone -----
+    socket.on('spotify:get_timezone', () => {
+      socket.emit('spotify:timezone', {
+        timeZone: _displayTZ,
+        hostZone: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
+      });
+    });
+
+    // ----- spotify:set_timezone -----
+    // Authoritative override for the host clock. Persists the IANA zone, applies
+    // it live, then repairs past log entries (recompute h/dow from each ts) so
+    // historical vibes/slots/heatmap are corrected — not just shifted visually.
+    socket.on('spotify:set_timezone', ({ timeZone, migrate = true } = {}) => {
+      try {
+        if (!applyDisplayTZ(timeZone)) {
+          socket.emit('spotify:error', { message: `Invalid timezone "${timeZone}"` });
+          return;
+        }
+        const cur = loadCfg() || {};
+        saveCfg({ ...cur, timeZone });
+        const summary = migrate ? migrateHistoryTimezone() : null;
+        io.emit('spotify:timezone', {
+          timeZone: _displayTZ,
+          hostZone: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
+          migrated: summary,
+        });
+        // Invalidate the cached context prediction so corrected h/dow counts
+        // immediately; the client re-requests insights on the 'timezone' event.
+        _contextProfilesAt = 0;
+      } catch (err) {
+        console.error('[Spotify] Set timezone error:', err.message);
         socket.emit('spotify:error', { message: err.message });
       }
     });
