@@ -3480,9 +3480,32 @@ function _sqAssembleWindow(currentTrack, slots) {
   return window;
 }
 
+// Durable per-track reason cache. The live Smart Queue window is trimmed as
+// playback advances (_sqTrimWindow drops slots well behind the cursor) and gets
+// rebuilt on divergence, so a reason that lives only in _sq.window disappears
+// from the queue panel on the next refresh / page reload — even when the same
+// track is still queued on Spotify. We mirror every annotated slot into this
+// bounded LRU cache (keyed by uri AND id) so the queue can always be re-decorated
+// with the explanation we already computed, regardless of window lifecycle.
+const _SQ_REASON_CACHE_MAX = 400;
+const _sqReasonCache = new Map();
+function _sqCacheReason(slot) {
+  if (!slot || (!slot.reason && !slot.smoothMix && slot.source !== 'ours')) return;
+  const entry = { source: slot.source, reason: slot.reason || '', smoothMix: !!slot.smoothMix };
+  for (const k of [slot.uri, slot.id]) {
+    if (!k) continue;
+    if (_sqReasonCache.has(k)) _sqReasonCache.delete(k); // bump LRU recency
+    _sqReasonCache.set(k, entry);
+  }
+  while (_sqReasonCache.size > _SQ_REASON_CACHE_MAX) {
+    _sqReasonCache.delete(_sqReasonCache.keys().next().value); // evict oldest
+  }
+}
+
 // Build a uri/id → { source, reason, smoothMix } lookup over the live Smart
 // Queue window, so emitQueue() can decorate the real Spotify queue with our
 // per-pick explanations (the real /me/player/queue carries none of our metadata).
+// Mirrors each annotated slot into the durable cache as a side effect.
 function _sqWindowAnnotations() {
   const map = new Map();
   if (!_sq || !Array.isArray(_sq.window)) return map;
@@ -3491,8 +3514,17 @@ function _sqWindowAnnotations() {
     const entry = { source: slot.source, reason: slot.reason || '', smoothMix: !!slot.smoothMix };
     if (slot.uri) map.set(slot.uri, entry);
     if (slot.id)  map.set(slot.id, entry);
+    _sqCacheReason(slot);
   }
   return map;
+}
+
+// Resolve a queue item's annotation: prefer the live window, fall back to the
+// durable cache so per-pick reasons survive window trims, rebuilds and refreshes.
+function _sqAnnotationFor(ann, t) {
+  if (!t) return null;
+  return ann.get(t.uri) || ann.get(t.id)
+      || _sqReasonCache.get(t.uri) || _sqReasonCache.get(t.id) || null;
 }
 
 // A compact, holistic summary of the UPCOMING Smart Queue window for the queue
@@ -3853,7 +3885,7 @@ async function emitQueue() {
     const items =
       dedupQueue.length
         ? dedupQueue.slice(0, 30).map((t) => {
-            const a = ann.get(t.uri) || ann.get(t.id) || null;
+            const a = _sqAnnotationFor(ann, t);
             return {
               id: t.id,
               uri: t.uri,
@@ -4567,6 +4599,9 @@ function _predictForNow() {
     valence: prof?.centroid ? Math.round(prof.centroid.valence) : (def ? Math.round((def.valence[0] + def.valence[1]) / 2) : null),
     bpm:     prof?.centroid?.bpm ? Math.round(prof.centroid.bpm) : null,
     topArtists: prof?.topArtists || [],
+    // Taste-drift for this exact slot — the same signal the Portraits grid shows,
+    // surfaced here so the current slot's "personal" card lives in one place.
+    drift:   _portraitDrift(weekend ? 'weekend' : 'weekday', slot),
   };
 }
 
@@ -5104,9 +5139,14 @@ function _portraitDrift(scope, slot) {
 
 function buildPortraits() {
   const profiles = _computeContextProfiles();
+  // The current slot is shown — enriched and actionable — on the Now Playing
+  // screen ("The vibe you're going for"), so omit it here to avoid duplicating
+  // the same portrait in two places.
+  const nowKey = _currentSlotKey();
   const out = [];
   for (const [key, p] of Object.entries(profiles)) {
     if (key.startsWith('slot:') || !p.centroid) continue; // composite buckets only
+    if (key === nowKey) continue;                          // lives on Now Playing instead
     const [scope, slot] = key.split(':');
     const def = FEELING_DEFS[_guessFeeling(p.centroid)] || {};
     out.push({
@@ -6283,7 +6323,7 @@ function init(io) {
         const items =
           data && data.queue
             ? data.queue.slice(0, 30).map((t) => {
-                const a = ann.get(t.uri) || ann.get(t.id) || null;
+                const a = _sqAnnotationFor(ann, t);
                 return {
                   id: t.id,
                   uri: t.uri,

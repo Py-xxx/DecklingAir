@@ -2914,7 +2914,7 @@
 /* Now-Playing vibe prediction (merged from old Routine tab) */
 .sp-intel-predict {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 9px;
   margin-top: 5px;
   padding: 7px 9px;
@@ -2948,6 +2948,19 @@
   white-space: normal;       /* let the full "you usually go for…" line wrap */
   overflow-wrap: break-word;
   line-height: 1.3;
+}
+/* Portraits-style energy / positivity bars + taste-drift, surfaced inline so
+   the current slot's personal portrait lives here instead of the Portraits grid. */
+.sp-intel-predict-bars { display: flex; flex-direction: column; gap: 3px; margin-top: 5px; max-width: 160px; }
+.sp-intel-predict-bar {
+  display: block; height: 4px; border-radius: 2px;
+  background: var(--bg-3, #2a2a2a); overflow: hidden;
+}
+.sp-intel-predict-bar i { display: block; height: 100%; width: 0; background: var(--sp-green, #1DB954); transition: width .4s ease; }
+.sp-intel-predict-bar--v i { background: #f0a93b; }
+.sp-intel-predict-drift {
+  font-size: 9px; font-weight: 600; color: #7ad0ff; margin-top: 4px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .sp-intel-predict-play {
   flex-shrink: 0;

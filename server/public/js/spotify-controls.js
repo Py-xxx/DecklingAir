@@ -3208,6 +3208,11 @@ export function renderSpotifyIntelligence(ctrl) {
           <div class="sp-intel-predict-info">
             <span class="sp-intel-predict-name">—</span>
             <span class="sp-intel-predict-sub"></span>
+            <div class="sp-intel-predict-bars" style="display:none">
+              <span class="sp-intel-predict-bar" title="Energy"><i class="sp-intel-predict-bar-e"></i></span>
+              <span class="sp-intel-predict-bar sp-intel-predict-bar--v" title="Positivity"><i class="sp-intel-predict-bar-v"></i></span>
+            </div>
+            <span class="sp-intel-predict-drift" style="display:none"></span>
           </div>
           <button class="sp-intel-predict-play" title="Play this vibe">▶</button>
         </div>
@@ -3259,6 +3264,10 @@ export function renderSpotifyIntelligence(ctrl) {
   const predictEmoji = card.querySelector('.sp-intel-predict-emoji');
   const predictName  = card.querySelector('.sp-intel-predict-name');
   const predictSub   = card.querySelector('.sp-intel-predict-sub');
+  const predictBars  = card.querySelector('.sp-intel-predict-bars');
+  const predictBarE  = card.querySelector('.sp-intel-predict-bar-e');
+  const predictBarV  = card.querySelector('.sp-intel-predict-bar-v');
+  const predictDrift = card.querySelector('.sp-intel-predict-drift');
   const predictPlay  = card.querySelector('.sp-intel-predict-play');
   let   _predictMoodKey = null;
   const clusterBar   = card.querySelector('.sp-intel-cluster-bar');
@@ -3318,6 +3327,20 @@ export function renderSpotifyIntelligence(ctrl) {
         ? `${cp.label} · you usually feel ${cp.feelingLabel.toLowerCase()}`
         : `${cp.label} · usually sounds ${cp.feelingLabel.toLowerCase()}`;
       predictSub.textContent = artists ? `${basis} · ${artists}` : basis;
+      // Portraits-style energy / positivity bars + taste-drift for this slot.
+      if (cp.energy != null && cp.valence != null) {
+        predictBarE.style.width = Math.max(0, Math.min(100, cp.energy)) + '%';
+        predictBarV.style.width = Math.max(0, Math.min(100, cp.valence)) + '%';
+        predictBars.style.display = '';
+      } else {
+        predictBars.style.display = 'none';
+      }
+      if (cp.drift) {
+        predictDrift.textContent = `↗ ${cp.drift}`;
+        predictDrift.style.display = '';
+      } else {
+        predictDrift.style.display = 'none';
+      }
       predictPlay.style.display = _predictMoodKey ? '' : 'none';
       predictEl.style.display = '';
       contextVal.style.display = 'none';
@@ -3326,6 +3349,8 @@ export function renderSpotifyIntelligence(ctrl) {
       predictEmoji.textContent = context.suggestedMoodEmoji || '🎧';
       predictName.textContent  = context.suggestedMoodName;
       predictSub.textContent   = 'a guess from your time-of-day patterns';
+      predictBars.style.display = 'none';
+      predictDrift.style.display = 'none';
       predictPlay.style.display = _predictMoodKey ? '' : 'none';
       predictEl.style.display = '';
       contextVal.style.display = 'none';
