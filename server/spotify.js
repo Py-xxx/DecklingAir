@@ -293,6 +293,14 @@ const SLOT_BIAS_STEP = 1.5; // per-skip nudge; small so it takes a pattern to mo
 // what-follows-what, not just harmonic mixing. PERSISTED across sessions.
 let _transitions     = new Map();
 let _transitionPrevId = null;    // id of the track that played immediately before the current one
+// When the APP forces a context change (new song / playlist / mood / vibe), the
+// outgoing track must NOT be judged as a user skip — the listener didn't reject
+// it, they changed the station. Set to a short future deadline on every manual
+// change; the next track-change in the poll loop consults it (then clears it) so
+// engagement scoring is skipped exactly once. Auto-expires so a forced play that
+// never actually changes the track can't silently eat a later genuine skip.
+let _suppressEngageUntil = 0;
+const _SUPPRESS_ENGAGE_MS = 12000;
 const TRANSITION_KEY = (from, to) => `${from}>${to}`;
 const TRANSITION_CLAMP = 5;      // bound each pair so one outlier can't dominate
 const TRANSITION_WEIGHT = 0.20;  // how much a learned transition can shift a flow score
@@ -1825,6 +1833,51 @@ function _artistBoost(artist) {
   return Math.max(0, _artistTaste.get(artist.toLowerCase()) || 0);
 }
 
+// Favourites by play count — the SAME signal the profile page's "top artists"
+// list is built from (computeProfile). The engagement-learned _artistTaste scores
+// are honest but SLOW: an artist you genuinely love reads as neutral until enough
+// finish/skip events accrue. Your play history already proves what you love on day
+// one, so we fold it in to SUPPORT the "loved artist" / "because you love X" /
+// "most-played" reasons. Cached (history grows slowly); recomputed on TTL.
+const FAVORITES_TTL = 10 * 60 * 1000;
+let _favoritesCache = null;
+let _favoritesAt = 0;
+function _favorites() {
+  if (_favoritesCache && Date.now() - _favoritesAt < FAVORITES_TTL) return _favoritesCache;
+  const artistCount = new Map();
+  const trackCount = new Map();
+  for (const e of combinedHistory()) {
+    if (e.artist) { const k = e.artist.toLowerCase(); artistCount.set(k, (artistCount.get(k) || 0) + 1); }
+    if (e.id) trackCount.set(e.id, (trackCount.get(e.id) || 0) + 1);
+  }
+  // "Favoured" = plays clear a floor AND rank in the upper band of your catalogue,
+  // so a couple of plays in a thin history doesn't crown everyone. The floor is the
+  // larger of an absolute minimum and the play count at the ~15th-ranked artist.
+  const counts = [...artistCount.values()].sort((a, b) => b - a);
+  const rankFloor = counts.length ? counts[Math.min(counts.length - 1, 14)] : 0;
+  const artistFloor = Math.max(3, rankFloor);
+  const lovedArtists = new Set();
+  for (const [k, c] of artistCount) if (c >= artistFloor) lovedArtists.add(k);
+  // Top tracks: songs you clearly return to (repeat-played) — your "most played".
+  const topTracks = new Set();
+  for (const [id, c] of trackCount) if (c >= 3) topTracks.add(id);
+  _favoritesCache = { lovedArtists, topTracks };
+  _favoritesAt = Date.now();
+  return _favoritesCache;
+}
+// True when an artist is loved — either by learned engagement OR by being one of
+// your most-played artists (the profile's top-artists signal).
+function _isLovedArtist(artist) {
+  if (!artist) return false;
+  const k = artist.toLowerCase();
+  if ((_artistTaste.get(k) || 0) > 0) return true;
+  return _favorites().lovedArtists.has(k);
+}
+// True when a track is one of the user's most repeat-played songs.
+function _isTopTrack(id) {
+  return !!id && _favorites().topTracks.has(id);
+}
+
 // Per-artist "sound" centroid (energy/valence/bpm) learned from real listening
 // history, cached briefly since history grows slowly. This is the backbone of the
 // "because you love X" anchoring (#1): it lets us measure how close a fresh pick
@@ -1866,7 +1919,7 @@ function _anchorLovedArtist(track) {
   const self = (track.artist || '').toLowerCase();
   let best = null, bestD = 0.33;                          // must be reasonably close
   for (const [k, info] of _artistCentroids()) {
-    if (k === self || (_artistTaste.get(k) || 0) <= 0) continue; // loved artists only
+    if (k === self || !_isLovedArtist(k)) continue; // loved artists only (learned or most-played)
     const d = _clusterDist(info.centroid, track);
     if (d < bestD) { bestD = d; best = info.name; }
   }
@@ -3365,7 +3418,10 @@ function _sqReasonFor(track, source, left, opts = {}) {
     if (_bondStrong(left, track)) reasons.push('you play these back-to-back');
   }
   if (source === 'ours') {
-    const loved = _artistBoost(track.artist) > 0;
+    // One of your most-played songs (profile top-tracks signal) — the strongest,
+    // most honest "you love this" we can show, so it leads.
+    if (_isTopTrack(track.id)) reasons.push('one of your most-played');
+    const loved = _isLovedArtist(track.artist);          // learned love OR a top artist
     if (loved) reasons.push('loved artist');
     else {
       const anchor = _anchorLovedArtist(track);        // #1 because you love X
@@ -3465,7 +3521,7 @@ function _sqInsightStrip() {
   // #1 — pick the single most interesting streak/callout to show.
   let lovedRun = 0;
   for (const s of upcoming) {
-    if (s.source === 'ours' && _artistBoost(s.track && s.track.artist) > 0) lovedRun++;
+    if (s.source === 'ours' && _isLovedArtist(s.track && s.track.artist)) lovedRun++;
     else break;
   }
   const oursCount   = upcoming.filter(s => s.source === 'ours').length;
@@ -3547,6 +3603,10 @@ function _sqStop(reason) {
 // our bookkeeping or get re-queued. Call it on EVERY manual change, BEFORE the
 // new play().
 function _sqClearQueue(reason) {
+  // This fires on every MANUAL change (new song / playlist / mood / vibe) right
+  // before the replacing play(), so it's the one place to flag that the track
+  // about to be interrupted should be exempt from skip/dislike scoring.
+  _suppressEngageUntil = Date.now() + _SUPPRESS_ENGAGE_MS;
   _sqStop(reason);
   _setStaged([]);
   _autoQueueCount = 0;
@@ -5217,8 +5277,18 @@ async function poll() {
         if (state.track?.uri) _stagedUris.delete(state.track.uri);
         // Record it in the recent-play window so it can't be re-staged for a while.
         _notePlayed(state.track?.id);
-        // Judge engagement with the outgoing track (skip vs finish) before we move on
-        _evaluateEngagement(_lastState);
+        // Judge engagement with the outgoing track (skip vs finish) before we move
+        // on — UNLESS this track change was triggered by an app-initiated context
+        // switch (mood/vibe/track change), in which case the outgoing track was
+        // not rejected by the user and must not be penalised as a skip.
+        const appInitiated = Date.now() < _suppressEngageUntil;
+        _suppressEngageUntil = 0; // consume: only the first change after a switch is exempt
+        if (appInitiated) {
+          _transitionPrevId = null; // break the transition chain across the context switch
+          console.log(`[Spotify] Engagement: skipped scoring "${_lastState?.track?.title}" — app-initiated context change`);
+        } else {
+          _evaluateEngagement(_lastState);
+        }
         _lastProgress = null;
         _autoQueueCount = Math.max(0, _autoQueueCount - 1);
         // Broadcast fresh queue ~1.5 s after track change so Spotify's queue
