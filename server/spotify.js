@@ -4585,8 +4585,23 @@ function _predictForNow() {
   if (!feeling) return null;
   const def  = FEELING_DEFS[feeling];
   const mood = moodForFeeling(feeling);
+
+  // Personal, Portraits/time-machine-style line surfaced on the Now Playing panel
+  // (this slot lives here, not in the Portraits grid). Mirrors buildTimeMachine's
+  // clock so both read identically, e.g. "It's Sunday 11pm, your nights usually
+  // feel angsty". "feel" when it's a reported feeling, "sound" when it's the
+  // audio-pattern guess. The client appends " · <top artists>".
+  const hr         = now.getHours();
+  const hour12     = ((hr + 11) % 12) + 1;
+  const ampm       = hr < 12 ? 'am' : 'pm';
+  const weekdayName = now.toLocaleDateString([], { weekday: 'long' });
+  const slotNoun   = SLOT_LABELS[slot] || slot;
+  const feelWord   = (def?.label || feeling).toLowerCase();
+  const personal   = `It's ${weekdayName} ${hour12}${ampm}, your ${slotNoun} usually ${reportedFeeling ? 'feel' : 'sound'} ${feelWord}`;
+
   return {
     label:        slotLabel,
+    personal,
     feeling,
     feelingLabel: def?.label || feeling,
     emoji:        def?.emoji || '',

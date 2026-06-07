@@ -2576,16 +2576,10 @@ export function renderSpotifyInsights(ctrl) {
   });
 
   function _renderPortraits(data) {
-    const tm = data && data.timeMachine;
-    if (tm) {
-      tmEl.style.display = '';
-      tmEmoji.textContent = tm.emoji || '🕰️';
-      tmHeadline.textContent = tm.headline || '';
-      tmSub.textContent = tm.sub || '';
-      tmPlay.style.display = (tm.seed && tm.seed.uri) ? '' : 'none';
-    } else {
-      tmEl.style.display = 'none';
-    }
+    // The current slot's "It's Sunday 11pm…" card now lives on the Now Playing
+    // panel (the prediction sub-line), so it's no longer shown here to avoid
+    // duplicating the same thing in two places.
+    if (tmEl) tmEl.style.display = 'none';
 
     // #7 — Your day in music recap.
     const recap = data && data.dayRecap;
