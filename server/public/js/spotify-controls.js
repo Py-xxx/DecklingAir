@@ -2156,25 +2156,31 @@ function renderSpotifyStats(ctrl) {
     return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) + ' ' + time;
   }
 
-  function _renderSessions(sessions) {
-    historyList.innerHTML = '';
-    if (!sessions || !sessions.length) {
-      historyList.innerHTML = '<div class="sp-queue-empty">No past sessions yet</div>';
-      return;
-    }
-    const maxMs = Math.max(...sessions.map(s => s.listenedMs || 0), 1);
-    sessions.forEach(s => {
-      const row = document.createElement('div');
-      row.className = 'sp-history-row';
-      row.dataset.id = s.id;
-      const sourceClass = s.source === 'away' ? 'sp-history-badge--away' : 'sp-history-badge--live';
-      const sourceLabel = s.source === 'away' ? 'Away' : 'Live';
-      const trackCount  = s.trackIds ? s.trackIds.length : (s.trackCount ?? 0);
-      const sparkPct    = Math.round(((s.listenedMs || 0) / maxMs) * 100);
-      const vibeChip    = s.vibeName
-        ? `<span class="sp-history-vibe" style="--vibe:${_vibeColor(s.vibeKey)}">${_esc(s.vibeName)}</span>`
-        : '';
-      row.innerHTML = `
+  // Monday-anchored start of the week containing `ts` (local time, midnight).
+  function _weekStart(ts) {
+    const d = new Date(ts);
+    d.setHours(0, 0, 0, 0);
+    const mondayOffset = (d.getDay() + 6) % 7; // Sun=0 → 6, Mon=1 → 0 …
+    d.setDate(d.getDate() - mondayOffset);
+    return d;
+  }
+  // "18 Jun - 24 Jun" range label for a week starting at `start`.
+  function _fmtWeekLabel(start) {
+    const end = new Date(start); end.setDate(end.getDate() + 6);
+    const opt = { day: 'numeric', month: 'short' };
+    return `${start.toLocaleDateString('en-GB', opt)} – ${end.toLocaleDateString('en-GB', opt)}`;
+  }
+
+  function _sessionRowHtml(s, maxMs) {
+    const sourceClass = s.source === 'away' ? 'sp-history-badge--away' : 'sp-history-badge--live';
+    const sourceLabel = s.source === 'away' ? 'Away' : 'Live';
+    const trackCount  = s.trackIds ? s.trackIds.length : (s.trackCount ?? 0);
+    const sparkPct    = Math.round(((s.listenedMs || 0) / maxMs) * 100);
+    const vibeChip    = s.vibeName
+      ? `<span class="sp-history-vibe" style="--vibe:${_vibeColor(s.vibeKey)}">${_esc(s.vibeName)}</span>`
+      : '';
+    return `
+      <div class="sp-history-row" data-id="${_esc(String(s.id))}">
         <button class="sp-history-head">
           <span class="sp-history-chevron">${SP_ICON.chevron}</span>
           <div class="sp-history-meta">
@@ -2191,8 +2197,43 @@ function renderSpotifyStats(ctrl) {
           </div>
         </button>
         <div class="sp-history-body" style="display:none"></div>
+      </div>`;
+  }
+
+  function _renderSessions(sessions) {
+    historyList.innerHTML = '';
+    if (!sessions || !sessions.length) {
+      historyList.innerHTML = '<div class="sp-queue-empty">No past sessions yet</div>';
+      return;
+    }
+    const sorted = [...sessions].sort((a, b) => (b.startTime || 0) - (a.startTime || 0));
+    const maxMs = Math.max(...sorted.map(s => s.listenedMs || 0), 1);
+
+    // Group into Mon–Sun weeks; only the most recent week starts expanded.
+    const groups = [];
+    const byKey = new Map();
+    for (const s of sorted) {
+      const start = _weekStart(s.startTime || Date.now());
+      const key = start.getTime();
+      let g = byKey.get(key);
+      if (!g) { g = { key, start, sessions: [] }; byKey.set(key, g); groups.push(g); }
+      g.sessions.push(s);
+    }
+
+    groups.forEach((g, gi) => {
+      const panel = document.createElement('div');
+      panel.className = 'sp-history-week' + (gi === 0 ? ' expanded' : '');
+      const totalMs = g.sessions.reduce((sum, s) => sum + (s.listenedMs || 0), 0);
+      const rows = g.sessions.map(s => _sessionRowHtml(s, maxMs)).join('');
+      panel.innerHTML = `
+        <button class="sp-history-week-head">
+          <span class="sp-history-chevron">${SP_ICON.chevron}</span>
+          <span class="sp-history-week-label">${_fmtWeekLabel(g.start)}</span>
+          <span class="sp-history-week-count">${g.sessions.length} · ${fmtDuration(totalMs)}</span>
+        </button>
+        <div class="sp-history-week-body">${rows}</div>
       `;
-      historyList.appendChild(row);
+      historyList.appendChild(panel);
     });
   }
 
@@ -2239,6 +2280,9 @@ function renderSpotifyStats(ctrl) {
 
   historyList.addEventListener('pointerup', async (e) => {
     if (isEditMode()) return;
+    const weekHead = e.target.closest('.sp-history-week-head');
+    if (weekHead) { weekHead.parentElement.classList.toggle('expanded'); return; }
+
     const head = e.target.closest('.sp-history-head');
     if (head) { _expandSession(head.parentElement); return; }
 

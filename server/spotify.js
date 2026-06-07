@@ -3511,8 +3511,20 @@ async function _sqEnqueueUpcoming() {
       break; // preserve order — stop on first failure, retry next tick
     }
   }
-  if (queued) console.log(`[SmartQueue] ➕ Queued ${queued} upcoming track(s) to Up Next`);
+  if (queued) {
+    console.log(`[SmartQueue] ➕ Queued ${queued} upcoming track(s) to Up Next`);
+    _scheduleQueueRefresh(); // push the freshly-extended Up Next to the queue panel
+  }
   return queued;
+}
+
+// Debounced queue-panel refresh. Smart Queue enqueues happen AFTER the post-track-
+// change emitQueue() fires, so without this the panel lags a track behind whenever
+// we add to Up Next. Coalesces bursts (build + extend in one tick) into one emit.
+let _queueRefreshTimer = null;
+function _scheduleQueueRefresh(delay = 1200) {
+  if (_queueRefreshTimer) clearTimeout(_queueRefreshTimer);
+  _queueRefreshTimer = setTimeout(() => { _queueRefreshTimer = null; emitQueue(); }, delay);
 }
 
 // Build a fresh window from the current track and enqueue the whole upcoming run.
@@ -3670,9 +3682,20 @@ async function emitQueue() {
   try {
     const data = await getQueue();
     const ann = _sqWindowAnnotations();
+    // Spotify repeats the current track in "Up Next" when there's no real queue or
+    // context (e.g. a single-song play), so the raw queue ends with the same track
+    // stacked over and over. Collapse consecutive duplicate URIs so the panel shows
+    // it once instead of a wall of repeats.
+    const rawQueue = (data && Array.isArray(data.queue)) ? data.queue : [];
+    const dedupQueue = [];
+    for (const t of rawQueue) {
+      const prev = dedupQueue[dedupQueue.length - 1];
+      if (prev && prev.uri && t.uri && prev.uri === t.uri) continue;
+      dedupQueue.push(t);
+    }
     const items =
-      data && data.queue
-        ? data.queue.slice(0, 30).map((t) => {
+      dedupQueue.length
+        ? dedupQueue.slice(0, 30).map((t) => {
             const a = ann.get(t.uri) || ann.get(t.id) || null;
             return {
               id: t.id,
