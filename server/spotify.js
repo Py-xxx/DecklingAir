@@ -3175,8 +3175,25 @@ async function _sqBuildOurCandidates(count) {
   } catch (err) {
     console.error('[SmartQueue] Candidate build failed:', err.message);
   }
-  return _excludeDisliked(tracks || []).filter(t =>
+  let out = _excludeDisliked(tracks || []).filter(t =>
     t && t.id && !_sq.noRepeat.has(t.id) && !_isRecentlyPlayed(t.id));
+
+  // Resilient top-up. The primary source (rightnow's top tracks, a mood/vibe
+  // list, or the search blend) runs dry mid-session once its picks all land in
+  // the no-repeat memory — which is exactly when window EXTENDS started coming
+  // back "0 ours" and the queue drifted to pure Spotify anchors. Backfill from
+  // the taste/context-ranked library so our songs keep getting woven in for as
+  // long as ANY unplayed familiar track remains. _sqLibraryCandidates already
+  // excludes no-repeat/recent/disliked, so this never resurfaces a just-played
+  // track, and it's context-biased so the fills still suit the current sound.
+  if (out.length < count) {
+    const have = new Set(out.map(t => t.id));
+    for (const t of _sqLibraryCandidates(count * 2)) {
+      if (out.length >= count) break;
+      if (t && t.id && !have.has(t.id)) { out.push(t); have.add(t.id); }
+    }
+  }
+  return out;
 }
 
 // Build the raw Spotify DISCOVERY anchors for a window — the fresh picks the app
