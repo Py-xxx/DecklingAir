@@ -2408,6 +2408,7 @@ export function renderSpotifyInsights(ctrl) {
     <div class="sp-ins-wrap">
       <div class="sp-ins-tab-bar">
         <button class="sp-ins-tab active" data-tab="profile">Profile</button>
+        <button class="sp-ins-tab" data-tab="artists">Artists</button>
         <button class="sp-ins-tab" data-tab="portraits">Portraits</button>
         <button class="sp-ins-tab" data-tab="vibes">Vibes</button>
         <button class="sp-ins-tab" data-tab="mood">Mood</button>
@@ -2453,6 +2454,14 @@ export function renderSpotifyInsights(ctrl) {
               <span class="sp-ins-signal-icon">💬</span><span class="sp-ins-signal-val">0</span> feeling labels
             </span>
           </div>
+        </div>
+
+        <!-- ARTISTS — rate recently-played artists to override the over-played
+             "loved" heuristic (a low rating strongly down-weights, never blocks). -->
+        <div class="sp-ins-panel" data-panel="artists" style="display:none">
+          <div class="sp-ins-rate-intro">Rate artists you've played recently. The smart queue over-promotes whatever you play a lot — a rating here overrides that. <b>Never</b> won't block an artist, just strongly down-weights them.</div>
+          <div class="sp-ins-rate-list"></div>
+          <div class="sp-ins-rate-empty" style="display:none">Keep listening — recently-played artists appear here once you have some history.</div>
         </div>
 
         <!-- PORTRAITS (#9 per-context taste portraits + #5 time-machine) -->
@@ -2576,6 +2585,7 @@ export function renderSpotifyInsights(ctrl) {
     btn.classList.add('active');
     panels.forEach(p => p.style.display = p.dataset.panel === btn.dataset.tab ? '' : 'none');
     if (btn.dataset.tab === 'portraits') socket.emit('spotify:get_portraits');
+    if (btn.dataset.tab === 'artists')   socket.emit('spotify:get_artist_ratings');
   });
 
   // ---- Portraits tab (#9) + time-machine (#5) ----
@@ -2647,6 +2657,68 @@ export function renderSpotifyInsights(ctrl) {
   }
   const _onPortraits = (data) => _renderPortraits(data);
   socket.on('spotify:portraits', _onPortraits);
+
+  // ---- Artists tab (rate recently-played artists) ----
+  const rateList  = card.querySelector('.sp-ins-rate-list');
+  const rateEmpty = card.querySelector('.sp-ins-rate-empty');
+  // value → { label, emoji }. Order shown low→high in the control.
+  const RATE_LEVELS = [
+    { v: -2, label: 'Never',   emoji: '🚫' },
+    { v: -1, label: 'Dislike', emoji: '👎' },
+    { v:  0, label: 'Neutral', emoji: '😐' },
+    { v:  1, label: 'Like',    emoji: '👍' },
+    { v:  2, label: 'Love',    emoji: '❤️' },
+  ];
+  function _rateAgo(ts) {
+    if (!ts) return '';
+    const d = Date.now() - ts;
+    const m = Math.floor(d / 60000);
+    if (m < 1) return 'just now';
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    const days = Math.floor(h / 24);
+    return `${days}d ago`;
+  }
+  function _renderArtistRatings(data) {
+    const items = (data && data.items) ? data.items : [];
+    rateList.innerHTML = '';
+    rateEmpty.style.display = items.length ? 'none' : '';
+    items.forEach((it) => {
+      const row = document.createElement('div');
+      row.className = 'sp-ins-rate-row';
+      row.dataset.artist = it.artist;
+      const meta = [];
+      if (it.count) meta.push(`${it.count} play${it.count === 1 ? '' : 's'}`);
+      if (it.lastTs) meta.push(_rateAgo(it.lastTs));
+      const buttons = RATE_LEVELS.map(l =>
+        `<button class="sp-ins-rate-btn${it.rating === l.v ? ' active' : ''}" data-val="${l.v}" title="${l.label}" aria-label="${l.label}">${l.emoji}</button>`
+      ).join('');
+      row.innerHTML = `
+        <div class="sp-ins-rate-art">${it.art ? `<img src="${_esc(it.art)}" alt="">` : '<span class="sp-ins-rate-art-ph">♪</span>'}</div>
+        <div class="sp-ins-rate-info">
+          <span class="sp-ins-rate-name">${_esc(it.artist)}${it.loved ? ' <span class="sp-ins-rate-loved" title="Currently treated as a loved artist">★</span>' : ''}</span>
+          <span class="sp-ins-rate-meta">${_esc(meta.join(' · '))}</span>
+        </div>
+        <div class="sp-ins-rate-ctrl">${buttons}</div>
+      `;
+      rateList.appendChild(row);
+    });
+  }
+  rateList.addEventListener('click', (e) => {
+    if (isEditMode()) return;
+    const btn = e.target.closest('.sp-ins-rate-btn');
+    if (!btn) return;
+    const row = btn.closest('.sp-ins-rate-row');
+    if (!row) return;
+    const artist = row.dataset.artist;
+    const val = Number(btn.dataset.val);
+    // Re-clicking the active rating clears it (back to the learned heuristic).
+    const rating = btn.classList.contains('active') ? null : val;
+    socket.emit('spotify:set_artist_rating', { artist, rating });
+  });
+  const _onArtistRatings = (data) => _renderArtistRatings(data);
+  socket.on('spotify:artist_ratings', _onArtistRatings);
 
   // ---- Feedback helper ----
   function _showFeedback(msg, ok = true) {
@@ -3084,6 +3156,7 @@ export function renderSpotifyInsights(ctrl) {
       socket.off('spotify:continuous_state', _onContinuousState);
       socket.off('spotify:insights',        _onInsights);
       socket.off('spotify:portraits',       _onPortraits);
+      socket.off('spotify:artist_ratings',  _onArtistRatings);
       _insRo.disconnect();
       _cleanObs.disconnect();
     }

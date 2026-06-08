@@ -2197,6 +2197,94 @@
   flex-shrink: 0;
 }
 
+/* ---------- ARTISTS (RATING) TAB ---------- */
+.sp-ins-rate-intro {
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-3, #9aa);
+  margin-bottom: 8px;
+}
+.sp-ins-rate-intro b { color: var(--text, #fff); font-weight: 600; }
+.sp-ins-rate-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+.sp-ins-rate-empty {
+  font-size: 11px;
+  color: var(--text-3, #888);
+  text-align: center;
+  padding: 18px 8px;
+}
+.sp-ins-rate-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 8px;
+  background: rgba(255,255,255,0.03);
+}
+.sp-ins-rate-art {
+  width: 30px;
+  height: 30px;
+  border-radius: 5px;
+  overflow: hidden;
+  flex-shrink: 0;
+  background: rgba(255,255,255,0.06);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.sp-ins-rate-art img { width: 100%; height: 100%; object-fit: cover; }
+.sp-ins-rate-art-ph { font-size: 13px; color: var(--text-3, #888); }
+.sp-ins-rate-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+.sp-ins-rate-name {
+  font-size: 11.5px;
+  color: var(--text, #fff);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sp-ins-rate-loved { color: var(--sp-green, #1DB954); font-size: 10px; }
+.sp-ins-rate-meta {
+  font-size: 9.5px;
+  color: var(--text-3, #888);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sp-ins-rate-ctrl {
+  display: flex;
+  gap: 1px;
+  flex-shrink: 0;
+}
+.sp-ins-rate-btn {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 3px;
+  border-radius: 6px;
+  filter: grayscale(1) opacity(0.4);
+  transition: filter 0.12s ease, background 0.12s ease, transform 0.08s ease;
+}
+.sp-ins-rate-btn:hover { filter: grayscale(0) opacity(0.9); background: rgba(255,255,255,0.06); }
+.sp-ins-rate-btn:active { transform: scale(0.9); }
+.sp-ins-rate-btn.active {
+  filter: grayscale(0) opacity(1);
+  background: rgba(29,185,84,0.18);
+  box-shadow: inset 0 0 0 1px rgba(29,185,84,0.5);
+}
+
 /* ---------- PATTERNS TAB ---------- */
 .sp-ins-heatmap-wrap {
   flex: 0 0 auto;

@@ -270,6 +270,11 @@ function _isRecentlyPlayed(id) { return !!id && _recentPlayIds.includes(id); }
 //                is soft-banned once skipped TRACK_SOFTBAN_COUNT times; a full listen
 //                decays the count back down (recovery).
 let _artistTaste   = new Map();
+// _artistRating: lowercase artist → EXPLICIT user rating, PERSISTED. This is a
+// deliberate override of the learned/play-count heuristics: the engine over-promotes
+// artists you merely play a lot, so an explicit rating wins. Levels:
+//   2 Love · 1 Like · 0 Neutral · -1 Dislike · -2 Never (strong down-weight, not a block).
+let _artistRating  = new Map();
 let _trackDislikes = new Map();
 // _skipSlot: trackId → the time-slot key ("weekday:evening") of its LAST hard skip.
 // Lets the engine spot a "rescued" pick: a track you skipped in one context that
@@ -524,6 +529,9 @@ function loadTasteProfile() {
     for (const [k, v] of Object.entries(obj.artistScores || {})) {
       if (typeof v === 'number') _artistTaste.set(k, v);
     }
+    for (const [k, v] of Object.entries(obj.artistRatings || {})) {
+      if (typeof v === 'number' && v >= -2 && v <= 2) _artistRating.set(k, v);
+    }
     for (const [k, v] of Object.entries(obj.trackDislikes || {})) {
       if (typeof v === 'number') _trackDislikes.set(k, v);
     }
@@ -536,7 +544,7 @@ function loadTasteProfile() {
     for (const [k, v] of Object.entries(obj.slotBias || {})) {
       if (v && typeof v === 'object') _slotBias.set(k, { dE: Number(v.dE) || 0, dV: Number(v.dV) || 0 });
     }
-    console.log(`[Spotify] Loaded taste profile — ${_artistTaste.size} artists, ${_trackDislikes.size} disliked tracks, ${_transitions.size} transitions, ${_slotBias.size} slot biases`);
+    console.log(`[Spotify] Loaded taste profile — ${_artistTaste.size} artists, ${_artistRating.size} rated, ${_trackDislikes.size} disliked tracks, ${_transitions.size} transitions, ${_slotBias.size} slot biases`);
   } catch (err) {
     console.error('[Spotify] loadTasteProfile error:', err.message);
   }
@@ -548,6 +556,7 @@ function saveTasteProfile() {
     fs.mkdirSync(path.dirname(TASTE_PROFILE_FILE), { recursive: true });
     const obj = {
       artistScores:  Object.fromEntries(_artistTaste),
+      artistRatings: Object.fromEntries(_artistRating),
       trackDislikes: Object.fromEntries(_trackDislikes),
       skipSlot:      Object.fromEntries(_skipSlot),
       transitions:   Object.fromEntries(_transitions),
@@ -1800,11 +1809,38 @@ function _adjustArtistScore(artist, delta) {
 }
 function _artistAvoided(artist) {
   if (!artist) return false;
+  // An explicit rating is a deliberate override: a rated artist is NEVER hard-avoided
+  // here (even "Never" is a strong down-weight, not a block — see _artistRatingMult).
+  if (_artistRating.has(artist.toLowerCase())) return false;
   return (_artistTaste.get(artist.toLowerCase()) || 0) <= ARTIST_DISLIKE_SCORE;
+}
+// Explicit user rating for an artist, or null if unrated. 2 Love · 1 Like · 0 Neutral
+// · -1 Dislike · -2 Never. This is the source of truth that overrides the learned and
+// play-count heuristics below.
+function _artistRatingOf(artist) {
+  if (!artist) return null;
+  const r = _artistRating.get(artist.toLowerCase());
+  return (typeof r === 'number') ? r : null;
+}
+// Selection-frequency multiplier from an explicit rating (1 = no change). Negative
+// ratings strongly down-weight the artist without ever fully blocking them.
+function _artistRatingMult(artist) {
+  switch (_artistRatingOf(artist)) {
+    case -2: return 0.18;  // Never  → strong down-weight (still appears occasionally)
+    case -1: return 0.45;  // Dislike → noticeable down-weight
+    default: return 1;     // Like/Love/Neutral/unrated → no penalty
+  }
 }
 // Positive taste signal for an artist (0 = neutral/disliked) — used to bias selection.
 function _artistBoost(artist) {
   if (!artist) return 0;
+  const rated = _artistRatingOf(artist);
+  if (rated != null) {
+    // Explicit rating overrides the slow learned score entirely.
+    if (rated >= 2) return ARTIST_TASTE_MAX;       // Love
+    if (rated === 1) return Math.round(ARTIST_TASTE_MAX / 2); // Like
+    return 0;                                      // Neutral / Dislike / Never
+  }
   return Math.max(0, _artistTaste.get(artist.toLowerCase()) || 0);
 }
 
@@ -1845,12 +1881,70 @@ function _favorites() {
 function _isLovedArtist(artist) {
   if (!artist) return false;
   const k = artist.toLowerCase();
+  // Explicit rating wins over BOTH the learned score and the play-count heuristic —
+  // this is exactly the over-played-but-not-loved case the rating UI exists to fix.
+  const rated = _artistRating.get(k);
+  if (typeof rated === 'number') return rated >= 1; // Like/Love only
   if ((_artistTaste.get(k) || 0) > 0) return true;
   return _favorites().lovedArtists.has(k);
 }
 // True when a track is one of the user's most repeat-played songs.
 function _isTopTrack(id) {
   return !!id && _favorites().topTracks.has(id);
+}
+
+// Recently-played artists with play counts, last-played time, a cover sample and the
+// current explicit rating — feeds the profile panel's "rate your artists" tab. Built
+// entirely from in-memory history (no Spotify calls). Sorted by play count desc.
+function _artistRatingList(limit = 60) {
+  const info = new Map(); // key → { name, count, lastTs, art }
+  for (const e of combinedHistory()) {
+    const name = e.artist;
+    if (!name) continue;
+    const key = name.toLowerCase();
+    let rec = info.get(key);
+    if (!rec) { rec = { name, count: 0, lastTs: 0, art: null }; info.set(key, rec); }
+    rec.count++;
+    const ts = e.ts || 0;
+    if (ts >= rec.lastTs) { rec.lastTs = ts; if (e.art) rec.art = e.art; }
+    if (!rec.art && e.art) rec.art = e.art;
+  }
+  // Include any rated artist even if it's aged out of history, so ratings stay editable.
+  for (const [key, rating] of _artistRating) {
+    if (!info.has(key)) info.set(key, { name: key, count: 0, lastTs: 0, art: null });
+  }
+  const out = [...info.entries()].map(([key, rec]) => ({
+    artist: rec.name,
+    key,
+    count: rec.count,
+    lastTs: rec.lastTs || null,
+    art: rec.art || null,
+    rating: _artistRating.has(key) ? _artistRating.get(key) : null,
+    loved: _isLovedArtist(rec.name),
+  }));
+  // Rated artists first (so you can find/edit them), then by play count.
+  out.sort((a, b) =>
+    (b.rating != null) - (a.rating != null) ||
+    b.count - a.count ||
+    (b.lastTs || 0) - (a.lastTs || 0));
+  return out.slice(0, limit);
+}
+
+// Apply an explicit rating (or clear it with null). Validates the level, persists,
+// and invalidates the favourites cache so the loved-artist heuristic re-resolves.
+function _setArtistRating(artist, rating) {
+  if (!artist) return false;
+  const key = artist.toLowerCase();
+  if (rating == null) {
+    _artistRating.delete(key);
+  } else {
+    const r = Math.round(Number(rating));
+    if (!(r >= -2 && r <= 2)) return false;
+    _artistRating.set(key, r);
+  }
+  _favoritesCache = null; // loved-artist set depends on ratings now
+  _scheduleTasteSave();
+  return true;
 }
 
 // Per-artist "sound" centroid (energy/valence/bpm) learned from real listening
@@ -3092,9 +3186,12 @@ function _sqLibraryCandidates(count) {
     // Set-closer (#8): when winding down, fold in a "calmer is better" term so the
     // tail of the night eases off rather than spiking back up.
     const cool = setCloser ? (1 - (t.energy != null ? t.energy : 50) / 100) : 0;
-    const s = setCloser
+    const base = setCloser
       ? artist * 0.40 + ctx * 0.35 + cool * 0.25 + Math.random() * jitter
       : artist * 0.55 + ctx * 0.45 + Math.random() * jitter;
+    // Explicit "Dislike"/"Never" ratings strongly suppress how often the artist is
+    // picked, without ever removing them from the pool entirely.
+    const s = base * _artistRatingMult(t.artist);
     return { t, s };
   });
   ranked.sort((a, b) => b.s - a.s);
@@ -6036,6 +6133,36 @@ function init(io) {
         socket.emit('spotify:search_results', { type: searchType, items });
       } catch (err) {
         console.error('[Spotify] Search error:', err.message);
+        socket.emit('spotify:error', { message: err.message });
+      }
+    });
+
+    // ----- spotify:get_artist_ratings -----
+    // Recently-played artists + play counts + current rating, for the profile panel's
+    // "rate your artists" tab. In-memory only (no Spotify API calls).
+    socket.on('spotify:get_artist_ratings', () => {
+      try {
+        socket.emit('spotify:artist_ratings', { items: _artistRatingList() });
+      } catch (err) {
+        console.error('[Spotify] get_artist_ratings error:', err.message);
+        socket.emit('spotify:error', { message: err.message });
+      }
+    });
+
+    // ----- spotify:set_artist_rating -----
+    // { artist, rating }  rating ∈ {2 Love,1 Like,0 Neutral,-1 Dislike,-2 Never} or
+    // null to clear. The explicit rating overrides the learned/play-count loved heuristic.
+    socket.on('spotify:set_artist_rating', ({ artist, rating } = {}) => {
+      try {
+        const ok = _setArtistRating(artist, rating);
+        if (ok) {
+          console.log(`[Spotify] Artist rating: "${artist}" → ${rating == null ? 'cleared' : rating}`);
+          _io.emit('spotify:artist_ratings', { items: _artistRatingList() });
+        } else {
+          socket.emit('spotify:error', { message: 'Invalid artist rating' });
+        }
+      } catch (err) {
+        console.error('[Spotify] set_artist_rating error:', err.message);
         socket.emit('spotify:error', { message: err.message });
       }
     });
