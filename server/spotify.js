@@ -4570,7 +4570,54 @@ function _activeMixState() {
     energy:  Math.round(_activeMixTarget.energy),
     valence: Math.round(_activeMixTarget.valence),
     vibeKey: _activeMixTarget.vibeKey || null,
+    auto:    !!_activeMixTarget.auto,
   };
+}
+
+// Auto-vibe steering. As the live listening cluster firms up (the same signal
+// behind the Now Playing confidence bar), lock a Mix target onto its centroid so
+// the smart queue leans into the detected vibe — WITHOUT rebuilding the queue.
+// We only flip the existing session's source to 'mix' and point _activeMixTarget
+// at the centroid; the already-queued slots play out untouched and only future
+// window EXTENDS are steered. Re-steers when the vibe genuinely moves; never
+// overrides an explicit user choice (mood / vibe / feeling / hand-picked mix).
+const AUTO_VIBE_MIN_TRACKS = 5;   // cluster agreement before first auto-lock
+const AUTO_VIBE_RESTEER     = 0.18; // centroid move (0–1) needed to re-point
+function _maybeAutoSteerVibe() {
+  if (!_sq) return;                                              // no queue to steer
+  if (_activeMoodKey || _activeVibeKey || _activeFeeling) return; // user chose explicitly
+  if (_activeMixTarget && !_activeMixTarget.auto) return;         // hand-picked mix wins
+  // Only steer the everyday autoplay paths (search / playlist), or an already
+  // auto-steered mix — never an explicit 'mood'/'vibe'/'mix'/'rightnow' session.
+  const steerable = _sq.source === 'search' || _sq.source === 'playlist' ||
+                    (_sq.source === 'mix' && _activeMixTarget && _activeMixTarget.auto);
+  if (!steerable) return;
+  if (!_currentCentroid || _currentCluster.length < AUTO_VIBE_MIN_TRACKS) return;
+
+  const c = _currentCentroid;
+  if (_activeMixTarget && _activeMixTarget.auto) {
+    const moved = _clusterDist(
+      { energy: _activeMixTarget.energy, valence: _activeMixTarget.valence, bpm: null },
+      { energy: c.energy, valence: c.valence, bpm: null });
+    if (moved < AUTO_VIBE_RESTEER) {
+      // Same vibe — keep the centroid fresh but don't churn/emit.
+      _activeMixTarget.energy = c.energy;
+      _activeMixTarget.valence = c.valence;
+      return;
+    }
+  }
+
+  const target = {
+    energy: c.energy, valence: c.valence, spread: 0.15,
+    vibeKey: getVibeKey({ energy: c.energy, valence: c.valence }),
+    auto: true,
+  };
+  target.label = _mixTargetLabel(target);
+  const was = _activeMixTarget && _activeMixTarget.auto ? _activeMixTarget.label : null;
+  _activeMixTarget = target;
+  _sq.source = 'mix';   // steer future EXTENDS toward the vibe — no rebuild
+  console.log(`[SmartQueue] ◎ Auto-vibe ${was ? `re-steered ${was} →` : 'locked'} "${target.label}" (energy=${Math.round(c.energy)} valence=${Math.round(c.valence)}) — steering existing queue`);
+  if (_io) _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: null, activeMix: _activeMixState() });
 }
 
 // ── Unified mix builder ───────────────────────────────────────────────────────
@@ -5217,6 +5264,10 @@ function _updateCluster(histEntry) {
     _currentCentroid = _computeCentroid(_currentCluster);
     _driftBuffer = [];
 
+    // Steer the autoplay toward this firming-up vibe (no queue rebuild) before we
+    // broadcast, so the same intelligence emit carries the freshly-locked mix.
+    _maybeAutoSteerVibe();
+
     // Always emit so the UI counter updates in real time
     _emitIntelligenceState();
 
@@ -5253,6 +5304,10 @@ function _updateCluster(histEntry) {
         _pendingCheckIn = null;
         if (_io) _io.emit('spotify:checkin_dismiss', { reason: 'vibe_changed' });
       }
+      // Re-steer once the new vibe has firmed up (this fresh cluster is only ~3
+      // tracks, so the old auto-vibe keeps steering until it reaches confidence —
+      // intentional stickiness so a brief detour doesn't yank the queue around).
+      _maybeAutoSteerVibe();
       _emitIntelligenceState();
     }
   }

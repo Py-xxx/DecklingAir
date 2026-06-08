@@ -1837,7 +1837,7 @@ function renderSpotifyQueue(ctrl) {
     clearTimeout(_flashTimer);
     _flashTimer = setTimeout(() => autoPill.classList.remove('is-flash'), 1100);
   }
-  const _onContState = (d) => _setAuto(!!(d && (d.activeMoodKey || d.activeVibeKey || d.activeFeeling)));
+  const _onContState = (d) => _setAuto(!!(d && (d.activeMoodKey || d.activeVibeKey || d.activeFeeling || d.activeMix)));
   const _onQueueManaged = (d) => { _setAuto(true); if (d && d.added > 0) _flashAuto(); };
   socket.on('spotify:continuous_state', _onContState);
   socket.on('spotify:queue_managed',    _onQueueManaged);
@@ -1920,7 +1920,7 @@ function renderSpotifyQueue(ctrl) {
   // Sync the Auto pill with the current engine state on creation.
   socket.emit('spotify:get_intelligence');
   socket.once('spotify:intelligence_state', (d) => {
-    _setAuto(!!(d && (d.activeMoodKey || d.activeVibeKey || d.activeFeeling)));
+    _setAuto(!!(d && (d.activeMoodKey || d.activeVibeKey || d.activeFeeling || d.activeMix)));
   });
 
   return card;
@@ -3033,11 +3033,13 @@ export function renderSpotifyInsights(ctrl) {
       dot.dataset.key = a.key;
       _mixPlace(dot, a.energy, a.valence);
       dot.innerHTML = `<span class="sp-ins-mixmap-anchor-dot"></span><span class="sp-ins-mixmap-anchor-name">${_esc(a.name)}</span>`;
+      // Tapping a preset on the map only *snaps* the puck to it (and labels it) —
+      // it never auto-plays, so a stray tap while sliding can't kick off a mix.
+      // Confirm with "Play this". (The Quick-pick chips below are the one-tap path.)
       dot.addEventListener('pointerup', (ev) => {
         ev.stopPropagation();
         if (isEditMode()) return;
         _mixSelect(a.energy, a.valence, a.name, a.key);
-        _mixPlaySelected();
       });
       _mixAnchorsEl.appendChild(dot);
     });
@@ -3523,12 +3525,22 @@ export function renderSpotifyIntelligence(ctrl) {
     const _ps = _currentPoolSizeCache;
     const _poolText = (_ps != null && _ps > 0) ? `drawing from ${_ps} of your songs` : null;
 
+    const activeMix = data.activeMix;
     if (activeFeeling) {
       feelingEmoji.textContent = activeFeeling.emoji;
       feelingLabel.textContent = activeFeeling.label;
       if (feelingSub) feelingSub.textContent = _poolText ? `Feeling · ${_poolText}` : 'Feeling · keeps going';
       feelingRow.style.display = '';
       vibeRow.style.display    = 'none';
+      idleEl.style.display     = 'none';
+    } else if (activeMix && activeMix.label) {
+      // Unified mood-map mix — either picked from the pad or auto-detected from
+      // your live listening (auto-steer leans the queue into the current vibe).
+      vibeLabelEl.textContent  = activeMix.label;
+      const _tag = activeMix.auto ? 'auto vibe' : 'mix';
+      if (vibeSub) vibeSub.textContent = _poolText ? `${_tag} · ${_poolText} · keeps going ∞` : `${_tag} · keeps going ∞`;
+      vibeRow.style.display    = '';
+      feelingRow.style.display = 'none';
       idleEl.style.display     = 'none';
     } else if (activeMoodKey || activeVibeKey) {
       vibeLabelEl.textContent  = data.activeMoodName || activeMoodKey || activeVibeKey;
