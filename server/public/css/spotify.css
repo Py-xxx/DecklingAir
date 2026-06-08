@@ -2980,6 +2980,18 @@
   will-change: transform;
   --sp-scroll-shift: 0px;
 }
+/* Static mode (time-machine descriptor line): wrap the text and never scroll. */
+.sp-intel-predict-sub.sp-marquee-static {
+  white-space: normal;
+  overflow: visible;
+}
+.sp-intel-predict-sub.sp-marquee-static > span {
+  display: inline;
+  white-space: normal;
+  transform: none !important;
+  animation: none !important;
+  will-change: auto;
+}
 /* Portraits-style energy / positivity bars + taste-drift, surfaced inline so
    the current slot's personal portrait lives here instead of the Portraits grid. */
 .sp-intel-predict-bars { display: flex; flex-direction: column; gap: 3px; margin-top: 5px; max-width: 160px; }

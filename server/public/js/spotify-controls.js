@@ -594,6 +594,7 @@ function _applyMarquee(containerEl) {
 // the inner span if missing. Only re-applies the marquee when the text changes.
 function _setMarqueeText(clipEl, text) {
   if (!clipEl) return;
+  clipEl.classList.remove('sp-marquee-static'); // re-enable scrolling if it was static
   let span = clipEl.querySelector(':scope > span');
   if (!span) { span = document.createElement('span'); clipEl.appendChild(span); }
   const str = text == null ? '' : String(text);
@@ -601,6 +602,20 @@ function _setMarqueeText(clipEl, text) {
     span.textContent = str;
     _applyMarquee(clipEl);
   }
+}
+
+// Set a clip element's text as STATIC — it wraps and never scrolls (the inverse of
+// _setMarqueeText). Adds the .sp-marquee-static class so CSS lets it wrap, and
+// cancels any marquee animation left over from a previous render of this element.
+function _setStaticText(clipEl, text) {
+  if (!clipEl) return;
+  let span = clipEl.querySelector(':scope > span');
+  if (!span) { span = document.createElement('span'); clipEl.appendChild(span); }
+  clipEl.classList.add('sp-marquee-static');
+  span.style.animation = 'none';
+  span.style.transform = 'none';
+  span.style.removeProperty('--sp-scroll-shift');
+  span.textContent = text == null ? '' : String(text);
 }
 
 // Recently-played playlist IDs — tracked client-side for the "Recent" sort
@@ -3357,8 +3372,9 @@ export function renderSpotifyIntelligence(ctrl) {
       if (contextLabel) contextLabel.style.display = 'none'; // the headline is self-describing
       predictEmoji.textContent = tm.emoji || '🕰️';
       _setMarqueeText(predictName, tm.headline);
-      // Static descriptor under the headline ("Your nights usually lean X, often:").
-      _setMarqueeText(predictSub, tm.lean || tm.sub || '');
+      // Static descriptor under the headline ("Your nights usually lean X, often:")
+      // — wraps instead of scrolling (no marquee), unlike the other render branches.
+      _setStaticText(predictSub, tm.lean || tm.sub || '');
       // Marquee of this time-slot's regular artists, scrolling beneath the descriptor.
       const tmArtists = (tm.artists && tm.artists.length) ? tm.artists.join('   ·   ') : '';
       if (predictArtists) {
@@ -3570,7 +3586,8 @@ export function renderSpotifyIntelligence(ctrl) {
     clearTimeout(_predictMarqueeTimer);
     _predictMarqueeTimer = setTimeout(() => {
       _applyMarquee(predictName);
-      _applyMarquee(predictSub);
+      // predictSub is static (wrapping) in time-machine mode — don't marquee it then.
+      if (!predictSub.classList.contains('sp-marquee-static')) _applyMarquee(predictSub);
       if (predictArtists) _applyMarquee(predictArtists);
     }, 60);
   });
