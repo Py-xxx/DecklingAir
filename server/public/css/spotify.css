@@ -2577,12 +2577,18 @@
   line-height: 1.35;
   margin: 2px 0 8px;
 }
-/* Square pad with axis captions around it. */
+/* Square pad with axis captions around it. In the insights panel (a flex
+   column) an auto cross-axis margin would cancel the default stretch and
+   collapse the pad, so we center with align-self + an explicit width. */
 .sp-ins-mixmap-wrap {
   position: relative;
-  margin: 0 auto 8px;
-  padding: 16px;
+  align-self: center;
+  width: 100%;
   max-width: 280px;
+  margin-bottom: 8px;
+  padding: 16px;
+  box-sizing: border-box;
+  flex-shrink: 0;
 }
 .sp-ins-mixmap-axis {
   position: absolute;
