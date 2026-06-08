@@ -3527,6 +3527,71 @@ function _sqAnnotationFor(ann, t) {
       || _sqReasonCache.get(t.uri) || _sqReasonCache.get(t.id) || null;
 }
 
+// --- Album-art / duration cache --------------------------------------------
+// We feed Spotify only ONE track at a time, so the panel is rendered from our
+// in-memory window (the full upcoming plan + reasons) rather than the physical
+// queue. But our window slots come from local history/library and carry no
+// album art or duration. So we opportunistically remember those fields from the
+// full track objects Spotify hands us for free in getQueue()/currently_playing
+// (no extra API calls), keyed by id and uri, and look them up when rendering.
+const _SQ_META_MAX = 500;
+const _sqMetaCache = new Map(); // id|uri -> { art, duration }
+function _sqRememberMeta(tracks) {
+  if (!Array.isArray(tracks)) return;
+  for (const t of tracks) {
+    if (!t) continue;
+    const art = (t.album && t.album.images && t.album.images.length) ? t.album.images[0].url : null;
+    const duration = t.duration_ms || null;
+    if (!art && !duration) continue;
+    const entry = { art, duration };
+    if (t.id)  _sqMetaCache.set(t.id, entry);
+    if (t.uri) _sqMetaCache.set(t.uri, entry);
+  }
+  while (_sqMetaCache.size > _SQ_META_MAX) {
+    _sqMetaCache.delete(_sqMetaCache.keys().next().value); // evict oldest
+  }
+}
+function _sqMetaFor(t) {
+  if (!t) return null;
+  return (t.id && _sqMetaCache.get(t.id)) || (t.uri && _sqMetaCache.get(t.uri)) || null;
+}
+function _sqArtistStr(t) {
+  if (!t) return '';
+  if (t.artist) return t.artist;
+  if (Array.isArray(t.artists)) return t.artists.map(a => a?.name || a).filter(Boolean).join(', ');
+  return '';
+}
+
+// Build the queue-panel item list from our in-memory Smart Queue window — the
+// full upcoming plan with every pick's "why" — rather than the physical Spotify
+// queue (which, since we feed one song at a time, is just our single pending
+// pick followed by Spotify autoplay filler). Already-played and dupe slots are
+// excluded; album art / duration are resolved from the meta cache.
+function _sqPanelItems() {
+  if (!_sq || !Array.isArray(_sq.window)) return [];
+  const out = [];
+  for (let i = _sq.pos + 1; i < _sq.window.length && out.length < 30; i++) {
+    const s = _sq.window[i];
+    if (!s || s.played || s.dupe || !s.track) continue;
+    const t = s.track;
+    const meta = _sqMetaFor(t);
+    const art = ((t.album && t.album.images && t.album.images.length) ? t.album.images[0].url : null)
+              || (meta && meta.art) || null;
+    out.push({
+      id: t.id,
+      uri: s.uri || t.uri,
+      title: t.title || t.name || '',
+      artist: _sqArtistStr(t),
+      albumArt: art,
+      duration: t.duration_ms || (meta && meta.duration) || null,
+      source: s.source,
+      reason: s.reason || undefined,
+      smoothMix: !!s.smoothMix,
+    });
+  }
+  return out;
+}
+
 // A compact, holistic summary of the UPCOMING Smart Queue window for the queue
 // card's header strip: a streak callout (#1), the harmonic key-journey (#2), an
 // energy sparkline (#4) and the set-closer state (#8). Returns null when there's
@@ -3581,7 +3646,7 @@ function _sqLogWindow(label) {
     const cursor = i === _sq.pos ? '▶' : ' ';
     const name = _sqName(s.track);
     const body = s.source === 'ours' ? `--${name}--` : name;
-    const tag  = s.source === 'ours' ? (s.added ? 'OURS+ ' : 'OURS  ') : 'SPOTIFY';
+    const tag  = s.dupe ? 'DUPE ⊘' : (s.source === 'ours' ? (s.added ? 'OURS+ ' : 'OURS  ') : 'SPOTIFY');
     return `        ${cursor} ${String(i + 1).padStart(2)}. [${tag}] ${body}`;
   });
   console.log(`[SmartQueue] ${label} — session ${_sq.id} (${_sq.window.length} slots, source=${_sq.source}):\n${lines.join('\n')}`);
@@ -3607,11 +3672,16 @@ function _sqStart(source, seedTrack, weave = true) {
     window: [],
     pos: -1,
     noRepeat: new Set(),
+    // Every track id that has physically entered Spotify's queue OR actually
+    // played this session. We add the whole queue ourselves (one song at a time),
+    // so a "late dupe" is simply a window slot whose id is already in here — we
+    // flag it, log it, and never add it. No live-queue check needed.
+    seen: new Set(),
     building: false,
     lastTickTrackId: null,
     lastSeedId: seedTrack?.id || null,
   };
-  if (seedTrack?.id) _sq.noRepeat.add(seedTrack.id);
+  if (seedTrack?.id) { _sq.noRepeat.add(seedTrack.id); _sq.seen.add(seedTrack.id); }
   // Build the window right away rather than waiting for the next slow base tick.
   refreshNow('smart-queue start');
   console.log(`[SmartQueue] ★ Session ${_sq.id} started — source=${source}, weave=${weave}, seed="${_sqName(seedTrack)}". Building window on next tick…`);
@@ -3665,32 +3735,67 @@ async function _sqStartFromSeed(source, seedUri, seedTrack, weave = true) {
   _sqStart(source, seedTrack || { uri: seedUri, id: seedUri.split(':').pop() }, weave);
 }
 
-// Enqueue every not-yet-added upcoming slot (anchors AND ours) into Spotify's
-// user queue, in window order, so "Up Next" mirrors our window. addToQueue
-// appends FIFO, and we only call it for slots we haven't added yet, so order is
-// preserved. Returns the number of tracks newly queued.
+// Strict one-at-a-time feed: keep EXACTLY ONE unplayed pick sitting in Spotify's
+// user queue. We add the whole queue ourselves, so this is also where dupes die —
+// any upcoming slot whose track already entered the queue or played this session
+// (it's in _sq.seen) is flagged a "late dupe", logged, and skipped without ever
+// being added. Walking forward, the first already-added slot ahead means the one
+// pending pick is in place (nothing to do); otherwise we add the first clean slot
+// and stop. Keeping only one song queued is what makes a mood/vibe switch trivial
+// to clear and spreads our API calls out to ~one addToQueue per track.
+// Returns 1 if a track was newly queued, else 0.
 async function _sqEnqueueUpcoming() {
-  if (!_sq) return 0;
-  let queued = 0;
+  if (!_sq || _sq.pos < 0) return 0;
   for (let i = _sq.pos + 1; i < _sq.window.length; i++) {
     const slot = _sq.window[i];
-    if (slot.added || !slot.uri) continue;
+    if (!slot || !slot.uri) continue;
+
+    // An already-added slot ahead is our single pending pick (not a dupe — we put
+    // it there). If it hasn't played yet, the queue is fed: stop. If it already
+    // played, keep walking to find the next one to feed.
+    if (slot.added) {
+      if (!slot.played) return 0;
+      continue;
+    }
+
+    // Late dupe: this track already entered the queue or played this session.
+    // Flag + log it once and skip — never add it, and ignore it in calculations.
+    if (slot.id && _sq.seen.has(slot.id)) {
+      if (!slot.dupe) {
+        slot.dupe = true;
+        console.log(`[SmartQueue] ⊘ Dupe skipped — "${_sqName(slot.track)}" already queued/played this session`);
+      }
+      continue;
+    }
+
+    // Clean, not yet added → add exactly this one and stop (strict one-at-a-time).
     try {
       await addToQueue(slot.uri);
       slot.added = true;
       _addStaged([slot.uri]);
+      if (slot.id) { _sq.seen.add(slot.id); _sq.noRepeat.add(slot.id); }
       if (slot.source === 'ours' && slot.id) _markPlayed(slot.id);
-      queued++;
+      console.log(`[SmartQueue] ➕ Queued next pick — [${slot.source === 'ours' ? 'OURS' : 'SPOTIFY'}] "${_sqName(slot.track)}"`);
+      _scheduleQueueRefresh(); // push the freshly-extended Up Next to the queue panel
+      return 1;
     } catch (err) {
       console.error(`[SmartQueue] addToQueue failed for ${_sqName(slot.track)}:`, err.message);
-      break; // preserve order — stop on first failure, retry next tick
+      return 0; // retry on the next tick (one song of runway covers the gap)
     }
   }
-  if (queued) {
-    console.log(`[SmartQueue] ➕ Queued ${queued} upcoming track(s) to Up Next`);
-    _scheduleQueueRefresh(); // push the freshly-extended Up Next to the queue panel
+  return 0;
+}
+
+// Count the feedable slots ahead of the cursor — non-dupe, not-yet-played — so the
+// extend trigger measures real upcoming songs, not skipped dupes.
+function _sqUpcomingCount() {
+  if (!_sq) return 0;
+  let n = 0;
+  for (let i = _sq.pos + 1; i < _sq.window.length; i++) {
+    const s = _sq.window[i];
+    if (s && !s.dupe && !s.played) n++;
   }
-  return queued;
+  return n;
 }
 
 // Debounced queue-panel refresh. Smart Queue enqueues happen AFTER the post-track-
@@ -3725,7 +3830,7 @@ async function _sqBuildAndEnqueueWindow(state, reason) {
     _sq.pos = 0;
     _sq.mode = 'active';
     _sq.lastTickTrackId = cur.uri;
-    if (cur.id) _sq.noRepeat.add(cur.id);
+    if (cur.id) { _sq.noRepeat.add(cur.id); _sq.seen.add(cur.id); }
     _sqTrimNoRepeat();
     console.log(`[SmartQueue] ✔ Window built — reason=${reason}, ${anchors.length} anchors, target ${targetU} ours (placed ${used}).`);
     _sqLogWindow('Window');
@@ -3744,7 +3849,12 @@ async function _sqExtendWindow(state) {
   if (!_sq || _sq.building) return;
   _sq.building = true;
   try {
-    const last = _sq.window[_sq.window.length - 1];
+    // Bridge from the last REAL slot (skip trailing dupes) so flow math isn't
+    // anchored to a track we never actually queue.
+    let last = null;
+    for (let i = _sq.window.length - 1; i >= 0; i--) {
+      if (_sq.window[i] && !_sq.window[i].dupe) { last = _sq.window[i]; break; }
+    }
     const bridgeLeft = _sqAnnotate(last?.track || state.track);
     const anchorN = _sqAnchorCount(); // Lookahead-derived window depth
     const anchors = (await _sqBuildSpotifyAnchors(anchorN)).slice(0, anchorN).map(_sqAnnotate);
@@ -3822,6 +3932,9 @@ async function _sqTick(state) {
   const prevPos = _sq.pos;
   _sq.pos = pos;
   for (let i = 0; i <= pos; i++) _sq.window[i].played = true;
+  // Whatever is actually playing has now been "seen" — even a native-autoplay
+  // interloper that slipped into a gap — so it's never re-queued or re-suggested.
+  if (state.track.id) { _sq.seen.add(state.track.id); _sq.noRepeat.add(state.track.id); }
 
   const firstSeen = _sq.lastTickTrackId !== curUri; // debounce heavy work to once/track
   _sq.lastTickTrackId = curUri;
@@ -3835,11 +3948,11 @@ async function _sqTick(state) {
     _sqLogWindow('Queue');
   }
 
-  // Keep Up Next populated (covers retries from any earlier addToQueue failure).
+  // Top up the single pending pick the instant the track changes (skips dupes).
   await _sqEnqueueUpcoming();
 
-  // Extend before we run dry.
-  const remaining = _sq.window.length - 1 - pos;
+  // Extend before we run dry — measured in real (non-dupe) upcoming slots.
+  const remaining = _sqUpcomingCount();
   if (firstSeen && remaining <= _sqExtendAhead()) {
     console.log(`[SmartQueue] ${remaining} slot(s) remain → extending window`);
     await _sqExtendWindow(state);
@@ -3870,39 +3983,49 @@ async function emitQueue() {
   if (!_io) return;
   try {
     const data = await getQueue();
-    const ann = _sqWindowAnnotations();
-    // Spotify repeats the current track in "Up Next" when there's no real queue or
-    // context (e.g. a single-song play), so the raw queue ends with the same track
-    // stacked over and over. Collapse consecutive duplicate URIs so the panel shows
-    // it once instead of a wall of repeats.
     const rawQueue = (data && Array.isArray(data.queue)) ? data.queue : [];
-    const dedupQueue = [];
-    for (const t of rawQueue) {
-      const prev = dedupQueue[dedupQueue.length - 1];
-      if (prev && prev.uri && t.uri && prev.uri === t.uri) continue;
-      dedupQueue.push(t);
+    // Warm the meta cache from the full track objects Spotify gives us for free
+    // here, so window-rendered rows (which carry no art) can still show thumbnails
+    // + durations for any track we've physically seen this session.
+    _sqRememberMeta(rawQueue);
+    if (data && data.currently_playing) _sqRememberMeta([data.currently_playing]);
+
+    let items;
+    if (_sq && Array.isArray(_sq.window) && _sq.window.length) {
+      // Active Smart Queue session → render the full in-memory plan (with reasons),
+      // NOT the 1-deep physical queue. Mirror reasons into the durable cache too.
+      _sqWindowAnnotations();
+      items = _sqPanelItems();
+    } else {
+      // No session → show the real Spotify queue. Spotify repeats the current
+      // track in "Up Next" when there's no real queue/context, so collapse
+      // consecutive duplicate URIs into a single row.
+      const ann = _sqWindowAnnotations();
+      const dedupQueue = [];
+      for (const t of rawQueue) {
+        const prev = dedupQueue[dedupQueue.length - 1];
+        if (prev && prev.uri && t.uri && prev.uri === t.uri) continue;
+        dedupQueue.push(t);
+      }
+      items = dedupQueue.slice(0, 30).map((t) => {
+        const a = _sqAnnotationFor(ann, t);
+        return {
+          id: t.id,
+          uri: t.uri,
+          title: t.name,
+          artist: t.artists ? t.artists.map((x) => x.name).join(', ') : '',
+          albumArt:
+            t.album && t.album.images && t.album.images.length > 0
+              ? t.album.images[0].url
+              : null,
+          duration: t.duration_ms,
+          // Smart Queue "why-picked" decoration (absent for non-SQ items).
+          source: a ? a.source : undefined,
+          reason: a ? a.reason : undefined,
+          smoothMix: a ? a.smoothMix : undefined,
+        };
+      });
     }
-    const items =
-      dedupQueue.length
-        ? dedupQueue.slice(0, 30).map((t) => {
-            const a = _sqAnnotationFor(ann, t);
-            return {
-              id: t.id,
-              uri: t.uri,
-              title: t.name,
-              artist: t.artists ? t.artists.map((x) => x.name).join(', ') : '',
-              albumArt:
-                t.album && t.album.images && t.album.images.length > 0
-                  ? t.album.images[0].url
-                  : null,
-              duration: t.duration_ms,
-              // Smart Queue "why-picked" decoration (absent for non-SQ items).
-              source: a ? a.source : undefined,
-              reason: a ? a.reason : undefined,
-              smoothMix: a ? a.smoothMix : undefined,
-            };
-          })
-        : [];
     _io.emit('spotify:queue', { items, meta: _sqInsightStrip() });
   } catch (err) {
     console.error('[Spotify] Auto queue emit error:', err.message);
@@ -6339,27 +6462,34 @@ function init(io) {
     socket.on('spotify:get_queue', async () => {
       try {
         const data = await getQueue();
-        const ann = _sqWindowAnnotations();
-        const items =
-          data && data.queue
-            ? data.queue.slice(0, 30).map((t) => {
-                const a = _sqAnnotationFor(ann, t);
-                return {
-                  id: t.id,
-                  uri: t.uri,
-                  title: t.name,
-                  artist: t.artists ? t.artists.map((x) => x.name).join(', ') : '',
-                  albumArt:
-                    t.album && t.album.images && t.album.images.length > 0
-                      ? t.album.images[0].url
-                      : null,
-                  duration: t.duration_ms,
-                  source: a ? a.source : undefined,
-                  reason: a ? a.reason : undefined,
-                  smoothMix: a ? a.smoothMix : undefined,
-                };
-              })
-            : [];
+        const rawQueue = (data && Array.isArray(data.queue)) ? data.queue : [];
+        _sqRememberMeta(rawQueue);
+        if (data && data.currently_playing) _sqRememberMeta([data.currently_playing]);
+
+        let items;
+        if (_sq && Array.isArray(_sq.window) && _sq.window.length) {
+          _sqWindowAnnotations();
+          items = _sqPanelItems();
+        } else {
+          const ann = _sqWindowAnnotations();
+          items = rawQueue.slice(0, 30).map((t) => {
+            const a = _sqAnnotationFor(ann, t);
+            return {
+              id: t.id,
+              uri: t.uri,
+              title: t.name,
+              artist: t.artists ? t.artists.map((x) => x.name).join(', ') : '',
+              albumArt:
+                t.album && t.album.images && t.album.images.length > 0
+                  ? t.album.images[0].url
+                  : null,
+              duration: t.duration_ms,
+              source: a ? a.source : undefined,
+              reason: a ? a.reason : undefined,
+              smoothMix: a ? a.smoothMix : undefined,
+            };
+          });
+        }
         socket.emit('spotify:queue', { items, meta: _sqInsightStrip() });
       } catch (err) {
         console.error('[Spotify] Get queue error:', err.message);
