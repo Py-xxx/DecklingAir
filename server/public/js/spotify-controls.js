@@ -22,11 +22,12 @@ import {
   addToPlaylist,
   getSpotifyInsights,
   renameVibe,
-  playVibe,
   setSmartQueue,
   getSmartQueue,
   playMood,
   stopContinuous,
+  playMix,
+  getMixMap,
   getTuning,
   setTuning,
   getTimezone,
@@ -2410,8 +2411,7 @@ export function renderSpotifyInsights(ctrl) {
         <button class="sp-ins-tab active" data-tab="profile">Profile</button>
         <button class="sp-ins-tab" data-tab="artists">Artists</button>
         <button class="sp-ins-tab" data-tab="portraits">Portraits</button>
-        <button class="sp-ins-tab" data-tab="vibes">Vibes</button>
-        <button class="sp-ins-tab" data-tab="mood">Mood</button>
+        <button class="sp-ins-tab" data-tab="mixes">Mixes</button>
         <button class="sp-ins-tab" data-tab="tuning">Tuning</button>
       </div>
       <div class="sp-ins-content">
@@ -2487,24 +2487,36 @@ export function renderSpotifyInsights(ctrl) {
           <div class="sp-ins-portraits-empty" style="display:none">Keep listening — portraits appear once each part of your day has a few plays.</div>
         </div>
 
-        <!-- VIBES -->
-        <div class="sp-ins-panel" data-panel="vibes" style="display:none">
-          <div class="sp-ins-vibes-toolbar">
-            <span class="sp-ins-continuous-badge" style="display:none">● Live</span>
-            <button class="sp-ins-stop-btn" style="display:none">Stop</button>
+        <!-- MIXES — one unified 2D mood map. Drag the puck anywhere in the
+             energy×mood space (or tap a named quick-pick) and we build a mix
+             targeting that exact point. The heat-cloud is your own listening. -->
+        <div class="sp-ins-panel" data-panel="mixes" style="display:none">
+          <div class="sp-ins-mood-context"></div>
+          <div class="sp-ins-mixmap-intro">Drag anywhere to pick exactly the kind of music you want. The glow is where you actually listen.</div>
+          <div class="sp-ins-mixmap-wrap">
+            <span class="sp-ins-mixmap-axis sp-ins-mixmap-axis-top">Intense</span>
+            <span class="sp-ins-mixmap-axis sp-ins-mixmap-axis-bottom">Calm</span>
+            <span class="sp-ins-mixmap-axis sp-ins-mixmap-axis-left">Dark</span>
+            <span class="sp-ins-mixmap-axis sp-ins-mixmap-axis-right">Bright</span>
+            <div class="sp-ins-mixmap-pad" tabindex="0" role="slider" aria-label="Mood map">
+              <canvas class="sp-ins-mixmap-heat" width="220" height="220"></canvas>
+              <div class="sp-ins-mixmap-anchors"></div>
+              <div class="sp-ins-mixmap-now" style="display:none" title="Where you're listening right now"></div>
+              <div class="sp-ins-mixmap-puck" style="display:none"></div>
+            </div>
           </div>
-          <div class="sp-ins-vibes-empty" style="display:none">
+          <div class="sp-ins-mixmap-readout">
+            <span class="sp-ins-mixmap-label">Pick a spot</span>
+            <button class="sp-ins-mixmap-play" disabled>Play this</button>
+          </div>
+          <div class="sp-ins-sub-title sp-ins-mixmap-chips-title" style="display:none">Quick picks</div>
+          <div class="sp-ins-mixmap-chips"></div>
+          <div class="sp-ins-mixmap-empty" style="display:none">
             <div class="sp-ins-empty-icon">✨</div>
-            <div class="sp-ins-empty-msg">Keep listening to build your vibe profile</div>
+            <div class="sp-ins-empty-msg">Keep listening to map your sound</div>
             <div class="sp-ins-empty-sub sp-ins-vibe-progress"></div>
           </div>
-          <div class="sp-ins-vibes-list"></div>
-        </div>
-
-        <!-- MOOD -->
-        <div class="sp-ins-panel" data-panel="mood" style="display:none">
-          <div class="sp-ins-mood-context"></div>
-          <div class="sp-ins-mood-grid"></div>
+          <!-- Shared active/stop footer -->
           <div class="sp-ins-mood-footer" style="display:none">
             <span class="sp-ins-mood-active-label"></span>
             <button class="sp-ins-stop-btn sp-ins-mood-stop-btn">Stop</button>
@@ -2586,6 +2598,7 @@ export function renderSpotifyInsights(ctrl) {
     panels.forEach(p => p.style.display = p.dataset.panel === btn.dataset.tab ? '' : 'none');
     if (btn.dataset.tab === 'portraits') socket.emit('spotify:get_portraits');
     if (btn.dataset.tab === 'artists')   socket.emit('spotify:get_artist_ratings');
+    if (btn.dataset.tab === 'mixes')     getMixMap();
   });
 
   // ---- Portraits tab (#9) + time-machine (#5) ----
@@ -2732,7 +2745,11 @@ export function renderSpotifyInsights(ctrl) {
   // ---- Listen for action results ----
   const _onAction = (data) => _showFeedback(data.msg, data.ok);
   const _onVibeRenamed = ({ key, name }) => {
-    card.querySelectorAll(`.sp-ins-vibe-row[data-key="${key}"] .sp-ins-vibe-name-text`).forEach(el => {
+    // Renamed clusters surface as Mixes quick-pick chips + pad anchors.
+    card.querySelectorAll(`.sp-ins-mixmap-chip[data-key="${key}"] .sp-ins-mixmap-chip-name`).forEach(el => {
+      el.textContent = name;
+    });
+    card.querySelectorAll(`.sp-ins-mixmap-anchor[data-key="${key}"] .sp-ins-mixmap-anchor-name`).forEach(el => {
       el.textContent = name;
     });
   };
@@ -2856,55 +2873,219 @@ export function renderSpotifyInsights(ctrl) {
     ).join('');
   }
 
-  function _renderVibes(v) {
-    const emptyEl = card.querySelector('.sp-ins-vibes-empty');
-    const listEl  = card.querySelector('.sp-ins-vibes-list');
-    if (!v.ready) {
-      emptyEl.style.display = '';
-      listEl.style.display  = 'none';
-      card.querySelector('.sp-ins-vibe-progress').textContent =
-        `${v.current} / ${v.needed} tracks needed`;
+  // ---- Mixes tab — unified 2D mood map (energy × valence) ----
+  // One pad covers what used to be split between Moods and Vibes. Drag the puck
+  // (or tap a named quick-pick = a discovered cluster) to target an exact point
+  // in the space; the server builds a mix around it. The glowing heat-cloud is
+  // the user's own listening, so they can see where their music actually lives.
+  const _mixPad    = card.querySelector('.sp-ins-mixmap-pad');
+  const _mixHeat   = card.querySelector('.sp-ins-mixmap-heat');
+  const _mixAnchorsEl = card.querySelector('.sp-ins-mixmap-anchors');
+  const _mixNowEl  = card.querySelector('.sp-ins-mixmap-now');
+  const _mixPuck   = card.querySelector('.sp-ins-mixmap-puck');
+  const _mixLabel  = card.querySelector('.sp-ins-mixmap-label');
+  const _mixPlay   = card.querySelector('.sp-ins-mixmap-play');
+  const _mixChips  = card.querySelector('.sp-ins-mixmap-chips');
+  const _mixChipsTitle = card.querySelector('.sp-ins-mixmap-chips-title');
+  const _mixEmpty  = card.querySelector('.sp-ins-mixmap-empty');
+  const _mixIntro  = card.querySelector('.sp-ins-mixmap-intro');
+
+  // Selected target: { energy, valence, label?, vibeKey? }
+  let _mixSelected = null;
+  let _mixAnchors  = [];
+
+  // Friendly client-side name for a freeform point (server computes the
+  // authoritative label for the active-mix footer; this is just for the readout).
+  const _mixEnergyWord  = (e) => (e < 33 ? 'Calm' : e < 66 ? 'Steady' : 'Intense');
+  const _mixValenceWord = (v) => (v < 33 ? 'dark'  : v < 66 ? 'moody'  : 'bright');
+  function _mixSpotName(energy, valence) {
+    return `${_mixEnergyWord(energy)} & ${_mixValenceWord(valence)}`;
+  }
+
+  // energy/valence (0-100) → pad position. Y is inverted: top = high energy.
+  function _mixPlace(el, energy, valence) {
+    el.style.left = `${valence}%`;
+    el.style.top  = `${100 - energy}%`;
+  }
+
+  function _mixSelect(energy, valence, label, vibeKey) {
+    energy  = Math.max(0, Math.min(100, Math.round(energy)));
+    valence = Math.max(0, Math.min(100, Math.round(valence)));
+    _mixSelected = { energy, valence, label: label || _mixSpotName(energy, valence), vibeKey };
+    _mixPuck.style.display = '';
+    _mixPlace(_mixPuck, energy, valence);
+    _mixLabel.textContent = _mixSelected.label;
+    _mixPlay.disabled = false;
+  }
+
+  function _mixPlaySelected() {
+    if (!_mixSelected) return;
+    playMix(_mixSelected);
+    _showFeedback(`Building "${_mixSelected.label}"…`);
+    _spToast(`⏳ Loading "${_mixSelected.label}" — building your queue…`);
+  }
+
+  // Pointer-to-value from a pad event.
+  function _mixPointToVal(ev) {
+    const r = _mixPad.getBoundingClientRect();
+    const fx = Math.max(0, Math.min(1, (ev.clientX - r.left) / r.width));
+    const fy = Math.max(0, Math.min(1, (ev.clientY - r.top)  / r.height));
+    return { valence: fx * 100, energy: (1 - fy) * 100 };
+  }
+
+  let _mixDragging = false;
+  _mixPad.addEventListener('pointerdown', (ev) => {
+    if (isEditMode()) return;
+    if (ev.target.closest('.sp-ins-mixmap-anchor')) return; // let anchor taps through
+    _mixDragging = true;
+    _mixPad.setPointerCapture?.(ev.pointerId);
+    const { energy, valence } = _mixPointToVal(ev);
+    _mixSelect(energy, valence);
+  });
+  _mixPad.addEventListener('pointermove', (ev) => {
+    if (!_mixDragging) return;
+    const { energy, valence } = _mixPointToVal(ev);
+    _mixSelect(energy, valence);
+  });
+  const _mixEndDrag = (ev) => {
+    if (!_mixDragging) return;
+    _mixDragging = false;
+    _mixPad.releasePointerCapture?.(ev.pointerId);
+  };
+  _mixPad.addEventListener('pointerup', _mixEndDrag);
+  _mixPad.addEventListener('pointercancel', _mixEndDrag);
+  // Keyboard nudge for accessibility.
+  _mixPad.addEventListener('keydown', (ev) => {
+    if (!_mixSelected) { _mixSelect(50, 50); }
+    let { energy, valence } = _mixSelected;
+    const step = ev.shiftKey ? 10 : 4;
+    if (ev.key === 'ArrowUp')    energy  += step;
+    else if (ev.key === 'ArrowDown')  energy  -= step;
+    else if (ev.key === 'ArrowLeft')  valence -= step;
+    else if (ev.key === 'ArrowRight') valence += step;
+    else if (ev.key === 'Enter') { _mixPlaySelected(); return; }
+    else return;
+    ev.preventDefault();
+    _mixSelect(energy, valence);
+  });
+  _mixPlay.addEventListener('pointerup', () => { if (!isEditMode()) _mixPlaySelected(); });
+
+  function _renderMixMap(mixMap, context) {
+    mixMap = mixMap || { ready: false };
+
+    // Context hint line (carried over from the old Moods tab).
+    const ctxEl = card.querySelector('.sp-ins-mood-context');
+    if (context?.suggestedMoodName) {
+      ctxEl.innerHTML = `<span class="sp-ins-ctx-icon">${context.suggestedMoodEmoji || '💡'}</span> <span class="sp-ins-ctx-text">Right now feels like <strong>${_esc(context.suggestedMoodName)}</strong></span>`;
+      ctxEl.style.display = '';
+    } else {
+      ctxEl.style.display = 'none';
+    }
+
+    if (!mixMap.ready) {
+      _mixEmpty.style.display = '';
+      _mixIntro.style.display = 'none';
+      const total = mixMap.total || 0;
+      card.querySelector('.sp-ins-mixmap-empty .sp-ins-vibe-progress').textContent =
+        `${total} / 10 tracks analysed`;
+      _mixHeat.getContext('2d')?.clearRect(0, 0, _mixHeat.width, _mixHeat.height);
+      _mixAnchorsEl.innerHTML = '';
+      _mixNowEl.style.display = 'none';
+      _mixChips.innerHTML = '';
+      _mixChipsTitle.style.display = 'none';
       return;
     }
-    emptyEl.style.display = 'none';
-    listEl.style.display  = '';
-    listEl.innerHTML = '';
-    v.clusters.forEach(cl => {
-      const row = document.createElement('div');
-      row.className = 'sp-ins-vibe-row';
-      row.dataset.key = cl.key;
-      const chips = [];
-      if (cl.avgEnergy  != null) chips.push(`<span class="sp-feat-chip sp-feat-energy">⚡ ${cl.avgEnergy}%</span>`);
-      if (cl.avgValence != null) chips.push(`<span class="sp-feat-chip sp-feat-valence">${cl.avgValence >= 60 ? '😄' : cl.avgValence >= 35 ? '😐' : '😔'} ${cl.avgValence}%</span>`);
-      if (cl.avgBpm     != null) chips.push(`<span class="sp-feat-chip sp-feat-bpm">♩ ${cl.avgBpm}</span>`);
-      row.innerHTML = `
-        <div class="sp-ins-vibe-top">
-          <span class="sp-ins-vibe-name-wrap">
-            <span class="sp-ins-vibe-name-text">${_esc(cl.name)}</span>
-            <button class="sp-ins-vibe-rename-btn" title="Rename">✎</button>
-          </span>
-          <span class="sp-ins-vibe-meta">${cl.plays} plays · ${cl.count} tracks</span>
-          <button class="sp-ins-action-btn sp-ins-vibe-queue-btn">Queue</button>
-        </div>
-        <div class="sp-ins-vibe-chips">${chips.join('')}</div>
-      `;
-      // Rename
-      row.querySelector('.sp-ins-vibe-rename-btn').addEventListener('pointerup', () => {
+    _mixEmpty.style.display = 'none';
+    _mixIntro.style.display = '';
+
+    // Heat-cloud — paint each bin as a soft radial blob so it reads as a cloud
+    // rather than a blocky grid. Y is inverted (row 0 = lowest energy = bottom).
+    const ctx = _mixHeat.getContext('2d');
+    if (ctx) {
+      const W = _mixHeat.width, H = _mixHeat.height;
+      ctx.clearRect(0, 0, W, H);
+      const bins = mixMap.bins || 10;
+      const max  = mixMap.max || 1;
+      const cw = W / bins, ch = H / bins;
+      for (let yi = 0; yi < bins; yi++) {
+        for (let xi = 0; xi < bins; xi++) {
+          const v = (mixMap.grid[yi] && mixMap.grid[yi][xi]) || 0;
+          if (!v) continue;
+          const a = 0.08 + (v / max) * 0.62;
+          const cx = (xi + 0.5) * cw;
+          const cy = H - (yi + 0.5) * ch; // invert Y
+          const rad = Math.max(cw, ch) * 0.9;
+          const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, rad);
+          g.addColorStop(0, `rgba(29,185,84,${a.toFixed(3)})`);
+          g.addColorStop(1, 'rgba(29,185,84,0)');
+          ctx.fillStyle = g;
+          ctx.fillRect(cx - rad, cy - rad, rad * 2, rad * 2);
+        }
+      }
+    }
+
+    // Named anchors (discovered clusters) as dots on the pad.
+    _mixAnchors = mixMap.anchors || [];
+    _mixAnchorsEl.innerHTML = '';
+    _mixAnchors.forEach(a => {
+      const dot = document.createElement('div');
+      dot.className = 'sp-ins-mixmap-anchor';
+      dot.dataset.key = a.key;
+      _mixPlace(dot, a.energy, a.valence);
+      dot.innerHTML = `<span class="sp-ins-mixmap-anchor-dot"></span><span class="sp-ins-mixmap-anchor-name">${_esc(a.name)}</span>`;
+      dot.addEventListener('pointerup', (ev) => {
+        ev.stopPropagation();
         if (isEditMode()) return;
-        const nameEl = row.querySelector('.sp-ins-vibe-name-text');
+        _mixSelect(a.energy, a.valence, a.name, a.key);
+        _mixPlaySelected();
+      });
+      _mixAnchorsEl.appendChild(dot);
+    });
+
+    // "Right now" dot.
+    if (mixMap.nowPoint) {
+      _mixNowEl.style.display = '';
+      _mixPlace(_mixNowEl, mixMap.nowPoint.energy, mixMap.nowPoint.valence);
+      _mixNowEl.title = `Where you usually are right now — ${mixMap.nowPoint.label}`;
+    } else {
+      _mixNowEl.style.display = 'none';
+    }
+
+    // Quick-pick chips = the same named clusters, renameable.
+    _mixChips.innerHTML = '';
+    _mixChipsTitle.style.display = _mixAnchors.length ? '' : 'none';
+    _mixAnchors.forEach(a => {
+      const chip = document.createElement('div');
+      chip.className = 'sp-ins-mixmap-chip';
+      chip.dataset.key = a.key;
+      chip.innerHTML = `
+        <button class="sp-ins-mixmap-chip-play" title="Play this mix">
+          <span class="sp-ins-mixmap-chip-name">${_esc(a.name)}</span>
+        </button>
+        <button class="sp-ins-mixmap-chip-rename" title="Rename">✎</button>`;
+      chip.querySelector('.sp-ins-mixmap-chip-play').addEventListener('pointerup', (ev) => {
+        ev.stopPropagation();
+        if (isEditMode()) return;
+        _mixSelect(a.energy, a.valence, a.name, a.key);
+        _mixPlaySelected();
+      });
+      chip.querySelector('.sp-ins-mixmap-chip-rename').addEventListener('pointerup', (ev) => {
+        ev.stopPropagation();
+        if (isEditMode()) return;
+        const nameEl = chip.querySelector('.sp-ins-mixmap-chip-name');
         const current = nameEl.textContent;
         const input = document.createElement('input');
-        input.className = 'sp-ins-vibe-rename-input';
+        input.className = 'sp-ins-mixmap-chip-input';
         input.value = current;
         nameEl.replaceWith(input);
         input.focus(); input.select();
         const commit = () => {
           const val = input.value.trim() || current;
-          const newText = document.createElement('span');
-          newText.className = 'sp-ins-vibe-name-text';
-          newText.textContent = val;
-          input.replaceWith(newText);
-          if (val !== current) renameVibe(cl.key, val);
+          const span = document.createElement('span');
+          span.className = 'sp-ins-mixmap-chip-name';
+          span.textContent = val;
+          input.replaceWith(span);
+          if (val !== current) renameVibe(a.key, val);
         };
         input.addEventListener('blur', commit);
         input.addEventListener('keydown', e => {
@@ -2912,14 +3093,7 @@ export function renderSpotifyInsights(ctrl) {
           if (e.key === 'Escape') { input.value = current; commit(); }
         });
       });
-      // Queue
-      row.querySelector('.sp-ins-vibe-queue-btn').addEventListener('pointerup', () => {
-        if (isEditMode()) return;
-        playVibe(cl.key);
-        _showFeedback(`Queuing "${cl.name}"…`);
-        _spToast(`⏳ Loading "${cl.name}" — building your queue…`);
-      });
-      listEl.appendChild(row);
+      _mixChips.appendChild(chip);
     });
   }
 
@@ -3029,92 +3203,22 @@ export function renderSpotifyInsights(ctrl) {
   });
   getTimezone();
 
-  // ---- Mood tab ----
-  let _moodsCache = [];
-  function _renderMoods(moods, activeMoodKey, activeVibeKey, context) {
-    _moodsCache = moods || [];
-    const grid = card.querySelector('.sp-ins-mood-grid');
-    const footer = card.querySelector('.sp-ins-mood-footer');
-    const activeLabel = card.querySelector('.sp-ins-mood-active-label');
-    const ctxEl = card.querySelector('.sp-ins-mood-context');
-
-    // Context suggestion
-    if (context?.suggestedMoodName) {
-      ctxEl.innerHTML = `<span class="sp-ins-ctx-icon">${context.suggestedMoodEmoji || '💡'}</span> <span class="sp-ins-ctx-text">Right now feels like <strong>${_esc(context.suggestedMoodName)}</strong></span>`;
-      ctxEl.style.display = '';
-    } else {
-      ctxEl.style.display = 'none';
-    }
-
-    // Active state footer
-    const anyActive = activeMoodKey || activeVibeKey;
-    if (anyActive) {
-      const activeLabel2 = activeMoodKey
-        ? (moods.find(m => m.key === activeMoodKey)?.name || activeMoodKey)
-        : activeVibeKey;
-      activeLabel.textContent = `● ${activeLabel2} · keeps going`;
-      footer.style.display = '';
-    } else {
-      footer.style.display = 'none';
-    }
-
-    // Mood cards
-    grid.innerHTML = '';
-    moods.forEach(mood => {
-      const isActive = mood.key === activeMoodKey;
-      const card2 = document.createElement('div');
-      card2.className = 'sp-mood-card' + (isActive ? ' sp-mood-card--active' : '');
-      card2.dataset.key = mood.key;
-      card2.innerHTML = `
-        <span class="sp-mood-emoji">${mood.emoji}</span>
-        <span class="sp-mood-name">${_esc(mood.name)}</span>
-        <span class="sp-mood-desc">${_esc(mood.desc)}</span>
-      `;
-      card2.addEventListener('pointerup', () => {
-        if (isEditMode()) return;
-        playMood(mood.key);
-        _showFeedback(`Building "${mood.name}" playlist…`);
-        _spToast(`⏳ Loading "${mood.name}" — building your queue…`);
-      });
-      grid.appendChild(card2);
-    });
-  }
-
-  function _updateContinuousState({ activeMoodKey, activeVibeKey }) {
-    // Update Vibes tab badges
-    const badge = card.querySelector('.sp-ins-continuous-badge');
-    const stopBtn = card.querySelector('.sp-ins-vibes-toolbar .sp-ins-stop-btn');
-    if (activeVibeKey) {
-      badge.style.display = '';
-      stopBtn.style.display = '';
-    } else {
-      badge.style.display = 'none';
-      stopBtn.style.display = 'none';
-    }
-    // Update Mood tab
+  // ---- Shared continuous-play footer (Mixes tab) ----
+  // The Mixes pad, plus legacy mood/vibe/feeling sources, all surface here as a
+  // single "keeps going" line. activeMix carries the freeform pad label.
+  function _updateContinuousState({ activeMoodKey, activeVibeKey, activeMix } = {}) {
     const moodFooter = card.querySelector('.sp-ins-mood-footer');
     const moodActiveLabel = card.querySelector('.sp-ins-mood-active-label');
-    if (activeMoodKey || activeVibeKey) {
-      const moodName = _moodsCache.find(m => m.key === activeMoodKey)?.name;
-      const label = moodName || activeMoodKey || activeVibeKey;
+    const label = (activeMix && activeMix.label) || activeMoodKey || activeVibeKey;
+    if (label) {
       moodActiveLabel.textContent = `● ${label} · keeps going`;
       moodFooter.style.display = '';
     } else {
       moodFooter.style.display = 'none';
     }
-    // Refresh mood card active states
-    card.querySelectorAll('.sp-mood-card').forEach(el => {
-      el.classList.toggle('sp-mood-card--active', el.dataset.key === activeMoodKey);
-    });
   }
 
-  // Stop continuous (Vibes toolbar)
-  card.querySelector('.sp-ins-vibes-toolbar .sp-ins-stop-btn').addEventListener('pointerup', () => {
-    if (isEditMode()) return;
-    stopContinuous();
-  });
-
-  // Stop continuous (Mood footer)
+  // Stop continuous (shared Mixes footer)
   card.querySelector('.sp-ins-mood-stop-btn').addEventListener('pointerup', () => {
     if (isEditMode()) return;
     stopContinuous();
@@ -3124,20 +3228,26 @@ export function renderSpotifyInsights(ctrl) {
   const _onContinuousState = (data) => _updateContinuousState(data);
   socket.on('spotify:continuous_state', _onContinuousState);
 
+  // Live mix-map refresh (server pushes after analysis or a reseed).
+  let _lastContext = null;
+  const _onMixMap = (data) => {
+    if (!data) return;
+    _renderMixMap(data, _lastContext);
+    _updateContinuousState({ activeMix: data.activeMix });
+  };
+  socket.on('spotify:mix_map', _onMixMap);
+
   // ---- Main data load ----
   function _loadAll(data) {
     if (!data) return;
     _renderProfile(data.profile  || {});
     _renderPatterns(data.patterns || { grid: [], max: 1, blockNames: [], dayNames: [], total: 0 });
-    _renderVibes(data.vibes      || { ready: false, needed: 20, current: 0 });
-    // Mood tab
-    if (data.moods) {
-      _renderMoods(data.moods, data.activeMoodKey, data.activeVibeKey, data.context);
-    }
+    _lastContext = data.context || null;
+    _renderMixMap(data.mixMap, _lastContext);
     // Tuning sliders
     if (data.tuning) _applyTuningState(data.tuning);
-    // Continuous badge
-    _updateContinuousState({ activeMoodKey: data.activeMoodKey, activeVibeKey: data.activeVibeKey });
+    // Shared continuous footer
+    _updateContinuousState({ activeMoodKey: data.activeMoodKey, activeVibeKey: data.activeVibeKey, activeMix: data.activeMix });
   }
 
   // Collapse the Profile two-column layout when the widget gets narrow.
@@ -3154,6 +3264,7 @@ export function renderSpotifyInsights(ctrl) {
       socket.off('spotify:tuning',          _onTuning);
       socket.off('spotify:timezone',        _onTimezone);
       socket.off('spotify:continuous_state', _onContinuousState);
+      socket.off('spotify:mix_map',         _onMixMap);
       socket.off('spotify:insights',        _onInsights);
       socket.off('spotify:portraits',       _onPortraits);
       socket.off('spotify:artist_ratings',  _onArtistRatings);

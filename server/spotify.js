@@ -218,6 +218,11 @@ let _libraryWarmedAt = 0;   // when _librarySeeds was last (re)built
 let _vibeNames      = {};   // { vibeKey: 'Custom Name' }
 let _activeVibeKey  = null;  // currently running continuous vibe (null = stopped)
 let _activeMoodKey  = null;  // currently running continuous mood (null = stopped)
+// _activeMixTarget: the unified "mood map" target driving continuous playback —
+// { energy, valence, spread, label, vibeKey }. A point in energy×valence space the
+// user picked on the 2D pad (or a named cluster's centroid). Supersedes mood/vibe as
+// the single selection model; null = no mix running.
+let _activeMixTarget = null;
 // Track IDs played OR auto-queued during the current session. Every automatic queueing
 // method skips tracks already in here so a song never repeats within a session.
 // Reset when a session opens/closes.
@@ -885,14 +890,15 @@ function resetSessionState() {
   // Stop any running continuous engine — otherwise it keeps refilling from the old
   // context and the reset looks like it did nothing.
   const hadFeeling = !!_activeFeeling;
-  const hadEngine  = !!(_activeMoodKey || _activeVibeKey || _activeFeeling);
-  _activeMoodKey  = null;
-  _activeVibeKey  = null;
-  _activeFeeling  = null;
+  const hadEngine  = !!(_activeMoodKey || _activeVibeKey || _activeFeeling || _activeMixTarget);
+  _activeMoodKey   = null;
+  _activeVibeKey   = null;
+  _activeMixTarget = null;
+  _activeFeeling   = null;
   _autoQueueCount = 0;
   if (hadFeeling && _io) _io.emit('spotify:feeling_expired');
   if (hadEngine && _io) {
-    _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: null });
+    _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: null, activeMix: null });
   }
   _sessionStats = { startTime: Date.now(), tracksPlayed: [] };
   clearLiveState();
@@ -3263,7 +3269,9 @@ function _sqVarietyGate(tracks, seedId) {
 async function _sqBuildOurCandidates(count) {
   let tracks = [];
   try {
-    if (_sq.source === 'mood' && _activeMoodKey) {
+    if (_sq.source === 'mix' && _activeMixTarget) {
+      tracks = await buildMixFromTarget(_activeMixTarget, count);
+    } else if (_sq.source === 'mood' && _activeMoodKey) {
       tracks = await buildMoodPlaylist(_activeMoodKey, count);
     } else if (_sq.source === 'vibe' && _activeVibeKey) {
       tracks = await buildVibePlaylist(_activeVibeKey, count);
@@ -4488,6 +4496,12 @@ function _vibeGateFor(vibeKey) {
 // The verdict fn for whatever continuous target is running right now, or null when
 // nothing is active. Used as the refill's final safety net.
 function _activeVibeVerdict() {
+  // A running mix is the primary continuous target now — gate to its energy×valence point.
+  if (_activeMixTarget) {
+    const centroid = { energy: _activeMixTarget.energy, valence: _activeMixTarget.valence, bpm: null };
+    const radius = (_activeMixTarget.spread != null ? _activeMixTarget.spread : 0.15) + _lerp(0.04, 0.30, _tVariety());
+    return (t) => _centroidVerdict(t, centroid, radius);
+  }
   let feelingKey = null;
   if (_activeFeeling) feelingKey = _activeFeeling.key;
   else if (_activeMoodKey) { const m = MOOD_STATES.find(x => x.key === _activeMoodKey); feelingKey = m && m.feeling; }
@@ -4539,6 +4553,70 @@ async function _gateDiscovery(tracks, verdict, limit) {
 // ---------------------------------------------------------------------------
 // Playlist builders
 // ---------------------------------------------------------------------------
+
+// A human label for a mix target: its saved name (a named cluster) or the energy×
+// valence quadrant's vibe name, so a freeform pad point still reads as e.g. "Hype".
+function _mixTargetLabel(target) {
+  if (!target) return 'Mix';
+  if (target.label) return target.label;
+  return getVibeName(getVibeKey({ energy: target.energy, valence: target.valence }));
+}
+
+// Compact running-mix descriptor for the client (footer / continuous badge).
+function _activeMixState() {
+  if (!_activeMixTarget) return null;
+  return {
+    label:   _mixTargetLabel(_activeMixTarget),
+    energy:  Math.round(_activeMixTarget.energy),
+    valence: Math.round(_activeMixTarget.valence),
+    vibeKey: _activeMixTarget.vibeKey || null,
+  };
+}
+
+// ── Unified mix builder ───────────────────────────────────────────────────────
+// The single engine behind the "mood map". A target is a point in energy×valence
+// space (0–100 each) plus a tolerance `spread`; this pulls your library/history
+// tracks within that radius, gates discovery to the same region, and runs the SAME
+// taste-bias → flow → artist-spacing tail as the vibe/feeling builders. A curated
+// mood is just a labelled point and a discovered vibe is just a point found in your
+// history — both now resolve to this one builder.
+async function buildMixFromTarget(target, limit = 20) {
+  if (!target || target.energy == null || target.valence == null) return [];
+  const centroid = { energy: target.energy, valence: target.valence, bpm: null };
+  // Base spread (how wide a net around the point) widened by the Variety tuning,
+  // mirroring _vibeRadius so the pad behaves like the discovered clusters.
+  const radius = (target.spread != null ? target.spread : 0.15) + _lerp(0.04, 0.30, _tVariety());
+  const verdict = (t) => _centroidVerdict(t, centroid, radius);
+
+  // Library/history tracks inside the target radius, not already heard this session.
+  const seen = new Set();
+  const pool = [];
+  for (const e of combinedHistory()) {
+    if (e.energy == null || e.valence == null) continue;
+    if (seen.has(e.id)) continue;
+    if (_sessionTrackIds.has(e.id)) continue;
+    if (_clusterDist(centroid, e) > radius) continue;
+    seen.add(e.id);
+    pool.push(e);
+  }
+
+  const discoveryCount = Math.min(Math.ceil(limit * _tDiscoveryRatio()), 10);
+  const baseCount = Math.max(1, limit - discoveryCount);
+
+  // Shuffle within the on-target pool, then taste-bias so loved artists surface when
+  // the pool is truncated (identical to the vibe/feeling builders).
+  const base = _applyTasteBias([...pool].sort(() => Math.random() - 0.5)).slice(0, baseCount);
+
+  const seedSource = base.length ? base : pool;
+  const seedIds = [...seedSource].sort(() => Math.random() - 0.5).slice(0, 3).map(t => t.id).filter(Boolean);
+  const seedArtists = seedSource.map(t => t.artist).filter(Boolean);
+  const discovery = await _buildDiscovery(seedIds, seedArtists, discoveryCount, verdict);
+
+  let all = _excludeDisliked(_excludePlayed([...base, ...discovery]));
+  // A valid target with real nearby history should never come back empty.
+  if (!all.length && pool.length) all = _excludeDisliked([...pool]);
+  return _spaceArtists(_tFlowOn() ? flowOrder(all) : all);
+}
 
 async function buildVibePlaylist(vibeKey, limit = 25) {
   const vibes = computeVibes();
@@ -4986,6 +5064,16 @@ function _guessFeeling(centroid) {
 // Returns null when nothing is active (or features aren't warm yet).
 function _activePoolSize() {
   try {
+    if (_activeMixTarget) {
+      const centroid = { energy: _activeMixTarget.energy, valence: _activeMixTarget.valence, bpm: null };
+      const radius = (_activeMixTarget.spread != null ? _activeMixTarget.spread : 0.15) + _lerp(0.04, 0.30, _tVariety());
+      let n = 0;
+      for (const e of combinedHistory()) {
+        if (e.energy == null || e.valence == null) continue;
+        if (_clusterDist(centroid, e) <= radius) n++;
+      }
+      return n;
+    }
     if (_activeVibeKey) {
       const vibes = computeVibes();
       if (!vibes.ready) return null;
@@ -5021,6 +5109,7 @@ function _emitIntelligenceState() {
     activeMoodKey:  _activeMoodKey,
     activeMoodName: _activeMoodKey ? (MOOD_STATES.find(m => m.key === _activeMoodKey)?.name || null) : null,
     activeVibeKey:  _activeVibeKey,
+    activeMix:      _activeMixState(),
     activePoolSize: _activePoolSize(),
     clusterSize:    _currentCluster.length,
     clusterCentroid: _currentCentroid,
@@ -5315,6 +5404,53 @@ function computeRightNow() {
   };
 }
 
+// The data behind the "mood map": a density grid of your listening across energy×
+// valence space (so the pad can show WHERE your music lives), the named clusters as
+// labelled anchor points, and a personal "right now" point (the centroid of what you
+// tend to play at this hour). All in-memory, no API calls.
+function computeMixMap() {
+  const BINS = 10;
+  const grid = Array.from({ length: BINS }, () => new Array(BINS).fill(0));
+  let max = 0, total = 0;
+  const nowHour = new Date().getHours();
+  const timed = []; // same-hour plays → the "right now" centroid
+  for (const e of combinedHistory()) {
+    if (e.energy == null || e.valence == null) continue;
+    const xi = Math.min(BINS - 1, Math.max(0, Math.floor((e.valence / 100) * BINS))); // valence → X
+    const yi = Math.min(BINS - 1, Math.max(0, Math.floor((e.energy  / 100) * BINS))); // energy  → Y
+    grid[yi][xi]++;
+    if (grid[yi][xi] > max) max = grid[yi][xi];
+    total++;
+    if (e.ts != null && e.h != null && Math.abs(e.h - nowHour) <= 1) timed.push(e);
+  }
+
+  // Named quick-picks = the discovered clusters, placed at their centroid.
+  const vibes = computeVibes();
+  const anchors = [];
+  if (vibes.ready) {
+    for (const c of vibes.clusters) {
+      if (c.avgEnergy == null || c.avgValence == null) continue;
+      anchors.push({
+        key: c.key, name: c.name,
+        energy: c.avgEnergy, valence: c.avgValence,
+        plays: c.plays, count: c.count, avgBpm: c.avgBpm,
+      });
+    }
+  }
+
+  // "Right now" — where you usually sit at this time of day.
+  let nowPoint = null;
+  if (timed.length >= 5) {
+    const c = _computeCentroid(timed);
+    if (c) nowPoint = {
+      energy: Math.round(c.energy), valence: Math.round(c.valence),
+      label: _mixTargetLabel({ energy: c.energy, valence: c.valence }),
+    };
+  }
+
+  return { ready: total >= 10, bins: BINS, grid, max, total, anchors, nowPoint };
+}
+
 // Build the full insights payload from current in-memory state (no network).
 // Each section is computed defensively so one failing analysis can't blank the
 // entire panel — a bad vibe calc shouldn't wipe Profile/Patterns/etc.
@@ -5330,6 +5466,8 @@ function buildInsightsPayload() {
     tuning:        { ..._tuning },
     activeMoodKey: _activeMoodKey,
     activeVibeKey: _activeVibeKey,
+    activeMix:     _activeMixState(),
+    mixMap:   safe(computeMixMap, { ready: false }),
     moods: MOOD_STATES.map(({ key, name, emoji, desc, feeling }) => ({ key, name, emoji, desc, feeling })),
     context: safe(detectCurrentContext, null),
   };
@@ -6428,6 +6566,7 @@ function init(io) {
         }
         _activeVibeKey = key;
         _activeMoodKey = null;
+        _activeMixTarget = null;
         _activeFeeling = null;
         const seedUri = seed.uri || `spotify:track:${seed.id}`;
         await _sqStartFromSeed('vibe', seedUri, seed);
@@ -6455,6 +6594,7 @@ function init(io) {
         }
         _activeMoodKey = key;
         _activeVibeKey = null;
+        _activeMixTarget = null;
         _activeFeeling = null;
         const seedUri = seed.uri || `spotify:track:${seed.id}`;
         await _sqStartFromSeed('mood', seedUri, seed);
@@ -6467,14 +6607,65 @@ function init(io) {
       }
     });
 
+    // ----- spotify:play_mix -----
+    // The unified entry point: { energy, valence } is a point on the mood map (a
+    // freeform pad pick OR a named cluster's centroid, optionally with label/vibeKey).
+    // Builds the seed from that target, plays it, and weaves more on-target picks ∞.
+    socket.on('spotify:play_mix', async ({ energy, valence, label, vibeKey, spread } = {}) => {
+      try {
+        const e = _clampNum(Number(energy), 0, 100);
+        const v = _clampNum(Number(valence), 0, 100);
+        if (Number.isNaN(e) || Number.isNaN(v)) {
+          socket.emit('spotify:insights_action', { ok: false, msg: 'Invalid spot on the map' });
+          return;
+        }
+        const target = {
+          energy: e, valence: v,
+          spread:  (spread != null && !Number.isNaN(Number(spread))) ? _clampNum(Number(spread), 0.05, 0.4) : 0.15,
+          label:   label || null,
+          vibeKey: vibeKey || null,
+        };
+        const seedPool = await buildMixFromTarget(target, 12);
+        const seed = (seedPool || []).find(t => t && (t.uri || t.id));
+        if (!seed) {
+          socket.emit('spotify:insights_action', { ok: false, msg: 'No songs near that spot yet — keep listening' });
+          return;
+        }
+        _activeMixTarget = target;
+        _activeMoodKey = null;
+        _activeVibeKey = null;
+        _activeFeeling = null;
+        const seedUri = seed.uri || `spotify:track:${seed.id}`;
+        await _sqStartFromSeed('mix', seedUri, seed);
+        const lbl = _mixTargetLabel(target);
+        socket.emit('spotify:insights_action', { ok: true, msg: `Smart Queue · "${lbl}" · weaving ∞` });
+        _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: null, activeMix: _activeMixState() });
+        _emitIntelligenceState();
+        setTimeout(emitQueue, 1500);
+      } catch (err) {
+        socket.emit('spotify:insights_action', { ok: false, msg: err.message });
+      }
+    });
+
+    // ----- spotify:get_mix_map -----  (Mixes tab: heat grid + cluster anchors + now-point)
+    socket.on('spotify:get_mix_map', () => {
+      try {
+        socket.emit('spotify:mix_map', { ...computeMixMap(), activeMix: _activeMixState() });
+      } catch (err) {
+        console.error('[Spotify] get_mix_map error:', err.message);
+        socket.emit('spotify:mix_map', { ready: false, error: err.message });
+      }
+    });
+
     // ----- spotify:stop_continuous -----
     socket.on('spotify:stop_continuous', () => {
       _sqStop('stop_continuous');
       _activeMoodKey = null;
       _activeVibeKey = null;
+      _activeMixTarget = null;
       _activeFeeling = null;
       _pendingCheckIn = null;
-      _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: null });
+      _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: null, activeMix: null });
       _io.emit('spotify:feeling_expired');
       _emitIntelligenceState();
     });
@@ -6486,6 +6677,7 @@ function init(io) {
         activeMoodKey:   _activeMoodKey,
         activeMoodName:  _activeMoodKey ? (MOOD_STATES.find(m => m.key === _activeMoodKey)?.name || null) : null,
         activeVibeKey:   _activeVibeKey,
+        activeMix:       _activeMixState(),
         activePoolSize:  _activePoolSize(),
         clusterSize:     _currentCluster.length,
         clusterCentroid: _currentCentroid,
@@ -6519,7 +6711,7 @@ function init(io) {
           socket.emit('spotify:insights_action', { ok: false, msg: 'Not enough history for this time slot yet' });
           return;
         }
-        _activeMoodKey = null; _activeVibeKey = null; _activeFeeling = null;
+        _activeMoodKey = null; _activeVibeKey = null; _activeMixTarget = null; _activeFeeling = null;
         await _sqStartFromSeed('rightnow', seed.uri, {
           uri: seed.uri, id: seed.id, title: seed.title, artist: seed.artist,
         });
@@ -6627,6 +6819,7 @@ function init(io) {
         if (!seed) return;
         _activeVibeKey = rn.vibeKey || null;
         _activeMoodKey = null;
+        _activeMixTarget = null;
         _activeFeeling = null;
         const seedUri = seed.uri || `spotify:track:${seed.id}`;
         await _sqStartFromSeed('rightnow', seedUri, seed);

@@ -177,6 +177,19 @@ export function stopContinuous() {
   socket.emit('spotify:stop_continuous');
 }
 
+/**
+ * Play a unified mix targeting an exact point in the energy×valence space.
+ * @param {{energy:number, valence:number, label?:string, vibeKey?:string, spread?:number}} target
+ */
+export function playMix(target) {
+  socket.emit('spotify:play_mix', target);
+}
+
+/** Request the 2D mood map (server replies with spotify:mix_map). */
+export function getMixMap() {
+  socket.emit('spotify:get_mix_map');
+}
+
 /** Request the current global tuning profile (server replies with spotify:tuning). */
 export function getTuning() {
   socket.emit('spotify:get_tuning');
