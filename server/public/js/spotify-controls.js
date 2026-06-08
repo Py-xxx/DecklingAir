@@ -2501,7 +2501,6 @@ export function renderSpotifyInsights(ctrl) {
             <div class="sp-ins-mixmap-pad" tabindex="0" role="slider" aria-label="Mood map">
               <canvas class="sp-ins-mixmap-heat" width="220" height="220"></canvas>
               <div class="sp-ins-mixmap-anchors"></div>
-              <div class="sp-ins-mixmap-now" style="display:none" title="Where you're listening right now"></div>
               <div class="sp-ins-mixmap-puck" style="display:none"></div>
             </div>
           </div>
@@ -2881,7 +2880,6 @@ export function renderSpotifyInsights(ctrl) {
   const _mixPad    = card.querySelector('.sp-ins-mixmap-pad');
   const _mixHeat   = card.querySelector('.sp-ins-mixmap-heat');
   const _mixAnchorsEl = card.querySelector('.sp-ins-mixmap-anchors');
-  const _mixNowEl  = card.querySelector('.sp-ins-mixmap-now');
   const _mixPuck   = card.querySelector('.sp-ins-mixmap-puck');
   const _mixLabel  = card.querySelector('.sp-ins-mixmap-label');
   const _mixPlay   = card.querySelector('.sp-ins-mixmap-play');
@@ -2893,6 +2891,8 @@ export function renderSpotifyInsights(ctrl) {
   // Selected target: { energy, valence, label?, vibeKey? }
   let _mixSelected = null;
   let _mixAnchors  = [];
+  // Once the user grabs the puck we stop auto-defaulting it to the current song/mix.
+  let _mixUserPicked = false;
 
   // Friendly client-side name for a freeform point (server computes the
   // authoritative label for the active-mix footer; this is just for the readout).
@@ -2908,7 +2908,7 @@ export function renderSpotifyInsights(ctrl) {
     el.style.top  = `${100 - energy}%`;
   }
 
-  function _mixSelect(energy, valence, label, vibeKey) {
+  function _mixSelect(energy, valence, label, vibeKey, userPicked = true) {
     energy  = Math.max(0, Math.min(100, Math.round(energy)));
     valence = Math.max(0, Math.min(100, Math.round(valence)));
     _mixSelected = { energy, valence, label: label || _mixSpotName(energy, valence), vibeKey };
@@ -2916,6 +2916,7 @@ export function renderSpotifyInsights(ctrl) {
     _mixPlace(_mixPuck, energy, valence);
     _mixLabel.textContent = _mixSelected.label;
     _mixPlay.disabled = false;
+    if (userPicked) _mixUserPicked = true;
   }
 
   function _mixPlaySelected() {
@@ -2970,7 +2971,7 @@ export function renderSpotifyInsights(ctrl) {
   });
   _mixPlay.addEventListener('pointerup', () => { if (!isEditMode()) _mixPlaySelected(); });
 
-  function _renderMixMap(mixMap, context) {
+  function _renderMixMap(mixMap, context, activeMix) {
     mixMap = mixMap || { ready: false };
 
     // Context hint line (carried over from the old Moods tab).
@@ -2990,7 +2991,6 @@ export function renderSpotifyInsights(ctrl) {
         `${total} / 10 tracks analysed`;
       _mixHeat.getContext('2d')?.clearRect(0, 0, _mixHeat.width, _mixHeat.height);
       _mixAnchorsEl.innerHTML = '';
-      _mixNowEl.style.display = 'none';
       _mixChips.innerHTML = '';
       _mixChipsTitle.style.display = 'none';
       return;
@@ -3044,13 +3044,17 @@ export function renderSpotifyInsights(ctrl) {
       _mixAnchorsEl.appendChild(dot);
     });
 
-    // "Right now" dot.
-    if (mixMap.nowPoint) {
-      _mixNowEl.style.display = '';
-      _mixPlace(_mixNowEl, mixMap.nowPoint.energy, mixMap.nowPoint.valence);
-      _mixNowEl.title = `Where you usually are right now — ${mixMap.nowPoint.label}`;
-    } else {
-      _mixNowEl.style.display = 'none';
+    // Default the selector onto where you already are — the active mix if one is
+    // playing, otherwise the current song's vibe — unless the user has grabbed the
+    // puck themselves. The selector IS the marker (no separate static dot).
+    if (!_mixUserPicked) {
+      let def = null;
+      if (activeMix && activeMix.energy != null) {
+        def = { energy: activeMix.energy, valence: activeMix.valence, label: activeMix.label, vibeKey: activeMix.vibeKey };
+      } else if (mixMap.currentPoint && mixMap.currentPoint.energy != null) {
+        def = mixMap.currentPoint;
+      }
+      if (def) _mixSelect(def.energy, def.valence, def.label, def.vibeKey, false);
     }
 
     // Quick-pick chips = the same named clusters, renameable.
@@ -3234,7 +3238,7 @@ export function renderSpotifyInsights(ctrl) {
   let _lastContext = null;
   const _onMixMap = (data) => {
     if (!data) return;
-    _renderMixMap(data, _lastContext);
+    _renderMixMap(data, _lastContext, data.activeMix);
     _updateContinuousState({ activeMix: data.activeMix });
   };
   socket.on('spotify:mix_map', _onMixMap);
@@ -3245,7 +3249,7 @@ export function renderSpotifyInsights(ctrl) {
     _renderProfile(data.profile  || {});
     _renderPatterns(data.patterns || { grid: [], max: 1, blockNames: [], dayNames: [], total: 0 });
     _lastContext = data.context || null;
-    _renderMixMap(data.mixMap, _lastContext);
+    _renderMixMap(data.mixMap, _lastContext, data.activeMix);
     // Tuning sliders
     if (data.tuning) _applyTuningState(data.tuning);
     // Shared continuous footer

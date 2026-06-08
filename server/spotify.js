@@ -5503,7 +5503,19 @@ function computeMixMap() {
     };
   }
 
-  return { ready: total >= 10, bins: BINS, grid, max, total, anchors, nowPoint };
+  // Where the current listening sits right now — the live cluster centroid (the
+  // vibe of what's playing). Used by the UI to default the selector puck onto the
+  // current song/mix instead of starting blank.
+  let currentPoint = null;
+  if (_currentCentroid && _currentCentroid.energy != null && _currentCentroid.valence != null) {
+    currentPoint = {
+      energy:  Math.round(_currentCentroid.energy),
+      valence: Math.round(_currentCentroid.valence),
+      label:   _mixTargetLabel({ energy: _currentCentroid.energy, valence: _currentCentroid.valence }),
+    };
+  }
+
+  return { ready: total >= 10, bins: BINS, grid, max, total, anchors, nowPoint, currentPoint };
 }
 
 // Build the full insights payload from current in-memory state (no network).
