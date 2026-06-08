@@ -3233,6 +3233,7 @@ export function renderSpotifyIntelligence(ctrl) {
           <div class="sp-intel-predict-info">
             <div class="sp-intel-predict-name"><span>—</span></div>
             <div class="sp-intel-predict-sub"><span></span></div>
+            <div class="sp-intel-predict-artists" style="display:none"><span></span></div>
             <div class="sp-intel-predict-bars" style="display:none">
               <span class="sp-intel-predict-bar" title="Energy"><i class="sp-intel-predict-bar-e"></i></span>
               <span class="sp-intel-predict-bar sp-intel-predict-bar--v" title="Positivity"><i class="sp-intel-predict-bar-v"></i></span>
@@ -3289,6 +3290,7 @@ export function renderSpotifyIntelligence(ctrl) {
   const predictEmoji = card.querySelector('.sp-intel-predict-emoji');
   const predictName  = card.querySelector('.sp-intel-predict-name');
   const predictSub   = card.querySelector('.sp-intel-predict-sub');
+  const predictArtists = card.querySelector('.sp-intel-predict-artists');
   const predictBars  = card.querySelector('.sp-intel-predict-bars');
   const predictBarE  = card.querySelector('.sp-intel-predict-bar-e');
   const predictBarV  = card.querySelector('.sp-intel-predict-bar-v');
@@ -3355,7 +3357,18 @@ export function renderSpotifyIntelligence(ctrl) {
       if (contextLabel) contextLabel.style.display = 'none'; // the headline is self-describing
       predictEmoji.textContent = tm.emoji || '🕰️';
       _setMarqueeText(predictName, tm.headline);
-      _setMarqueeText(predictSub, tm.sub || '');
+      // Static descriptor under the headline ("Your nights usually lean X, often:").
+      _setMarqueeText(predictSub, tm.lean || tm.sub || '');
+      // Marquee of this time-slot's regular artists, scrolling beneath the descriptor.
+      const tmArtists = (tm.artists && tm.artists.length) ? tm.artists.join('   ·   ') : '';
+      if (predictArtists) {
+        if (tmArtists) {
+          _setMarqueeText(predictArtists, tmArtists);
+          predictArtists.style.display = '';
+        } else {
+          predictArtists.style.display = 'none';
+        }
+      }
       predictBars.style.display = 'none';
       predictDrift.style.display = 'none';
       predictPlay.style.display = (tm.seed && tm.seed.uri) ? '' : 'none';
@@ -3364,6 +3377,7 @@ export function renderSpotifyIntelligence(ctrl) {
     } else if (cp && cp.feelingLabel) {
       _predictTimeMachine = false;
       _predictMoodKey = cp.moodKey || null;
+      if (predictArtists) predictArtists.style.display = 'none';
       if (contextLabel) contextLabel.style.display = '';
       predictEmoji.textContent = cp.emoji || cp.moodEmoji || '🎧';
       _setMarqueeText(predictName, cp.moodName || cp.feelingLabel);
@@ -3395,6 +3409,7 @@ export function renderSpotifyIntelligence(ctrl) {
     } else if (context?.suggestedMoodName) {
       _predictTimeMachine = false;
       _predictMoodKey = context.suggestedMoodKey || null;
+      if (predictArtists) predictArtists.style.display = 'none';
       if (contextLabel) contextLabel.style.display = '';
       predictEmoji.textContent = context.suggestedMoodEmoji || '🎧';
       _setMarqueeText(predictName, context.suggestedMoodName);
@@ -3407,6 +3422,7 @@ export function renderSpotifyIntelligence(ctrl) {
     } else {
       _predictTimeMachine = false;
       _predictMoodKey = null;
+      if (predictArtists) predictArtists.style.display = 'none';
       if (contextLabel) contextLabel.style.display = '';
       predictEl.style.display = 'none';
       contextVal.style.display = '';
@@ -3555,6 +3571,7 @@ export function renderSpotifyIntelligence(ctrl) {
     _predictMarqueeTimer = setTimeout(() => {
       _applyMarquee(predictName);
       _applyMarquee(predictSub);
+      if (predictArtists) _applyMarquee(predictArtists);
     }, 60);
   });
   _intelRo.observe(card);

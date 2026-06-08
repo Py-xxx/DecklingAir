@@ -3640,6 +3640,12 @@ function _sqTrimNoRepeat() {
 // API never autoplays a bare track). `weave` controls whether OUR picks are
 // woven in (search/playlist honour the toggle; mood/vibe/rightnow always weave).
 function _sqStart(source, seedTrack, weave = true) {
+  // Kill any existing session FIRST so a new start completely replaces the old
+  // one. The id bump below is the kill switch: every async Smart Queue operation
+  // captures its session id and bails (via _sqAlive) the moment it no longer
+  // matches, so an in-flight build/enqueue from the previous session can never
+  // resume and write its picks into this new one (the "two queues at once" bug).
+  if (_sq) _sqStop('superseded by a new session');
   _sq = {
     id: ++_sqSessionSeq,
     source,
@@ -3667,6 +3673,15 @@ function _sqStop(reason) {
   if (!_sq) return;
   console.log(`[SmartQueue] ■ Session ${_sq.id} stopped (${reason})`);
   _sq = null;
+}
+
+// True only while `sid` is STILL the live session. Every async Smart Queue step
+// re-checks this after each await: if the session was stopped or replaced while
+// a network call was in flight, the stale continuation aborts instead of mutating
+// whatever session happens to be current now. This is what guarantees exactly one
+// live Smart Queue at a time.
+function _sqAlive(sid) {
+  return !!_sq && _sq.id === sid;
 }
 
 // Clear the playback queue on a MANUAL change (new song / playlist / mood / vibe).
@@ -3722,6 +3737,7 @@ async function _sqStartFromSeed(source, seedUri, seedTrack, weave = true) {
 // Returns 1 if a track was newly queued, else 0.
 async function _sqEnqueueUpcoming() {
   if (!_sq || _sq.pos < 0) return 0;
+  const sid = _sq.id;
   for (let i = _sq.pos + 1; i < _sq.window.length; i++) {
     const slot = _sq.window[i];
     if (!slot || !slot.uri) continue;
@@ -3747,6 +3763,9 @@ async function _sqEnqueueUpcoming() {
     // Clean, not yet added → add exactly this one and stop (strict one-at-a-time).
     try {
       await addToQueue(slot.uri);
+      // Session was replaced/stopped while the add was in flight — don't write
+      // this pick's bookkeeping into whatever session is current now.
+      if (!_sqAlive(sid)) return 0;
       slot.added = true;
       _addStaged([slot.uri]);
       if (slot.id) { _sq.seen.add(slot.id); _sq.noRepeat.add(slot.id); }
@@ -3830,11 +3849,13 @@ function _scheduleQueueRefresh(delay = 1200) {
 // are woven into the roughest gaps (skipped entirely when weave is off).
 async function _sqBuildAndEnqueueWindow(state, reason) {
   if (!_sq || _sq.building) return;
+  const sid = _sq.id;
   _sq.building = true;
   try {
     const cur = state.track;
     const anchorN = _sqAnchorCount(); // Lookahead-derived window depth
     const anchors = (await _sqBuildSpotifyAnchors(anchorN)).slice(0, anchorN).map(_sqAnnotate);
+    if (!_sqAlive(sid)) return; // session replaced mid-build → abandon
     const targetU = _sqTargetOurs(anchors.length || 1);
     let pool = [];
     if (targetU > 0) {
@@ -3842,6 +3863,7 @@ async function _sqBuildAndEnqueueWindow(state, reason) {
       pool = (await _sqBuildOurCandidates(targetU + 6))
         .filter(t => t && t.id && !anchorIds.has(t.id))   // dedupe ours vs anchors
         .map(_sqAnnotate);
+      if (!_sqAlive(sid)) return; // session replaced mid-build → abandon
     }
     const { slots, used } = _sqPlanInterleave(_sqAnnotate(cur), anchors, pool, targetU);
     _sq.window = _sqAssembleWindow(cur, slots);
@@ -3855,8 +3877,9 @@ async function _sqBuildAndEnqueueWindow(state, reason) {
   } catch (err) {
     console.error('[SmartQueue] Window build failed:', err.message);
   } finally {
-    _sq.building = false;
+    if (_sqAlive(sid)) _sq.building = false; // never clear a different session's flag
   }
+  if (!_sqAlive(sid)) return;
   await _sqEnqueueUpcoming(); // populate Up Next immediately
 }
 
@@ -3865,6 +3888,7 @@ async function _sqBuildAndEnqueueWindow(state, reason) {
 // them, and enqueue — so playback never runs dry.
 async function _sqExtendWindow(state) {
   if (!_sq || _sq.building) return;
+  const sid = _sq.id;
   _sq.building = true;
   try {
     // Bridge from the last REAL slot (skip trailing dupes) so flow math isn't
@@ -3876,6 +3900,7 @@ async function _sqExtendWindow(state) {
     const bridgeLeft = _sqAnnotate(last?.track || state.track);
     const anchorN = _sqAnchorCount(); // Lookahead-derived window depth
     const anchors = (await _sqBuildSpotifyAnchors(anchorN)).slice(0, anchorN).map(_sqAnnotate);
+    if (!_sqAlive(sid)) return; // session replaced mid-extend → abandon
     if (!anchors.length) { console.log('[SmartQueue] Extend: no fresh anchors available'); return; }
     const targetU = _sqTargetOurs(anchors.length || 1);
     let pool = [];
@@ -3884,6 +3909,7 @@ async function _sqExtendWindow(state) {
       pool = (await _sqBuildOurCandidates(targetU + 6))
         .filter(t => t && t.id && !anchorIds.has(t.id))
         .map(_sqAnnotate);
+      if (!_sqAlive(sid)) return; // session replaced mid-extend → abandon
     }
     const { slots, used } = _sqPlanInterleave(bridgeLeft, anchors, pool, targetU);
     // Decorate each new slot with its "why-picked" reason just like
@@ -3912,8 +3938,9 @@ async function _sqExtendWindow(state) {
   } catch (err) {
     console.error('[SmartQueue] Extend failed:', err.message);
   } finally {
-    _sq.building = false;
+    if (_sqAlive(sid)) _sq.building = false; // never clear a different session's flag
   }
+  if (!_sqAlive(sid)) return;
   await _sqEnqueueUpcoming();
   _sqTrimWindow();
 }
@@ -3934,6 +3961,7 @@ function _sqTrimWindow() {
 async function _sqTick(state) {
   if (!_sq || _sq.building) return;
   if (!state?.isPlaying || !state.track?.uri) return;
+  const sid = _sq.id;
   const curUri = state.track.uri;
 
   // First tick (or after a full rebuild cleared it): build the window now.
@@ -3968,6 +3996,7 @@ async function _sqTick(state) {
 
   // Top up the single pending pick the instant the track changes (skips dupes).
   await _sqEnqueueUpcoming();
+  if (!_sqAlive(sid)) return; // session changed during the enqueue → stop here
 
   // Extend before we run dry — measured in real (non-dupe) upcoming slots.
   const remaining = _sqUpcomingCount();
@@ -5343,17 +5372,25 @@ function buildTimeMachine() {
   const def      = centroid ? (FEELING_DEFS[_guessFeeling(centroid)] || {}) : {};
   const counts   = new Map();
   for (const e of recent) if (e.artist) counts.set(e.artist, (counts.get(e.artist) || 0) + 1);
-  const topArtist = [...counts.entries()].sort((a, b) => b[1] - a[1])[0];
+  const ranked    = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  const topArtist = ranked[0];
+  const topArtists = ranked.slice(0, 10).map(e => e[0]); // marquee list of this slot's regulars
   const seedEntry = [...recent].reverse().find(e => e.id || e.uri);
 
   const now = new Date();
   const hr = now.getHours();
   const hour12 = ((hr + 11) % 12) + 1;
   const ampm = hr < 12 ? 'am' : 'pm';
+  const slotLabel = SLOT_LABELS[slot] || slot;
+  const feelWord  = def.label ? def.label.toLowerCase() : 'familiar';
   return {
     emoji: def.emoji || '🕰️',
     headline: `It's ${now.toLocaleDateString([], { weekday: 'long' })} ${hour12}${ampm}`,
-    sub: `Your ${SLOT_LABELS[slot] || slot} usually lean ${def.label ? def.label.toLowerCase() : 'familiar'}${topArtist ? ` — often ${topArtist[0]}` : ''}`,
+    // Static descriptor line shown under the headline; the artists scroll below it.
+    lean: `Your ${slotLabel} usually lean ${feelWord}, often:`,
+    artists: topArtists,
+    // Legacy single-line summary kept for any consumer that still reads `sub`.
+    sub: `Your ${slotLabel} usually lean ${feelWord}${topArtist ? ` — often ${topArtist[0]}` : ''}`,
     sampleSize: recent.length,
     seed: seedEntry ? {
       uri: seedEntry.uri || (seedEntry.id ? `spotify:track:${seedEntry.id}` : null),
