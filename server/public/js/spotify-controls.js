@@ -1148,7 +1148,11 @@ function renderSpotifySearch(ctrl) {
     row.querySelector('.sp-row-action-queue').addEventListener('pointerup', (e) => {
       if (isEditMode()) return;
       e.stopPropagation();
-      spotifyCmd('queue_add', { uri: track.uri });
+      spotifyCmd('queue_add', {
+        uri: track.uri, id: track.id,
+        title: track.title, artist: track.artist,
+        albumArt: track.albumArt || '',
+      });
       _addRecentTrack(track);
       _flashBtn(e.currentTarget);
       _deselectAll();

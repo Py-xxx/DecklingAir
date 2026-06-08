@@ -238,8 +238,8 @@ function _markPlayed(id) {
   }
 }
 
-// URIs WE deliberately staged into the playback context (queueOnTop / Smart Queue
-// window). Spotify's own Autoplay can silently append recommended tracks to the queue;
+// URIs WE deliberately staged into the queue (Smart Queue picks + manual search
+// adds). Spotify's own Autoplay can silently append recommended tracks to the queue;
 // those injected tracks aren't in here, so we can tell our picks apart from autoplay's.
 let _stagedUris = new Set();
 function _setStaged(uris) { _stagedUris = new Set((uris || []).filter(Boolean)); }
@@ -1020,6 +1020,7 @@ async function seedFromSpotify() {
           title: t.name,
           artist: t.artists?.map(a => a.name).join(', ') || '',
           album: t.album?.name || '',
+          art: t.album?.images?.[0]?.url || '',
           ts, h: d.getHours(), dow: d.getDay(),
           seeded: true, source: 'recently_played',
         });
@@ -1042,6 +1043,7 @@ async function seedFromSpotify() {
             title: t.name,
             artist: t.artists?.map(a => a.name).join(', ') || '',
             album: t.album?.name || '',
+            art: t.album?.images?.[0]?.url || '',
             seeded: true, source: range,
           });
           added++;
@@ -1093,6 +1095,7 @@ function _libSeedFromTrack(t, source) {
     title: t.name,
     artist: t.artists?.map(a => a.name).join(', ') || '',
     album: t.album?.name || '',
+    art: t.album?.images?.[0]?.url || '',
     seeded: true, source,
   };
 }
@@ -1775,39 +1778,11 @@ async function _queueTrack(t) {
   return true;
 }
 
-// Put a track at the TOP of the queue (i.e. play it next, right after the
-// current song). Spotify's /queue endpoint only appends to the end and there's
-// no reorder API, so we rebuild the upcoming queue with the new track first and
-// re-issue playback — resuming the current track at its current position.
-async function queueOnTop(uri) {
-  if (!uri) return false;
-  let currentUri = null, progressMs = 0, upcoming = [];
-  try {
-    const st = await getPlaybackState();
-    currentUri = st?.item?.uri || null;
-    progressMs = st?.progress_ms || 0;
-  } catch { /* no active playback */ }
-  try {
-    const q = await getQueue();
-    upcoming = (q?.queue || []).map(t => t && t.uri).filter(Boolean);
-  } catch { /* queue unavailable */ }
-
-  // Avoid duplicating the track if it's already somewhere downstream
-  upcoming = upcoming.filter(u => u !== uri && u !== currentUri);
-
-  if (currentUri) {
-    // Keep the current song playing where it is, slot the new track in next.
-    await play({ uris: [currentUri, uri, ...upcoming], positionMs: progressMs });
-    _setStaged([currentUri, uri, ...upcoming]);
-  } else {
-    // Nothing playing — just start with the new track at the front.
-    await play({ uris: [uri, ...upcoming] });
-    _setStaged([uri, ...upcoming]);
-  }
-  const id = uri.startsWith('spotify:track:') ? uri.split(':').pop() : null;
-  _markPlayed(id);
-  return true;
-}
+// NOTE: the old queueOnTop() helper was removed. It faked "play next" by calling
+// play({ uris: [...] }), which rebuilds the playback context and WIPES Spotify's
+// queue — destroying the Smart Queue. Spotify's API has no insert-at-front or
+// reorder endpoint, so manual search adds now use addToQueue() (append-only) and
+// are mirrored into the in-memory window via _sqRegisterUserQueued().
 
 // Drop any tracks already played or queued during this session.
 function _excludePlayed(tracks) {
@@ -3575,7 +3550,8 @@ function _sqPanelItems() {
     if (!s || s.played || s.dupe || !s.track) continue;
     const t = s.track;
     const meta = _sqMetaFor(t);
-    const art = ((t.album && t.album.images && t.album.images.length) ? t.album.images[0].url : null)
+    const art = t.albumArt || t.art
+              || ((t.album && t.album.images && t.album.images.length) ? t.album.images[0].url : null)
               || (meta && meta.art) || null;
     out.push({
       id: t.id,
@@ -3646,7 +3622,7 @@ function _sqLogWindow(label) {
     const cursor = i === _sq.pos ? '▶' : ' ';
     const name = _sqName(s.track);
     const body = s.source === 'ours' ? `--${name}--` : name;
-    const tag  = s.dupe ? 'DUPE ⊘' : (s.source === 'ours' ? (s.added ? 'OURS+ ' : 'OURS  ') : 'SPOTIFY');
+    const tag  = s.userQueued ? 'USERQ ' : s.dupe ? 'DUPE ⊘' : (s.source === 'ours' ? (s.added ? 'OURS+ ' : 'OURS  ') : 'SPOTIFY');
     return `        ${cursor} ${String(i + 1).padStart(2)}. [${tag}] ${body}`;
   });
   console.log(`[SmartQueue] ${label} — session ${_sq.id} (${_sq.window.length} slots, source=${_sq.source}):\n${lines.join('\n')}`);
@@ -3786,16 +3762,58 @@ async function _sqEnqueueUpcoming() {
   return 0;
 }
 
-// Count the feedable slots ahead of the cursor — non-dupe, not-yet-played — so the
-// extend trigger measures real upcoming songs, not skipped dupes.
+// Count the feedable slots ahead of the cursor — non-dupe, not-yet-played, and
+// not user-queued — so the extend trigger measures the engine's OWN upcoming
+// songs, ignoring skipped dupes and the user's manual queue adds.
 function _sqUpcomingCount() {
   if (!_sq) return 0;
   let n = 0;
   for (let i = _sq.pos + 1; i < _sq.window.length; i++) {
     const s = _sq.window[i];
-    if (s && !s.dupe && !s.played) n++;
+    if (s && !s.dupe && !s.played && !s.userQueued) n++;
   }
   return n;
+}
+
+// Mirror a track the user manually queued (search bar → "Queue") into the live
+// window so the panel shows it, WITHOUT letting the engine act on it. It is
+// flagged userQueued + added (the user already physically appended it via the
+// queue endpoint), so _sqEnqueueUpcoming never re-adds it, _sqUpcomingCount
+// ignores it, and the interleave/dedupe math never considers it. Its id still
+// enters seen/noRepeat so the engine never re-picks it as one of ITS songs.
+// No-op when there's no active Smart Queue session (the panel then renders the
+// physical queue, which already includes the add).
+function _sqRegisterUserQueued(meta = {}) {
+  if (!_sq || !Array.isArray(_sq.window)) return;
+  const uri = meta.uri || (meta.id ? `spotify:track:${meta.id}` : null);
+  if (!uri) return;
+  const id = meta.id || (uri.startsWith('spotify:track:') ? uri.split(':').pop() : null);
+  if (id) { _sq.seen.add(id); _sq.noRepeat.add(id); }
+  const track = {
+    id, uri,
+    title: meta.title || '',
+    artist: meta.artist || '',
+    albumArt: meta.albumArt || '',
+    duration: meta.duration || null,
+  };
+  const slot = {
+    uri, id, track,
+    source: 'manual',
+    added: true,        // user already physically queued it — engine must not re-add
+    played: false,
+    userQueued: true,
+    reason: 'Queued by you',
+    smoothMix: false,
+  };
+  // Insert right after the deepest already-queued slot so the in-memory order
+  // mirrors the physical queue (current → our pending pick → user's song). If the
+  // user stacks several adds, each lands after the previous — same as Spotify.
+  let insertAt = _sq.pos + 1;
+  for (let i = _sq.pos + 1; i < _sq.window.length; i++) {
+    if (_sq.window[i] && _sq.window[i].added) insertAt = i + 1;
+  }
+  _sq.window.splice(insertAt, 0, slot);
+  console.log(`[SmartQueue] ★ User-queued "${_sqName(track)}" → slot ${insertAt + 1} (engine ignores it)`);
 }
 
 // Debounced queue-panel refresh. Smart Queue enqueues happen AFTER the post-track-
@@ -5497,6 +5515,7 @@ async function poll() {
             id: state.track.id, uri: state.track.uri,
             title: state.track.title, artist: state.track.artist,
             album: state.track.album || '',
+            art: state.track.albumArt || '',
             dur: state.track.duration,
           };
           const _stored = _findStoredFeatures(state.track.id);
@@ -5865,12 +5884,22 @@ function init(io) {
             await transferPlayback(args.deviceId, args.play ?? true);
             break;
 
-          case 'queue_add':
-            // Manual add from search — put it at the TOP (play next), not buried
-            // behind auto-queued tracks. _sessionTrackIds is updated inside.
-            await queueOnTop(args.uri);
+          case 'queue_add': {
+            // Manual add from search — APPEND to the end of the queue via the
+            // queue endpoint. NON-destructive: no play()/context rebuild (that
+            // method wipes Spotify's queue and breaks the Smart Queue). Because
+            // the engine feeds one song at a time, the physical queue is nearly
+            // empty, so "end of queue" is effectively right behind the next pick.
+            await addToQueue(args.uri);
+            const _qid = args.id || (args.uri && args.uri.startsWith('spotify:track:') ? args.uri.split(':').pop() : null);
+            _markPlayed(_qid);
+            _addStaged([args.uri]);
+            // Mirror it into the in-memory window (marked userQueued) so the panel
+            // shows it and the engine ignores it in all calculations.
+            _sqRegisterUserQueued(args);
             setTimeout(emitQueue, 1500);
             break;
+          }
 
           case 'like':
             // Feb 2026: now takes URI (spotify:track:...) not bare ID
