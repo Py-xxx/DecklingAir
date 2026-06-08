@@ -3290,7 +3290,9 @@ export function renderSpotifyIntelligence(ctrl) {
   const predictBarV  = card.querySelector('.sp-intel-predict-bar-v');
   const predictDrift = card.querySelector('.sp-intel-predict-drift');
   const predictPlay  = card.querySelector('.sp-intel-predict-play');
+  const contextLabel = card.querySelector('.sp-intel-context-label');
   let   _predictMoodKey = null;
+  let   _predictTimeMachine = false; // true when the predict card is showing the time-machine
   const clusterBar   = card.querySelector('.sp-intel-cluster-bar');
   const clusterSize  = card.querySelector('.sp-intel-cluster-size');
   const autoCheck    = card.querySelector('.sp-intel-auto-check');
@@ -3335,12 +3337,30 @@ export function renderSpotifyIntelligence(ctrl) {
       idleEl.style.display     = '';
     }
 
-    // Predicted vibe — merges your reported feelings with this slot's audio pattern
-    // into one "this is what you're going for now" + one-tap play. Falls back to the
-    // lighter time-of-day mood guess when we don't have a learned prediction yet.
+    // The current slot's "It's Sunday 11pm — your nights usually lean angsty,
+    // often X" time-machine card — exactly what used to be on the Portraits panel,
+    // now shown here verbatim. The ▶ replays a real past same-slot track (the
+    // time-machine seed). Both the headline and sub scroll (marquee) when they
+    // overflow, so it fits every Now Playing card size. Falls back to the lighter
+    // mood guess only when there isn't enough history for a time-machine yet.
+    const tm = context?.timeMachine;
     const cp = context?.contextProfile;
-    if (cp && cp.feelingLabel) {
+    if (tm && tm.headline) {
+      _predictTimeMachine = true;
+      _predictMoodKey = null;
+      if (contextLabel) contextLabel.style.display = 'none'; // the headline is self-describing
+      predictEmoji.textContent = tm.emoji || '🕰️';
+      _setMarqueeText(predictName, tm.headline);
+      _setMarqueeText(predictSub, tm.sub || '');
+      predictBars.style.display = 'none';
+      predictDrift.style.display = 'none';
+      predictPlay.style.display = (tm.seed && tm.seed.uri) ? '' : 'none';
+      predictEl.style.display = '';
+      contextVal.style.display = 'none';
+    } else if (cp && cp.feelingLabel) {
+      _predictTimeMachine = false;
       _predictMoodKey = cp.moodKey || null;
+      if (contextLabel) contextLabel.style.display = '';
       predictEmoji.textContent = cp.emoji || cp.moodEmoji || '🎧';
       _setMarqueeText(predictName, cp.moodName || cp.feelingLabel);
       const artists = (cp.topArtists || []).slice(0, 2).map(a => a.name).join(', ');
@@ -3369,7 +3389,9 @@ export function renderSpotifyIntelligence(ctrl) {
       predictEl.style.display = '';
       contextVal.style.display = 'none';
     } else if (context?.suggestedMoodName) {
+      _predictTimeMachine = false;
       _predictMoodKey = context.suggestedMoodKey || null;
+      if (contextLabel) contextLabel.style.display = '';
       predictEmoji.textContent = context.suggestedMoodEmoji || '🎧';
       _setMarqueeText(predictName, context.suggestedMoodName);
       _setMarqueeText(predictSub, 'a guess from your time-of-day patterns');
@@ -3379,7 +3401,9 @@ export function renderSpotifyIntelligence(ctrl) {
       predictEl.style.display = '';
       contextVal.style.display = 'none';
     } else {
+      _predictTimeMachine = false;
       _predictMoodKey = null;
+      if (contextLabel) contextLabel.style.display = '';
       predictEl.style.display = 'none';
       contextVal.style.display = '';
       contextVal.textContent = 'Not sure yet — keep listening';
@@ -3407,6 +3431,13 @@ export function renderSpotifyIntelligence(ctrl) {
   predictPlay.addEventListener('pointerup', (e) => {
     if (isEditMode()) return;
     e.stopPropagation();
+    // Time-machine mode: replay a real past same-slot track (the seed), exactly
+    // like the old Portraits card's ▶ did.
+    if (_predictTimeMachine) {
+      socket.emit('spotify:time_machine_play');
+      _spToast('⏳ Replaying your time-of-day vibe — building your queue…');
+      return;
+    }
     if (!_predictMoodKey) return;
     playMood(_predictMoodKey);
     _spToast(`⏳ Loading ${predictName.textContent} — building your queue…`);

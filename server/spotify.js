@@ -4664,9 +4664,14 @@ function detectCurrentContext() {
   // playable mood so the UI can offer one-tap play. Also biases unguided recs.
   const contextProfile = _predictForNow();
 
+  // The "It's Sunday 11pm — your nights usually lean angsty, often X" card that
+  // used to live on the Portraits panel now lives on the Now Playing card. Carry
+  // it (plus its replay seed) here so the UI can render it verbatim.
+  const timeMachine = buildTimeMachine();
+
   return { hour: h, dow, timeSlot, isWeekend, recentEnergy, suggestedMoodKey,
            suggestedMoodName: suggestedMood?.name, suggestedMoodEmoji: suggestedMood?.emoji,
-           contextProfile };
+           contextProfile, timeMachine };
 }
 
 // ---------------------------------------------------------------------------

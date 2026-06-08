@@ -3111,9 +3111,10 @@
 .sp-intel-compact .sp-intel-checkin-btn { padding: 6px 10px; }
 .sp-intel-compact .sp-intel-reset-btn { width: 30px; }
 
-/* TINY (very short card): shed secondary lines so the essentials always fit. */
+/* TINY (very short card): shed secondary lines so the essentials always fit.
+   The prediction sub-line stays — it carries the time-machine card's actual
+   content ("your nights usually lean angsty — often X"), not just a hint. */
 .sp-intel-tiny .sp-intel-context-hint,
-.sp-intel-tiny .sp-intel-predict-sub,
 .sp-intel-tiny .sp-intel-feeling-sub,
 .sp-intel-tiny .sp-intel-vibe-sub { display: none; }
 .sp-intel-tiny .sp-intel-wrap { gap: 5px; }
