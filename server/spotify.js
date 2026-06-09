@@ -281,10 +281,15 @@ let _artistTaste   = new Map();
 // artists you merely play a lot, so an explicit rating wins. Levels:
 //   2 Love · 1 Like · 0 Neutral · -1 Dislike · -2 Never (strong down-weight, not a block).
 let _artistRating  = new Map();
-// _artistGenres: Spotify artistId → raw Spotify genre strings, PERSISTED. Genres
-// live on artists (not tracks/audio-features) and effectively never change, so we
-// fetch once and cache to disk. Powers the Genres tab's macro-genre filtering.
+// _artistGenres: lowercased artist NAME → raw Spotify genre strings, PERSISTED.
+// Genres live on artists (not tracks/audio-features) and effectively never change.
+// We key by NAME (not id) because stored history/seeds only carry artist names —
+// that's the universal join key across every track source. Powers the Genres tab.
 let _artistGenres  = new Map();
+// Artist IDs still needing a genre fetch. Harvested from raw API track objects
+// (seed, library) where the full {id,name} artists are present; drained by the
+// backfill (which can only call /artists by id), then stored back keyed by name.
+let _artistIdsToBackfill = new Set();
 let _genreBackfillTimer = null;
 let _trackDislikes = new Map();
 // _skipSlot: trackId → the time-slot key ("weekday:evening") of its LAST hard skip.
@@ -1032,6 +1037,7 @@ async function seedFromSpotify() {
     // 1. Recently played — has real played_at timestamps
     try {
       const rp = await api('GET', '/me/player/recently-played', { params: { limit: 50 }, priority: 'low' });
+      _collectArtistIds((rp?.items || []).map(i => i.track)); // harvest artist ids for genre backfill
       for (const item of (rp?.items || [])) {
         const t = item.track;
         if (!t?.id) continue;
@@ -1059,6 +1065,7 @@ async function seedFromSpotify() {
     for (const range of ['long_term', 'medium_term']) {
       try {
         const tt = await api('GET', '/me/top/tracks', { params: { time_range: range, limit: 50 }, priority: 'low' });
+        _collectArtistIds(tt?.items || []); // harvest artist ids for genre backfill
         let added = 0;
         for (const t of (tt?.items || [])) {
           if (!t?.id || ownIds.has(t.id) || seededTopIds.has(t.id)) continue;
@@ -1157,6 +1164,7 @@ async function warmFeatureLibrary() {
     const byId = new Map();
     try {
       const liked = await getAllLikedSongs('low');
+      _collectArtistIds(liked.map(e => e.item || e.track)); // harvest artist ids for genre backfill
       for (const entry of liked) {
         const t = entry.item || entry.track;
         if (t?.id && !byId.has(t.id)) byId.set(t.id, _libSeedFromTrack(t, 'liked_library'));
@@ -1167,6 +1175,7 @@ async function warmFeatureLibrary() {
     for (const range of ['short_term', 'medium_term', 'long_term']) {
       try {
         const tt = await api('GET', '/me/top/tracks', { params: { time_range: range, limit: 50 }, priority: 'low' });
+        _collectArtistIds(tt?.items || []); // harvest artist ids for genre backfill
         for (const t of (tt?.items || [])) {
           if (t?.id && !byId.has(t.id)) byId.set(t.id, _libSeedFromTrack(t, 'top_' + range));
         }
@@ -1202,6 +1211,11 @@ async function warmFeatureLibrary() {
       await new Promise(r => setTimeout(r, FEATURE_WARM_DELAY_MS));
     }
     console.log(`[Spotify] Feature warm complete — ${got} new features (${byId.size} library tracks now pooled for matching)`);
+    // Library artists are now harvested → make sure a genre backfill is queued to
+    // cover them (the initial kick may have run before this completed).
+    if (_artistIdsToBackfill.size && !_genreBackfillTimer) {
+      _genreBackfillTimer = setTimeout(() => backfillArtistGenres().catch(() => {}), 5000);
+    }
   } catch (err) {
     console.error('[Spotify] warmFeatureLibrary error:', err.message);
   } finally {
@@ -2655,15 +2669,21 @@ function _macroGenresOf(rawGenres) {
   return out;
 }
 
-// A track's macro-genres = union over its artists' cached genres. Returns null
-// when we have NO genre data for any of the track's artists (not yet backfilled),
-// so callers can distinguish "unknown" from "known, matches nothing".
+// A track's macro-genres = union over its artists' cached genres, looked up by
+// NAME (track.artist is a "A, B" join). Returns null when we have NO genre data
+// for any of the track's artists, so callers can distinguish "unknown" from
+// "known, matches nothing".
 function _trackMacroGenres(track) {
+  const raw = (track && track.artist) ? track.artist : '';
+  if (!raw) return null;
+  // Try the whole "A, B" string first (covers single artists whose name contains
+  // a comma, e.g. "Tyler, The Creator"), then each comma-split name.
+  const candidates = [raw.trim().toLowerCase(), ...raw.split(', ').map(n => n.trim().toLowerCase())];
   const out = new Set();
   let known = false;
-  for (const id of (track && track.artistIds) || []) {
-    const raw = _artistGenres.get(id);
-    if (raw) { known = true; for (const k of _macroGenresOf(raw)) out.add(k); }
+  for (const name of candidates) {
+    const g = _artistGenres.get(name);
+    if (g) { known = true; for (const k of _macroGenresOf(g)) out.add(k); }
   }
   return known ? out : null;
 }
@@ -2675,39 +2695,46 @@ function _trackMatchesGenre(track, bucketKey) {
   return macros ? macros.has(bucketKey) : false;
 }
 
-// Merge genres from any artist objects we happen to fetch (top artists, /artists
-// backfill, …). Persists, since this is durable data.
+// Record genres from FULL artist objects (have name + genres), keyed by name.
+// Used for /me/top/artists and the /artists backfill responses.
 function _recordArtistGenres(artists) {
   let added = 0;
   for (const a of artists || []) {
-    if (a && a.id && Array.isArray(a.genres) && !_artistGenres.has(a.id)) {
-      _artistGenres.set(a.id, a.genres);
-      added++;
+    if (a && a.name && Array.isArray(a.genres)) {
+      const k = a.name.toLowerCase();
+      if (!_artistGenres.has(k)) { _artistGenres.set(k, a.genres); added++; }
+      _artistIdsToBackfill.delete(a.id); // covered now
     }
   }
   if (added) _scheduleTasteSave();
   return added;
 }
 
-// Lazily backfill artist genres for everything in the library/history. Spotify
-// returns 50 artists/call; genres never change so we cache permanently. Runs a few
-// batches per pass behind the live-API cooldown + rate-limit guards, then reschedules
-// itself until every known artist is covered — local-first, ban-recovery-friendly.
+// Harvest artist {id,name} pairs from RAW API track objects (track.artists exists
+// on recently-played / top-tracks / library responses). Queues IDs for genre
+// backfill, but only for artists whose name we don't already have genres for.
+function _collectArtistIds(rawTracks) {
+  for (const t of rawTracks || []) {
+    for (const a of (t && t.artists) || []) {
+      if (a && a.id && a.name && !_artistGenres.has(a.name.toLowerCase())) {
+        _artistIdsToBackfill.add(a.id);
+      }
+    }
+  }
+}
+
+// Lazily backfill artist genres for the library/seed artists harvested above.
+// Spotify returns 50 artists/call; genres never change so we cache permanently
+// (keyed by name). Runs a few batches per pass behind the rate-limit guard, then
+// reschedules itself until the queue drains — local-first, ban-recovery-friendly.
 const GENRE_BACKFILL_BATCHES_PER_PASS = 2;   // ≤100 artists/pass
 const GENRE_BACKFILL_PASS_DELAY = 60 * 1000;
 async function backfillArtistGenres() {
   _genreBackfillTimer = null;
   try {
-    // Collect distinct, still-unknown artist IDs across all known tracks.
-    const missing = [];
-    const seen = new Set();
-    for (const e of combinedHistory()) {
-      for (const id of e.artistIds || []) {
-        if (id && !seen.has(id) && !_artistGenres.has(id)) { seen.add(id); missing.push(id); }
-      }
-    }
-    if (!missing.length) {
-      console.log('[Spotify] Genre backfill complete — all known artists covered');
+    const queue = [..._artistIdsToBackfill];
+    if (!queue.length) {
+      console.log(`[Spotify] Genre backfill idle — ${_artistGenres.size} artists covered`);
       return;
     }
     if (_spotifyRateLimited()) {
@@ -2715,23 +2742,24 @@ async function backfillArtistGenres() {
       return;
     }
     let fetched = 0;
-    for (let b = 0; b < GENRE_BACKFILL_BATCHES_PER_PASS && b * 50 < missing.length; b++) {
-      const ids = missing.slice(b * 50, b * 50 + 50);
+    for (let b = 0; b < GENRE_BACKFILL_BATCHES_PER_PASS && b * 50 < queue.length; b++) {
+      const ids = queue.slice(b * 50, b * 50 + 50);
       try {
         const res = await api('GET', '/artists', { params: { ids: ids.join(',') } });
         const arr = res?.artists || [];
-        // Store every returned artist; also stamp empties so we don't re-request
-        // artists Spotify has no genres for.
-        for (const a of arr) if (a && a.id) _artistGenres.set(a.id, Array.isArray(a.genres) ? a.genres : []);
+        for (const a of arr) {
+          if (a && a.name) _artistGenres.set(a.name.toLowerCase(), Array.isArray(a.genres) ? a.genres : []);
+        }
+        for (const id of ids) _artistIdsToBackfill.delete(id); // drained whether or not returned
         fetched += arr.length;
       } catch (err) {
         console.error('[Spotify] Genre backfill batch failed:', err.message);
         break;
       }
     }
-    if (fetched) { _scheduleTasteSave(); console.log(`[Spotify] Genre backfill — +${fetched} artists (${missing.length - fetched} remaining)`); }
-    // More to go → schedule the next pass.
-    if (missing.length > GENRE_BACKFILL_BATCHES_PER_PASS * 50) {
+    if (fetched) { _scheduleTasteSave(); console.log(`[Spotify] Genre backfill — +${fetched} artists (${_artistIdsToBackfill.size} queued)`); }
+    // More queued → schedule the next pass.
+    if (_artistIdsToBackfill.size) {
       _genreBackfillTimer = setTimeout(backfillArtistGenres, GENRE_BACKFILL_PASS_DELAY);
     }
   } catch (err) {
