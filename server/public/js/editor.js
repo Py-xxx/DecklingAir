@@ -10,7 +10,7 @@ import {
   LEGACY_GAP,
 } from './controls.js';
 import { vmMacro, requestSoundboardDevices, socket } from './socket.js';
-import { saveSpotifyConfig, disconnectSpotify } from './spotify-client.js';
+import { saveSpotifyConfig, disconnectSpotify, saveLastfmKey, getLastfmStatus } from './spotify-client.js';
 
 // Convert the size-picker's colSpan/rowSpan choice into a pixel size,
 // clamped up to the type's minimum footprint.
@@ -187,6 +187,16 @@ export function initEditor(state, callbacks) {
     disconnectSpotify();
   });
 
+  // Last.fm API key (Genres tab genre source)
+  document.getElementById('s-lastfm-save')?.addEventListener('click', () => {
+    const inp = document.getElementById('s-lastfm-key');
+    const key = (inp?.value || '').trim();
+    saveLastfmKey(key);
+    const st = document.getElementById('s-lastfm-status');
+    if (st) st.textContent = key ? 'Saved ✓ — building genre profile…' : 'Cleared';
+    if (inp) inp.value = '';
+  });
+
   document.getElementById('settings-close').addEventListener('click', closeSettings);
   document.getElementById('settings-cancel').addEventListener('click', closeSettings);
   document.getElementById('settings-apply').addEventListener('click', applySettings);
@@ -344,6 +354,13 @@ export function openSettings() {
   renderDefaultDeviceDropdown();
   renderPagesList();
   updateSpotifySettingsStatus(_state.spotifyAuthStatus || null);
+  // Reflect whether a Last.fm key is already saved (don't echo the secret back).
+  getLastfmStatus().then(({ hasKey }) => {
+    const st = document.getElementById('s-lastfm-status');
+    const inp = document.getElementById('s-lastfm-key');
+    if (st) st.textContent = hasKey ? '✓ Key saved' : '';
+    if (inp) inp.placeholder = hasKey ? '•••••••• saved — enter to replace' : 'Last.fm API key';
+  }).catch(() => {});
   document.getElementById('settings-modal').style.display = 'flex';
 }
 

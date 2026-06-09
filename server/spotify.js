@@ -13,6 +13,10 @@ const SPOTIFY_API = 'https://api.spotify.com/v1';
 // ReccoBeats: free drop-in for Spotify's deprecated /audio-features endpoint.
 // Takes Spotify track IDs, returns the same feature schema (0-1 floats, key 0-11, mode 0/1).
 const RECCOBEATS_API = 'https://api.reccobeats.com/v1';
+// Last.fm: genre/tag source for the Genres tab. Spotify strips the `genres` field
+// from artist objects for this app's access tier, so we resolve artist → genre tags
+// via Last.fm (free API key) and cache them permanently to disk, keyed by name.
+const LASTFM_API = 'https://ws.audioscrobbler.com/2.0/';
 const SPOTIFY_ACCOUNTS = 'accounts.spotify.com';
 // Adaptive playback polling. Instead of a fixed fast interval, the monitor self-
 // schedules: a slow base cadence while a song plays through, a single precise poll
@@ -286,10 +290,6 @@ let _artistRating  = new Map();
 // We key by NAME (not id) because stored history/seeds only carry artist names —
 // that's the universal join key across every track source. Powers the Genres tab.
 let _artistGenres  = new Map();
-// Artist IDs still needing a genre fetch. Harvested from raw API track objects
-// (seed, library) where the full {id,name} artists are present; drained by the
-// backfill (which can only call /artists by id), then stored back keyed by name.
-let _artistIdsToBackfill = new Set();
 let _genreBackfillTimer = null;
 let _trackDislikes = new Map();
 // _skipSlot: trackId → the time-slot key ("weekday:evening") of its LAST hard skip.
@@ -1037,7 +1037,6 @@ async function seedFromSpotify() {
     // 1. Recently played — has real played_at timestamps
     try {
       const rp = await api('GET', '/me/player/recently-played', { params: { limit: 50 }, priority: 'low' });
-      _collectArtistIds((rp?.items || []).map(i => i.track)); // harvest artist ids for genre backfill
       for (const item of (rp?.items || [])) {
         const t = item.track;
         if (!t?.id) continue;
@@ -1065,7 +1064,6 @@ async function seedFromSpotify() {
     for (const range of ['long_term', 'medium_term']) {
       try {
         const tt = await api('GET', '/me/top/tracks', { params: { time_range: range, limit: 50 }, priority: 'low' });
-        _collectArtistIds(tt?.items || []); // harvest artist ids for genre backfill
         let added = 0;
         for (const t of (tt?.items || [])) {
           if (!t?.id || ownIds.has(t.id) || seededTopIds.has(t.id)) continue;
@@ -1164,7 +1162,6 @@ async function warmFeatureLibrary() {
     const byId = new Map();
     try {
       const liked = await getAllLikedSongs('low');
-      _collectArtistIds(liked.map(e => e.item || e.track)); // harvest artist ids for genre backfill
       for (const entry of liked) {
         const t = entry.item || entry.track;
         if (t?.id && !byId.has(t.id)) byId.set(t.id, _libSeedFromTrack(t, 'liked_library'));
@@ -1175,7 +1172,6 @@ async function warmFeatureLibrary() {
     for (const range of ['short_term', 'medium_term', 'long_term']) {
       try {
         const tt = await api('GET', '/me/top/tracks', { params: { time_range: range, limit: 50 }, priority: 'low' });
-        _collectArtistIds(tt?.items || []); // harvest artist ids for genre backfill
         for (const t of (tt?.items || [])) {
           if (t?.id && !byId.has(t.id)) byId.set(t.id, _libSeedFromTrack(t, 'top_' + range));
         }
@@ -1211,11 +1207,6 @@ async function warmFeatureLibrary() {
       await new Promise(r => setTimeout(r, FEATURE_WARM_DELAY_MS));
     }
     console.log(`[Spotify] Feature warm complete — ${got} new features (${byId.size} library tracks now pooled for matching)`);
-    // Library artists are now harvested → make sure a genre backfill is queued to
-    // cover them (the initial kick may have run before this completed).
-    if (_artistIdsToBackfill.size && !_genreBackfillTimer) {
-      _genreBackfillTimer = setTimeout(() => backfillArtistGenres().catch(() => {}), 5000);
-    }
   } catch (err) {
     console.error('[Spotify] warmFeatureLibrary error:', err.message);
   } finally {
@@ -2695,63 +2686,103 @@ function _trackMatchesGenre(track, bucketKey) {
   return macros ? macros.has(bucketKey) : false;
 }
 
-// Record genres from FULL artist objects (have name + genres), keyed by name.
-// Used for /me/top/artists and the /artists backfill responses.
+// Record genres from FULL Spotify artist objects, keyed by name. Spotify now strips
+// the `genres` field for this app, so this is effectively dormant — kept only so a
+// future restoration (or a different tier) would slot back in for free.
 function _recordArtistGenres(artists) {
   let added = 0;
   for (const a of artists || []) {
-    if (a && a.name && Array.isArray(a.genres)) {
+    if (a && a.name && Array.isArray(a.genres) && a.genres.length) {
       const k = a.name.toLowerCase();
       if (!_artistGenres.has(k)) { _artistGenres.set(k, a.genres); added++; }
-      _artistIdsToBackfill.delete(a.id); // covered now
     }
   }
   if (added) _scheduleTasteSave();
   return added;
 }
 
-// Harvest artist {id,name} pairs from RAW API track objects (track.artists exists
-// on recently-played / top-tracks / library responses). Queues IDs for genre
-// backfill, but only for artists whose name we don't already have genres for.
-function _collectArtistIds(rawTracks) {
-  for (const t of rawTracks || []) {
-    for (const a of (t && t.artists) || []) {
-      if (a && a.id && a.name && !_artistGenres.has(a.name.toLowerCase())) {
-        _artistIdsToBackfill.add(a.id);
-      }
-    }
+// Last.fm API key — from env or the Spotify config file (data/spotify-config.json:
+// { "lastfmApiKey": "…" }). Memoised; null when unset (backfill stays dormant).
+let _lastfmKeyCache; // undefined = not resolved yet
+function _lastfmKey() {
+  if (_lastfmKeyCache === undefined) {
+    _lastfmKeyCache = process.env.LASTFM_API_KEY || (loadCfg() || {}).lastfmApiKey || null;
   }
+  return _lastfmKeyCache;
 }
 
-// Backfill artist genres for the Genres tab. NOTE: Spotify blocks "Get Several
-// Artists" (/artists) for this app's access tier — it 403s, same clampdown that
-// forces ReccoBeats for audio features. So we source genres from /me/top/artists
-// instead (same user-top-read scope as the working top-tracks calls). Three time
-// ranges → up to ~150 of your most-played artists, which dominate your history.
-// Genres are cached to disk (by name) and effectively never change.
-const GENRE_BACKFILL_PASS_DELAY = 60 * 1000;
+// Fetch an artist's top genre tags from Last.fm. Returns an array of lowercased
+// tag names (genre-ish, e.g. ['metalcore','post-hardcore']) on success, [] for a
+// not-found / tagless artist (so we cache the miss), or null on a transient error
+// (so we retry later). Last.fm returns HTTP 200 even for errors, with `error` set.
+async function _lastfmArtistTags(name) {
+  const key = _lastfmKey();
+  if (!key) return null;
+  const url = `${LASTFM_API}?method=artist.gettoptags&artist=${encodeURIComponent(name)}` +
+              `&api_key=${encodeURIComponent(key)}&autocorrect=1&format=json`;
+  let data;
+  try {
+    data = await httpsRequest('GET', url, { headers: { Accept: 'application/json', 'User-Agent': 'voicemeeter-control/1.0 (personal dashboard)' } });
+  } catch (err) {
+    if (err.status === 429 || (err.status >= 500 && err.status < 600)) return null; // transient
+    return []; // 4xx (bad key/params) — treat as no tags rather than spinning forever
+  }
+  if (!data || typeof data !== 'object') return [];
+  if (data.error) return data.error === 6 ? [] : null; // 6 = artist not found (cache the miss)
+  const tags = (data.toptags && data.toptags.tag) || [];
+  // Keep the meaningful tags only (count is 0–100 popularity); cap for tidiness.
+  return tags
+    .filter(t => t && t.name && (Number(t.count) || 0) >= 10)
+    .slice(0, 12)
+    .map(t => String(t.name).toLowerCase());
+}
+
+// Backfill artist genres for the Genres tab via Last.fm (Spotify won't supply them).
+// Walks the distinct artist names across your history/library, resolves each to its
+// Last.fm genre tags, and caches permanently to disk (by name). Throttled and run in
+// bounded passes that reschedule until everything is covered — local-first friendly.
+const GENRE_BACKFILL_PER_PASS = 40;        // artists resolved per pass
+const GENRE_BACKFILL_GAP      = 250;       // ms between Last.fm calls (~4/sec, polite)
+const GENRE_BACKFILL_PASS_DELAY = 30 * 1000;
 async function backfillArtistGenres() {
   _genreBackfillTimer = null;
   try {
-    if (_spotifyRateLimited()) {
-      _genreBackfillTimer = setTimeout(backfillArtistGenres, GENRE_BACKFILL_PASS_DELAY * 3);
+    if (!_lastfmKey()) {
+      console.log('[Spotify] Genre backfill skipped — no Last.fm API key (set LASTFM_API_KEY or "lastfmApiKey" in spotify-config.json)');
       return;
     }
-    let added = 0, seen = 0;
-    for (const range of ['short_term', 'medium_term', 'long_term']) {
-      try {
-        const res = await api('GET', '/me/top/artists', { params: { time_range: range, limit: 50 }, priority: 'low' });
-        const arr = res?.items || [];
-        seen += arr.length;
-        added += _recordArtistGenres(arr); // records by name + clears from backfill queue
-      } catch (err) {
-        console.error(`[Spotify] Genre backfill (${range}) failed:`, err.message);
+    // Distinct, still-unresolved artist names (individual, comma-split) from history.
+    const names = [];
+    const seen = new Set();
+    for (const e of combinedHistory()) {
+      if (!e.artist) continue;
+      for (const part of e.artist.split(', ')) {
+        const n = part.trim().toLowerCase();
+        if (n && !seen.has(n) && !_artistGenres.has(n)) { seen.add(n); names.push(n); }
       }
     }
-    // The id-harvest queue can't be drained via /artists (403), so clear it to stop
-    // the post-feature-warm kick from re-firing endlessly; top-artists is our source.
-    _artistIdsToBackfill.clear();
-    console.log(`[Spotify] Genre backfill via top-artists — +${added} new (${seen} seen, ${_artistGenres.size} artists covered)`);
+    if (!names.length) {
+      console.log(`[Spotify] Genre backfill complete — ${_artistGenres.size} artists covered`);
+      return;
+    }
+    let fetched = 0;
+    for (const name of names.slice(0, GENRE_BACKFILL_PER_PASS)) {
+      const tags = await _lastfmArtistTags(name);
+      if (tags === null) break;          // transient error — resume next pass
+      _artistGenres.set(name, tags);     // store [] for misses so we don't refetch
+      fetched++;
+      await new Promise(r => setTimeout(r, GENRE_BACKFILL_GAP));
+    }
+    if (fetched) {
+      _scheduleTasteSave();
+      console.log(`[Spotify] Genre backfill via Last.fm — +${fetched} artists (${names.length - fetched} remaining, ${_artistGenres.size} covered)`);
+      // Push fresh chips to any open Genres tab as coverage grows.
+      if (_io) { try { _io.emit('spotify:genre_profile', computeGenreProfile()); } catch { /* non-fatal */ } }
+    }
+    // More to resolve (or we bailed on a transient error) → schedule the next pass.
+    if (names.length > fetched) {
+      _genreBackfillTimer = setTimeout(backfillArtistGenres, GENRE_BACKFILL_PASS_DELAY);
+    }
   } catch (err) {
     console.error('[Spotify] backfillArtistGenres error:', err.message);
   }
@@ -7199,7 +7230,7 @@ function init(io) {
     // ----- spotify:save_config -----
     socket.on('spotify:save_config', ({ clientId, clientSecret } = {}) => {
       try {
-        // Merge so other settings (e.g. timeZone) survive a credentials save.
+        // Merge so other settings (e.g. timeZone, lastfmApiKey) survive a creds save.
         const cur = loadCfg() || {};
         saveCfg({ ...cur, clientId, clientSecret });
         socket.emit('spotify:config_saved', { success: true });
@@ -7207,6 +7238,30 @@ function init(io) {
         console.error('[Spotify] Save config error:', err.message);
         socket.emit('spotify:error', { message: err.message });
       }
+    });
+
+    // ----- spotify:set_lastfm_key -----  (Genres tab genre source)
+    socket.on('spotify:set_lastfm_key', ({ key } = {}) => {
+      try {
+        const trimmed = (key || '').trim();
+        const cur = loadCfg() || {};
+        saveCfg({ ...cur, lastfmApiKey: trimmed || undefined }); // undefined drops it from JSON
+        _lastfmKeyCache = trimmed || null;                       // refresh memo immediately
+        // With a key now set, (re)start the genre backfill right away.
+        if (_lastfmKeyCache) {
+          if (_genreBackfillTimer) { clearTimeout(_genreBackfillTimer); _genreBackfillTimer = null; }
+          _genreBackfillTimer = setTimeout(() => backfillArtistGenres().catch(() => {}), 500);
+        }
+        socket.emit('spotify:lastfm_status', { hasKey: !!_lastfmKeyCache, saved: true });
+      } catch (err) {
+        console.error('[Spotify] set_lastfm_key error:', err.message);
+        socket.emit('spotify:error', { message: err.message });
+      }
+    });
+
+    // ----- spotify:get_lastfm_status -----
+    socket.on('spotify:get_lastfm_status', () => {
+      socket.emit('spotify:lastfm_status', { hasKey: !!_lastfmKey() });
     });
 
     // ----- spotify:get_timezone -----

@@ -584,6 +584,17 @@
             <button class="btn-primary btn-sm" id="s-spotify-connect">Connect Spotify</button>
             <button class="btn-secondary btn-sm" id="s-spotify-disconnect" style="display:none">Disconnect</button>
           </div>
+          <div class="form-row" style="margin-top:16px">
+            <div class="form-group fg-grow">
+              <label class="form-label">Last.fm API Key</label>
+              <input type="password" id="s-lastfm-key" class="form-input" placeholder="Last.fm API key" autocomplete="off">
+            </div>
+          </div>
+          <span class="form-hint">Powers the <strong>Genres</strong> tab — Spotify no longer provides genre data, so genres come from Last.fm. Get a free key at <strong>last.fm/api/account/create</strong>.</span>
+          <div class="btn-row" style="margin-top:10px">
+            <button class="btn-primary btn-sm" id="s-lastfm-save">Save Last.fm Key</button>
+            <span id="s-lastfm-status" class="form-hint" style="align-self:center"></span>
+          </div>
         </section>
         <section class="settings-section">
           <h3>Mixer</h3>

@@ -304,6 +304,19 @@ export function saveSpotifyConfig(clientId, clientSecret) {
   socket.emit('spotify:save_config', { clientId, clientSecret });
 }
 
+/** Save (or clear, if empty) the Last.fm API key used for the Genres tab. */
+export function saveLastfmKey(key) {
+  socket.emit('spotify:set_lastfm_key', { key });
+}
+
+/** Resolve whether a Last.fm key is configured. → { hasKey } */
+export function getLastfmStatus() {
+  return new Promise((resolve) => {
+    socket.once('spotify:lastfm_status', resolve);
+    socket.emit('spotify:get_lastfm_status');
+  });
+}
+
 /**
  * Disconnect (revoke tokens on server).
  */
