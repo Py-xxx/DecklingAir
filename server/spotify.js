@@ -90,6 +90,7 @@ const FEATURE_WARM_INTERVAL    = 6 * 60 * 60 * 1000; // re-scan every 6h for new
 // alongside the first interactive player/queue/playlist loads.
 const SEED_START_DELAY         = 8 * 1000;           // history seed: after the first live read settles
 const RECONCILE_START_DELAY    = 60 * 1000;          // away-listening reconcile: 1 min after startup
+const GENRE_BACKFILL_START_DELAY = 3 * 60 * 1000;    // artist-genre backfill: after seed + feature warm kick off
 const FEATURE_WARM_DELAY_MS    = 1200;               // gentle pause between each ReccoBeats fetch
 
 const SESSION_PRUNE_DAYS       = 90;
@@ -280,6 +281,11 @@ let _artistTaste   = new Map();
 // artists you merely play a lot, so an explicit rating wins. Levels:
 //   2 Love · 1 Like · 0 Neutral · -1 Dislike · -2 Never (strong down-weight, not a block).
 let _artistRating  = new Map();
+// _artistGenres: Spotify artistId → raw Spotify genre strings, PERSISTED. Genres
+// live on artists (not tracks/audio-features) and effectively never change, so we
+// fetch once and cache to disk. Powers the Genres tab's macro-genre filtering.
+let _artistGenres  = new Map();
+let _genreBackfillTimer = null;
 let _trackDislikes = new Map();
 // _skipSlot: trackId → the time-slot key ("weekday:evening") of its LAST hard skip.
 // Lets the engine spot a "rescued" pick: a track you skipped in one context that
@@ -537,6 +543,9 @@ function loadTasteProfile() {
     for (const [k, v] of Object.entries(obj.artistRatings || {})) {
       if (typeof v === 'number' && v >= -2 && v <= 2) _artistRating.set(k, v);
     }
+    for (const [k, v] of Object.entries(obj.artistGenres || {})) {
+      if (Array.isArray(v)) _artistGenres.set(k, v);
+    }
     for (const [k, v] of Object.entries(obj.trackDislikes || {})) {
       if (typeof v === 'number') _trackDislikes.set(k, v);
     }
@@ -562,6 +571,7 @@ function saveTasteProfile() {
     const obj = {
       artistScores:  Object.fromEntries(_artistTaste),
       artistRatings: Object.fromEntries(_artistRating),
+      artistGenres:  Object.fromEntries(_artistGenres),
       trackDislikes: Object.fromEntries(_trackDislikes),
       skipSlot:      Object.fromEntries(_skipSlot),
       transitions:   Object.fromEntries(_transitions),
@@ -2614,6 +2624,121 @@ async function getSimilarTracks(seedTrackIds = [], seedArtistIds = [], limit = 5
 // live) to surface songs the user hasn't played: deeper cuts from artists they like
 // plus fresh tracks in their favourite genres.
 
+// ── Genre buckets ─────────────────────────────────────────────────────────────
+// Spotify tags genres on ARTISTS, hyper-granularly ("dance pop", "pop rap", …).
+// We roll those micro-genres up into a handful of broad, predictable buckets for
+// the Genres tab. `match` keywords are tested as substrings of an artist's raw
+// genres (an artist/track can land in several buckets — that's fine, and lenient
+// is good for thin genres). `seeds` are Spotify genre-search terms used to source
+// fresh in-genre discovery. Order = display priority.
+const GENRE_BUCKETS = [
+  { key: 'hiphop',     name: 'Hip-Hop',     match: ['hip hop', 'hip-hop', 'rap', 'trap', 'drill', 'grime'],                              seeds: ['hip-hop', 'rap'] },
+  { key: 'pop',        name: 'Pop',         match: ['pop'],                                                                              seeds: ['pop'] },
+  { key: 'rock',       name: 'Rock',        match: ['rock', 'punk', 'grunge', 'britpop'],                                                seeds: ['rock'] },
+  { key: 'electronic', name: 'Electronic',  match: ['edm', 'electro', 'house', 'techno', 'dubstep', 'trance', 'dnb', 'drum and bass', 'dance', 'garage', 'bass music'], seeds: ['edm', 'dance'] },
+  { key: 'rnb',        name: 'R&B / Soul',  match: ['r&b', 'rnb', 'soul', 'funk', 'motown'],                                             seeds: ['r-n-b', 'soul'] },
+  { key: 'metal',      name: 'Metal',       match: ['metal', 'metalcore', 'hardcore', 'djent'],                                          seeds: ['metal'] },
+  { key: 'indie',      name: 'Indie / Alt', match: ['indie', 'alternative', 'alt z', 'shoegaze', 'emo'],                                 seeds: ['indie', 'alt-rock'] },
+  { key: 'country',    name: 'Country',     match: ['country', 'americana', 'bluegrass', 'folk'],                                        seeds: ['country'] },
+  { key: 'jazz',       name: 'Jazz',        match: ['jazz', 'bebop', 'swing', 'bossa'],                                                  seeds: ['jazz'] },
+  { key: 'classical',  name: 'Classical',   match: ['classical', 'orchestra', 'baroque', 'romantic era', 'opera'],                      seeds: ['classical'] },
+];
+const GENRE_BUCKET_BY_KEY = Object.fromEntries(GENRE_BUCKETS.map(b => [b.key, b]));
+
+// Roll a list of raw Spotify genre strings up into our macro-bucket keys (a Set).
+function _macroGenresOf(rawGenres) {
+  const out = new Set();
+  for (const raw of rawGenres || []) {
+    const g = String(raw).toLowerCase();
+    for (const b of GENRE_BUCKETS) if (b.match.some(m => g.includes(m))) out.add(b.key);
+  }
+  return out;
+}
+
+// A track's macro-genres = union over its artists' cached genres. Returns null
+// when we have NO genre data for any of the track's artists (not yet backfilled),
+// so callers can distinguish "unknown" from "known, matches nothing".
+function _trackMacroGenres(track) {
+  const out = new Set();
+  let known = false;
+  for (const id of (track && track.artistIds) || []) {
+    const raw = _artistGenres.get(id);
+    if (raw) { known = true; for (const k of _macroGenresOf(raw)) out.add(k); }
+  }
+  return known ? out : null;
+}
+
+// Does a track belong to the given macro-genre bucket? 'any'/empty = no filter.
+function _trackMatchesGenre(track, bucketKey) {
+  if (!bucketKey || bucketKey === 'any') return true;
+  const macros = _trackMacroGenres(track);
+  return macros ? macros.has(bucketKey) : false;
+}
+
+// Merge genres from any artist objects we happen to fetch (top artists, /artists
+// backfill, …). Persists, since this is durable data.
+function _recordArtistGenres(artists) {
+  let added = 0;
+  for (const a of artists || []) {
+    if (a && a.id && Array.isArray(a.genres) && !_artistGenres.has(a.id)) {
+      _artistGenres.set(a.id, a.genres);
+      added++;
+    }
+  }
+  if (added) _scheduleTasteSave();
+  return added;
+}
+
+// Lazily backfill artist genres for everything in the library/history. Spotify
+// returns 50 artists/call; genres never change so we cache permanently. Runs a few
+// batches per pass behind the live-API cooldown + rate-limit guards, then reschedules
+// itself until every known artist is covered — local-first, ban-recovery-friendly.
+const GENRE_BACKFILL_BATCHES_PER_PASS = 2;   // ≤100 artists/pass
+const GENRE_BACKFILL_PASS_DELAY = 60 * 1000;
+async function backfillArtistGenres() {
+  _genreBackfillTimer = null;
+  try {
+    // Collect distinct, still-unknown artist IDs across all known tracks.
+    const missing = [];
+    const seen = new Set();
+    for (const e of combinedHistory()) {
+      for (const id of e.artistIds || []) {
+        if (id && !seen.has(id) && !_artistGenres.has(id)) { seen.add(id); missing.push(id); }
+      }
+    }
+    if (!missing.length) {
+      console.log('[Spotify] Genre backfill complete — all known artists covered');
+      return;
+    }
+    if (_spotifyRateLimited()) {
+      _genreBackfillTimer = setTimeout(backfillArtistGenres, GENRE_BACKFILL_PASS_DELAY * 3);
+      return;
+    }
+    let fetched = 0;
+    for (let b = 0; b < GENRE_BACKFILL_BATCHES_PER_PASS && b * 50 < missing.length; b++) {
+      const ids = missing.slice(b * 50, b * 50 + 50);
+      try {
+        const res = await api('GET', '/artists', { params: { ids: ids.join(',') } });
+        const arr = res?.artists || [];
+        // Store every returned artist; also stamp empties so we don't re-request
+        // artists Spotify has no genres for.
+        for (const a of arr) if (a && a.id) _artistGenres.set(a.id, Array.isArray(a.genres) ? a.genres : []);
+        fetched += arr.length;
+      } catch (err) {
+        console.error('[Spotify] Genre backfill batch failed:', err.message);
+        break;
+      }
+    }
+    if (fetched) { _scheduleTasteSave(); console.log(`[Spotify] Genre backfill — +${fetched} artists (${missing.length - fetched} remaining)`); }
+    // More to go → schedule the next pass.
+    if (missing.length > GENRE_BACKFILL_BATCHES_PER_PASS * 50) {
+      _genreBackfillTimer = setTimeout(backfillArtistGenres, GENRE_BACKFILL_PASS_DELAY);
+    }
+  } catch (err) {
+    console.error('[Spotify] backfillArtistGenres error:', err.message);
+  }
+}
+
 let _topGenresCache = { genres: [], ts: 0 };
 const TOP_GENRES_TTL = 6 * 60 * 60 * 1000;
 async function _getTopGenres() {
@@ -2622,6 +2747,7 @@ async function _getTopGenres() {
   }
   try {
     const res = await api('GET', '/me/top/artists', { params: { time_range: 'medium_term', limit: 50 } });
+    _recordArtistGenres(res?.items || []); // free genre data for your top artists
     const counts = {};
     for (const a of res?.items || []) for (const g of a.genres || []) counts[g] = (counts[g] || 0) + 1;
     const genres = Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([g]) => g);
@@ -2630,6 +2756,36 @@ async function _getTopGenres() {
   } catch {
     return _topGenresCache.genres;
   }
+}
+
+// Macro-genre coverage for the Genres tab chips: how many of your known tracks
+// fall in each bucket. `ready` once we have genre data for a reasonable share of
+// your library; `coverage` lets the UI show buckets sorted by how much you own.
+function computeGenreProfile() {
+  const counts = {};
+  for (const b of GENRE_BUCKETS) counts[b.key] = 0;
+  let known = 0, total = 0;
+  const seen = new Set();
+  for (const e of combinedHistory()) {
+    if (!e.id || seen.has(e.id)) continue;
+    seen.add(e.id);
+    total++;
+    const macros = _trackMacroGenres(e);
+    if (macros == null) continue;       // artist genres not backfilled yet
+    known++;
+    for (const k of macros) counts[k] = (counts[k] || 0) + 1;
+  }
+  const buckets = GENRE_BUCKETS
+    .map(b => ({ key: b.key, name: b.name, count: counts[b.key] || 0 }))
+    .filter(b => b.count > 0)
+    .sort((a, b) => b.count - a.count);
+  return {
+    ready: known >= 10 && buckets.length > 0,
+    buckets,
+    known,
+    total,
+    pending: total - known,            // artists still awaiting genre backfill
+  };
 }
 
 // All track IDs the user already knows (everything in their listening history).
@@ -4558,8 +4714,11 @@ async function _gateDiscovery(tracks, verdict, limit) {
 // valence quadrant's vibe name, so a freeform pad point still reads as e.g. "Hype".
 function _mixTargetLabel(target) {
   if (!target) return 'Mix';
-  if (target.label) return target.label;
-  return getVibeName(getVibeKey({ energy: target.energy, valence: target.valence }));
+  // target.label is the MOOD portion only; genre (if any) is appended here so the
+  // composed label never gets double-stamped when it's recomputed.
+  const moodLabel = target.label || getVibeName(getVibeKey({ energy: target.energy, valence: target.valence }));
+  const g = (target.genre && target.genre !== 'any') ? (GENRE_BUCKET_BY_KEY[target.genre]?.name || null) : null;
+  return g ? `${moodLabel} · ${g}` : moodLabel;
 }
 
 // Compact running-mix descriptor for the client (footer / continuous badge).
@@ -4570,6 +4729,7 @@ function _activeMixState() {
     energy:  Math.round(_activeMixTarget.energy),
     valence: Math.round(_activeMixTarget.valence),
     vibeKey: _activeMixTarget.vibeKey || null,
+    genre:   _activeMixTarget.genre || null,
     auto:    !!_activeMixTarget.auto,
   };
 }
@@ -4635,6 +4795,10 @@ async function buildMixFromTarget(target, limit = 20) {
   const radius = (target.spread != null ? target.spread : 0.15) + _lerp(0.04, 0.30, _tVariety());
   const verdict = (t) => _centroidVerdict(t, centroid, radius);
 
+  // Optional genre filter: only keep tracks whose artist falls in the bucket.
+  const genreKey = target.genre && target.genre !== 'any' ? target.genre : null;
+  const seedGenres = genreKey ? (GENRE_BUCKET_BY_KEY[genreKey]?.seeds || null) : null;
+
   // Library/history tracks inside the target radius, not already heard this session.
   const seen = new Set();
   const pool = [];
@@ -4643,11 +4807,18 @@ async function buildMixFromTarget(target, limit = 20) {
     if (seen.has(e.id)) continue;
     if (_sessionTrackIds.has(e.id)) continue;
     if (_clusterDist(centroid, e) > radius) continue;
+    if (genreKey && !_trackMatchesGenre(e, genreKey)) continue;
     seen.add(e.id);
     pool.push(e);
   }
 
-  const discoveryCount = Math.min(Math.ceil(limit * _tDiscoveryRatio()), 10);
+  let discoveryCount = Math.min(Math.ceil(limit * _tDiscoveryRatio()), 10);
+  // Lean into discovery when the genre-filtered library is thin: if we own fewer
+  // on-genre/on-target tracks than the batch needs, make up the deficit with fresh
+  // in-genre finds (uncapped beyond the usual 10) so a sparse genre still fills.
+  if (genreKey && pool.length < limit) {
+    discoveryCount = Math.min(limit, Math.max(discoveryCount, limit - pool.length));
+  }
   const baseCount = Math.max(1, limit - discoveryCount);
 
   // Shuffle within the on-target pool, then taste-bias so loved artists surface when
@@ -4657,7 +4828,7 @@ async function buildMixFromTarget(target, limit = 20) {
   const seedSource = base.length ? base : pool;
   const seedIds = [...seedSource].sort(() => Math.random() - 0.5).slice(0, 3).map(t => t.id).filter(Boolean);
   const seedArtists = seedSource.map(t => t.artist).filter(Boolean);
-  const discovery = await _buildDiscovery(seedIds, seedArtists, discoveryCount, verdict);
+  const discovery = await _buildDiscovery(seedIds, seedArtists, discoveryCount, verdict, seedGenres);
 
   let all = _excludeDisliked(_excludePlayed([...base, ...discovery]));
   // A valid target with real nearby history should never come back empty.
@@ -4775,11 +4946,14 @@ async function buildFeelingPlaylist(feelingKey, sessionTracks = [], limit = 20) 
 // `verdict` (optional) gates every candidate against the active mood/vibe's audio
 // profile — see _gateDiscovery. Off-vibe tracks are dropped so artist/genre-sourced
 // discovery can't contradict the chosen sound.
-async function _buildDiscovery(seedIds, seedArtists, count, verdict = null) {
+async function _buildDiscovery(seedIds, seedArtists, count, verdict = null, seedGenres = null) {
   if (count <= 0) return [];
   const known = _knownTrackIdSet();
   const excludeIds = new Set([...known, ..._sessionTrackIds]);
-  const topGenres = await _getTopGenres();
+  // When a genre filter is active, source fresh tracks FROM that genre (genre
+  // search / "{Genre} Mix") rather than your overall top genres — so a sparse
+  // genre still fills with genuinely in-genre discoveries.
+  const topGenres = (seedGenres && seedGenres.length) ? seedGenres : await _getTopGenres();
 
   // Over-fetch each source so there's slack to gate against the vibe and still fill.
   const fetch = verdict ? (count * 2 + 4) : (count + 4);
@@ -5463,33 +5637,43 @@ function computeRightNow() {
 // valence space (so the pad can show WHERE your music lives), the named clusters as
 // labelled anchor points, and a personal "right now" point (the centroid of what you
 // tend to play at this hour). All in-memory, no API calls.
-function computeMixMap() {
+// genreFilter (a macro-genre bucket key) restricts the heat-cloud to that genre,
+// so the Genres tab shows where *your rock/hip-hop/…* actually lives in the space.
+// Readiness still reflects your overall history (the pad stays usable even when a
+// genre is sparse — discovery fills it), and anchors are dropped under a filter.
+function computeMixMap(genreFilter = null) {
   const BINS = 10;
   const grid = Array.from({ length: BINS }, () => new Array(BINS).fill(0));
-  let max = 0, total = 0;
+  const genreKey = genreFilter && genreFilter !== 'any' ? genreFilter : null;
+  let max = 0, total = 0, fullTotal = 0;
   const nowHour = new Date().getHours();
   const timed = []; // same-hour plays → the "right now" centroid
   for (const e of combinedHistory()) {
     if (e.energy == null || e.valence == null) continue;
+    fullTotal++;
+    if (e.ts != null && e.h != null && Math.abs(e.h - nowHour) <= 1) timed.push(e);
+    if (genreKey && !_trackMatchesGenre(e, genreKey)) continue;
     const xi = Math.min(BINS - 1, Math.max(0, Math.floor((e.valence / 100) * BINS))); // valence → X
     const yi = Math.min(BINS - 1, Math.max(0, Math.floor((e.energy  / 100) * BINS))); // energy  → Y
     grid[yi][xi]++;
     if (grid[yi][xi] > max) max = grid[yi][xi];
     total++;
-    if (e.ts != null && e.h != null && Math.abs(e.h - nowHour) <= 1) timed.push(e);
   }
 
-  // Named quick-picks = the discovered clusters, placed at their centroid.
-  const vibes = computeVibes();
+  // Named quick-picks = the discovered clusters, placed at their centroid. Hidden
+  // under a genre filter (clusters aren't genre-specific — the chips are the picks).
   const anchors = [];
-  if (vibes.ready) {
-    for (const c of vibes.clusters) {
-      if (c.avgEnergy == null || c.avgValence == null) continue;
-      anchors.push({
-        key: c.key, name: c.name,
-        energy: c.avgEnergy, valence: c.avgValence,
-        plays: c.plays, count: c.count, avgBpm: c.avgBpm,
-      });
+  if (!genreKey) {
+    const vibes = computeVibes();
+    if (vibes.ready) {
+      for (const c of vibes.clusters) {
+        if (c.avgEnergy == null || c.avgValence == null) continue;
+        anchors.push({
+          key: c.key, name: c.name,
+          energy: c.avgEnergy, valence: c.avgValence,
+          plays: c.plays, count: c.count, avgBpm: c.avgBpm,
+        });
+      }
     }
   }
 
@@ -5515,7 +5699,10 @@ function computeMixMap() {
     };
   }
 
-  return { ready: total >= 10, bins: BINS, grid, max, total, anchors, nowPoint, currentPoint };
+  return {
+    ready: fullTotal >= 10, bins: BINS, grid, max, total, anchors, nowPoint, currentPoint,
+    genre: genreKey || null,
+  };
 }
 
 // Build the full insights payload from current in-memory state (no network).
@@ -6057,6 +6244,11 @@ function startPolling() {
     setTimeout(() => warmFeatureLibrary().catch(() => {}), FEATURE_WARM_START_DELAY);
     _featureWarmTimer = setInterval(() => warmFeatureLibrary().catch(() => {}), FEATURE_WARM_INTERVAL);
   }
+  // Backfill artist genres for the Genres tab — runs after seeding so history is
+  // populated, then self-reschedules in small batches until every artist is covered.
+  if (!_genreBackfillTimer) {
+    _genreBackfillTimer = setTimeout(() => backfillArtistGenres().catch(() => {}), GENRE_BACKFILL_START_DELAY);
+  }
 }
 
 function stopPolling() {
@@ -6072,6 +6264,10 @@ function stopPolling() {
   if (_featureWarmTimer) {
     clearInterval(_featureWarmTimer);
     _featureWarmTimer = null;
+  }
+  if (_genreBackfillTimer) {
+    clearTimeout(_genreBackfillTimer);
+    _genreBackfillTimer = null;
   }
   // Close any active session so time isn't lost on graceful shutdown
   closeActiveSession();
@@ -6678,7 +6874,7 @@ function init(io) {
     // The unified entry point: { energy, valence } is a point on the mood map (a
     // freeform pad pick OR a named cluster's centroid, optionally with label/vibeKey).
     // Builds the seed from that target, plays it, and weaves more on-target picks ∞.
-    socket.on('spotify:play_mix', async ({ energy, valence, label, vibeKey, spread } = {}) => {
+    socket.on('spotify:play_mix', async ({ energy, valence, label, vibeKey, spread, genre } = {}) => {
       try {
         const e = _clampNum(Number(energy), 0, 100);
         const v = _clampNum(Number(valence), 0, 100);
@@ -6686,11 +6882,13 @@ function init(io) {
           socket.emit('spotify:insights_action', { ok: false, msg: 'Invalid spot on the map' });
           return;
         }
+        const genreKey = (genre && genre !== 'any' && GENRE_BUCKET_BY_KEY[genre]) ? genre : null;
         const target = {
           energy: e, valence: v,
           spread:  (spread != null && !Number.isNaN(Number(spread))) ? _clampNum(Number(spread), 0.05, 0.4) : 0.15,
           label:   label || null,
           vibeKey: vibeKey || null,
+          genre:   genreKey,
         };
         const seedPool = await buildMixFromTarget(target, 12);
         const seed = (seedPool || []).find(t => t && (t.uri || t.id));
@@ -6714,13 +6912,26 @@ function init(io) {
       }
     });
 
-    // ----- spotify:get_mix_map -----  (Mixes tab: heat grid + cluster anchors + now-point)
-    socket.on('spotify:get_mix_map', () => {
+    // ----- spotify:get_mix_map -----  (Mixes/Genres tab: heat grid + anchors + points)
+    // Optional { genre } filters the heat-cloud to a macro-genre (Genres tab). The
+    // response echoes `genre` so the client routes it to the right pad.
+    socket.on('spotify:get_mix_map', ({ genre } = {}) => {
       try {
-        socket.emit('spotify:mix_map', { ...computeMixMap(), activeMix: _activeMixState() });
+        const genreKey = (genre && genre !== 'any' && GENRE_BUCKET_BY_KEY[genre]) ? genre : null;
+        socket.emit('spotify:mix_map', { ...computeMixMap(genreKey), activeMix: _activeMixState() });
       } catch (err) {
         console.error('[Spotify] get_mix_map error:', err.message);
         socket.emit('spotify:mix_map', { ready: false, error: err.message });
+      }
+    });
+
+    // ----- spotify:get_genre_profile -----  (Genres tab: macro-genre chips)
+    socket.on('spotify:get_genre_profile', () => {
+      try {
+        socket.emit('spotify:genre_profile', computeGenreProfile());
+      } catch (err) {
+        console.error('[Spotify] get_genre_profile error:', err.message);
+        socket.emit('spotify:genre_profile', { ready: false, buckets: [], error: err.message });
       }
     });
 

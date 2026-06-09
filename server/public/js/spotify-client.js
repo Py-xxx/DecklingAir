@@ -185,9 +185,14 @@ export function playMix(target) {
   socket.emit('spotify:play_mix', target);
 }
 
-/** Request the 2D mood map (server replies with spotify:mix_map). */
-export function getMixMap() {
-  socket.emit('spotify:get_mix_map');
+/** Request the 2D mood map (server replies with spotify:mix_map). Optional macro-genre filters the heat-cloud. */
+export function getMixMap(genre) {
+  socket.emit('spotify:get_mix_map', genre ? { genre } : {});
+}
+
+/** Request the macro-genre profile for the Genres tab (server replies with spotify:genre_profile). */
+export function getGenreProfile() {
+  socket.emit('spotify:get_genre_profile');
 }
 
 /** Request the current global tuning profile (server replies with spotify:tuning). */

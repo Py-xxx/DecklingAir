@@ -2765,6 +2765,42 @@
   transition: color 0.15s;
 }
 .sp-ins-mixmap-chip-rename:hover { color: var(--text, #fff); }
+
+/* ---------- GENRES TAB (genre chips above the shared mood pad) ---------- */
+.sp-ins-genre-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.sp-ins-genre-chip {
+  background: var(--bg-2, #1e1e1e);
+  border: 1px solid var(--sp-border, rgba(255,255,255,0.1));
+  border-radius: 14px;
+  color: var(--text-2, #aaa);
+  font-size: 12px;
+  font-weight: 700;
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.sp-ins-genre-chip:hover {
+  border-color: rgba(29,185,84,0.5);
+  color: var(--text, #fff);
+}
+.sp-ins-genre-chip--active {
+  background: var(--sp-green, #1DB954);
+  border-color: var(--sp-green, #1DB954);
+  color: #07210f;
+}
+.sp-ins-genre-empty {
+  text-align: center;
+  padding: 10px 8px;
+  color: var(--text-3, #888);
+}
+.sp-ins-genre-empty .sp-ins-empty-icon { font-size: 22px; }
+.sp-ins-genre-empty .sp-ins-empty-msg { font-size: 12px; font-weight: 600; margin-top: 4px; }
+.sp-ins-genre-empty .sp-ins-empty-sub { font-size: 11px; margin-top: 2px; }
 .sp-ins-mood-context {
   display: flex;
   align-items: center;
