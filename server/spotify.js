@@ -2723,45 +2723,35 @@ function _collectArtistIds(rawTracks) {
   }
 }
 
-// Lazily backfill artist genres for the library/seed artists harvested above.
-// Spotify returns 50 artists/call; genres never change so we cache permanently
-// (keyed by name). Runs a few batches per pass behind the rate-limit guard, then
-// reschedules itself until the queue drains — local-first, ban-recovery-friendly.
-const GENRE_BACKFILL_BATCHES_PER_PASS = 2;   // ≤100 artists/pass
+// Backfill artist genres for the Genres tab. NOTE: Spotify blocks "Get Several
+// Artists" (/artists) for this app's access tier — it 403s, same clampdown that
+// forces ReccoBeats for audio features. So we source genres from /me/top/artists
+// instead (same user-top-read scope as the working top-tracks calls). Three time
+// ranges → up to ~150 of your most-played artists, which dominate your history.
+// Genres are cached to disk (by name) and effectively never change.
 const GENRE_BACKFILL_PASS_DELAY = 60 * 1000;
 async function backfillArtistGenres() {
   _genreBackfillTimer = null;
   try {
-    const queue = [..._artistIdsToBackfill];
-    if (!queue.length) {
-      console.log(`[Spotify] Genre backfill idle — ${_artistGenres.size} artists covered`);
-      return;
-    }
     if (_spotifyRateLimited()) {
       _genreBackfillTimer = setTimeout(backfillArtistGenres, GENRE_BACKFILL_PASS_DELAY * 3);
       return;
     }
-    let fetched = 0;
-    for (let b = 0; b < GENRE_BACKFILL_BATCHES_PER_PASS && b * 50 < queue.length; b++) {
-      const ids = queue.slice(b * 50, b * 50 + 50);
+    let added = 0, seen = 0;
+    for (const range of ['short_term', 'medium_term', 'long_term']) {
       try {
-        const res = await api('GET', '/artists', { params: { ids: ids.join(',') } });
-        const arr = res?.artists || [];
-        for (const a of arr) {
-          if (a && a.name) _artistGenres.set(a.name.toLowerCase(), Array.isArray(a.genres) ? a.genres : []);
-        }
-        for (const id of ids) _artistIdsToBackfill.delete(id); // drained whether or not returned
-        fetched += arr.length;
+        const res = await api('GET', '/me/top/artists', { params: { time_range: range, limit: 50 }, priority: 'low' });
+        const arr = res?.items || [];
+        seen += arr.length;
+        added += _recordArtistGenres(arr); // records by name + clears from backfill queue
       } catch (err) {
-        console.error('[Spotify] Genre backfill batch failed:', err.message);
-        break;
+        console.error(`[Spotify] Genre backfill (${range}) failed:`, err.message);
       }
     }
-    if (fetched) { _scheduleTasteSave(); console.log(`[Spotify] Genre backfill — +${fetched} artists (${_artistIdsToBackfill.size} queued)`); }
-    // More queued → schedule the next pass.
-    if (_artistIdsToBackfill.size) {
-      _genreBackfillTimer = setTimeout(backfillArtistGenres, GENRE_BACKFILL_PASS_DELAY);
-    }
+    // The id-harvest queue can't be drained via /artists (403), so clear it to stop
+    // the post-feature-warm kick from re-firing endlessly; top-artists is our source.
+    _artistIdsToBackfill.clear();
+    console.log(`[Spotify] Genre backfill via top-artists — +${added} new (${seen} seen, ${_artistGenres.size} artists covered)`);
   } catch (err) {
     console.error('[Spotify] backfillArtistGenres error:', err.message);
   }
