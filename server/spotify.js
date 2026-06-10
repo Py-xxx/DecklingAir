@@ -4133,6 +4133,9 @@ function _sqStart(source, seedTrack, weave = true) {
     lastSeedId: seedTrack?.id || null,
   };
   if (seedTrack?.id) { _sq.noRepeat.add(seedTrack.id); _sq.seen.add(seedTrack.id); }
+  // Tell the UI a fresh queue is being built so it can show a loading overlay until
+  // the window is enqueued (paired with 'queue_built' from _sqBuildAndEnqueueWindow).
+  if (_io) _io.emit('spotify:queue_building', { source });
   // Build the window right away rather than waiting for the next slow base tick.
   refreshNow('smart-queue start');
   console.log(`[SmartQueue] ★ Session ${_sq.id} started — source=${source}, weave=${weave}, seed="${_sqName(seedTrack)}". Building window on next tick…`);
@@ -4350,6 +4353,8 @@ async function _sqBuildAndEnqueueWindow(state, reason) {
   }
   if (!_sqAlive(sid)) return;
   await _sqEnqueueUpcoming(); // populate Up Next immediately
+  // Window is built + enqueued → clear the UI loading overlay and let it refresh.
+  if (_io) _io.emit('spotify:queue_built', { reason });
 }
 
 // Extend the window when few slots remain ahead of the current track: fetch a

@@ -207,6 +207,15 @@
   85%,100% { transform: translateX(var(--sp-scroll-shift, 0px)); }
 }
 
+/* Continuous one-direction marquee (.sp-marquee-loop). The text is rendered twice;
+   shifting by exactly one copy width loops seamlessly back to the start. */
+@keyframes sp-marquee-loop {
+  from { transform: translateX(0); }
+  to   { transform: translateX(var(--sp-mq-shift, 0px)); }
+}
+.sp-mq-copy { display: inline-block; white-space: nowrap; }
+.sp-mq-copy.sp-mq-gap { padding-right: 2.5em; } /* gap between the end of the list and its restart */
+
 /* Action button group — heart/add/device as a tight unit on the right */
 .sp-action-btns {
   display: flex;
@@ -792,6 +801,7 @@
 }
 
 .sp-queue-wrap {
+  position: relative; /* anchor for the loading overlay */
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -802,6 +812,37 @@
      so the scrolling list never bleeds through the rounded corners. */
   border-radius: var(--radius, 12px);
   overflow: hidden;
+}
+
+/* Loading overlay shown while the smart queue builds a fresh window. */
+.sp-queue-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  background: rgba(10, 10, 10, 0.82);
+  backdrop-filter: blur(2px);
+  border-radius: var(--radius, 12px);
+}
+.sp-queue-loading[hidden] { display: none; }
+.sp-queue-loading-spinner {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 3px solid rgba(255, 255, 255, 0.15);
+  border-top-color: var(--sp-green, #1DB954);
+  animation: sp-queue-spin 0.8s linear infinite;
+}
+@keyframes sp-queue-spin { to { transform: rotate(360deg); } }
+.sp-queue-loading-text {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2, #aaa);
+  letter-spacing: 0.02em;
 }
 
 .sp-queue-list {

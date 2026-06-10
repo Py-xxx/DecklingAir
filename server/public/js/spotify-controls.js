@@ -577,6 +577,39 @@ function _applyMarquee(containerEl) {
   // Hard-cancel any running animation so layout is settled before we measure
   span.style.animation = 'none';
   span.style.transform = 'translateX(0)';
+
+  // Continuous mode (opt-in via .sp-marquee-loop): scroll one direction at a
+  // constant speed and restart seamlessly. We render the text twice and animate by
+  // exactly one copy's width, so the second copy lands where the first began — an
+  // uninterrupted loop. Canonical text lives in data-mq since nesting copies clobbers
+  // textContent.
+  if (containerEl.classList.contains('sp-marquee-loop')) {
+    const text = span.dataset.mq != null ? span.dataset.mq
+      : (span.querySelector(':scope > .sp-mq-copy')?.textContent ?? span.textContent ?? '');
+    span.dataset.mq = text;
+    span.textContent = '';
+    const copy = document.createElement('span');
+    copy.className = 'sp-mq-copy';
+    copy.textContent = text;
+    span.appendChild(copy);
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const overflow = copy.offsetWidth - containerEl.offsetWidth;
+      if (overflow > 6) {
+        copy.classList.add('sp-mq-gap');          // trailing gap (only when scrolling)
+        const shift = copy.offsetWidth;            // one copy width, incl. the gap
+        span.appendChild(copy.cloneNode(true));    // second copy for the seamless loop
+        const secs = Math.max(4, shift / 45);      // constant ~45px/s
+        span.style.setProperty('--sp-mq-shift', `-${shift}px`);
+        span.style.animation = `sp-marquee-loop ${secs}s linear infinite`;
+      } else {
+        span.style.animation = '';
+        span.style.removeProperty('--sp-mq-shift');
+      }
+    }));
+    return;
+  }
+
+  // Ping-pong (default): player title/artist + queue reasons.
   requestAnimationFrame(() => requestAnimationFrame(() => {
     const overflow = span.offsetWidth - containerEl.offsetWidth;
     if (overflow > 6) {
@@ -593,14 +626,17 @@ function _applyMarquee(containerEl) {
 
 // Set the text of a marquee clip (a container holding one inner <span>) and
 // (re)measure it, exactly like the player does for long titles/artists. Creates
-// the inner span if missing. Only re-applies the marquee when the text changes.
+// the inner span if missing. Only re-applies the marquee when the text changes
+// (compared against the canonical data-mq for loop clips, textContent otherwise).
 function _setMarqueeText(clipEl, text) {
   if (!clipEl) return;
   clipEl.classList.remove('sp-marquee-static'); // re-enable scrolling if it was static
   let span = clipEl.querySelector(':scope > span');
   if (!span) { span = document.createElement('span'); clipEl.appendChild(span); }
   const str = text == null ? '' : String(text);
-  if (span.textContent !== str) {
+  const cur = clipEl.classList.contains('sp-marquee-loop') ? span.dataset.mq : span.textContent;
+  if (cur !== str) {
+    span.dataset.mq = str;
     span.textContent = str;
     _applyMarquee(clipEl);
   }
@@ -617,6 +653,8 @@ function _setStaticText(clipEl, text) {
   span.style.animation = 'none';
   span.style.transform = 'none';
   span.style.removeProperty('--sp-scroll-shift');
+  span.style.removeProperty('--sp-mq-shift');
+  span.removeAttribute('data-mq'); // so a later marquee with the same text re-applies
   span.textContent = text == null ? '' : String(text);
 }
 
@@ -1768,6 +1806,10 @@ function renderSpotifyQueue(ctrl) {
         </div>
       </div>
       <div class="sp-queue-list"></div>
+      <div class="sp-queue-loading" hidden>
+        <div class="sp-queue-loading-spinner"></div>
+        <div class="sp-queue-loading-text">Building your queue…</div>
+      </div>
     </div>
   `;
 
@@ -1776,6 +1818,7 @@ function renderSpotifyQueue(ctrl) {
   card.appendChild(editOverlay(ctrl.id));
 
   const listEl     = card.querySelector('.sp-queue-list');
+  const loadingEl  = card.querySelector('.sp-queue-loading');
   const refreshBtn = card.querySelector('.sp-queue-refresh');
   const autoPill   = card.querySelector('.sp-queue-auto-pill');
   const stripEl    = card.querySelector('.sp-queue-strip');
@@ -1886,6 +1929,21 @@ function renderSpotifyQueue(ctrl) {
   card._updateSpotifyQueue = _render;
   _queueCardUpdaters.add(_render);
 
+  // Loading overlay — covers the queue from the moment a smart-queue action fires
+  // (mix/genre/mood/vibe/search…) until the engine has finished building & enqueuing
+  // the window. A safety timeout clears it if the 'built' signal never lands.
+  let _qLoadTimer = null;
+  const _showQueueLoading = () => {
+    if (loadingEl) loadingEl.hidden = false;
+    clearTimeout(_qLoadTimer);
+    _qLoadTimer = setTimeout(() => { if (loadingEl) loadingEl.hidden = true; }, 15000);
+  };
+  const _hideQueueLoading = () => { clearTimeout(_qLoadTimer); if (loadingEl) loadingEl.hidden = true; };
+  const _onQueueBuilding = () => _showQueueLoading();
+  const _onQueueBuilt = () => { _hideQueueLoading(); getSpotifyQueue().then(_render); };
+  socket.on('spotify:queue_building', _onQueueBuilding);
+  socket.on('spotify:queue_built',    _onQueueBuilt);
+
   refreshBtn.addEventListener('pointerup', () => {
     if (isEditMode()) return;
     getSpotifyQueue().then(_render);
@@ -1909,6 +1967,9 @@ function renderSpotifyQueue(ctrl) {
       _queueCardUpdaters.delete(_render);
       socket.off('spotify:continuous_state', _onContState);
       socket.off('spotify:queue_managed',    _onQueueManaged);
+      socket.off('spotify:queue_building',   _onQueueBuilding);
+      socket.off('spotify:queue_built',      _onQueueBuilt);
+      clearTimeout(_qLoadTimer);
       clearTimeout(_flashTimer);
       queueRo.disconnect();
       observer.disconnect();
@@ -3614,9 +3675,9 @@ export function renderSpotifyIntelligence(ctrl) {
         <div class="sp-intel-predict" style="display:none">
           <span class="sp-intel-predict-emoji"></span>
           <div class="sp-intel-predict-info">
-            <div class="sp-intel-predict-name"><span>—</span></div>
-            <div class="sp-intel-predict-sub"><span></span></div>
-            <div class="sp-intel-predict-artists" style="display:none"><span></span></div>
+            <div class="sp-intel-predict-name sp-marquee-loop"><span>—</span></div>
+            <div class="sp-intel-predict-sub sp-marquee-loop"><span></span></div>
+            <div class="sp-intel-predict-artists sp-marquee-loop" style="display:none"><span></span></div>
             <div class="sp-intel-predict-bars" style="display:none">
               <span class="sp-intel-predict-bar" title="Energy"><i class="sp-intel-predict-bar-e"></i></span>
               <span class="sp-intel-predict-bar sp-intel-predict-bar--v" title="Positivity"><i class="sp-intel-predict-bar-v"></i></span>
