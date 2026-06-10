@@ -5148,9 +5148,70 @@ async function buildMoodPlaylist(moodKey, limit = 25) {
   return buildFeelingPlaylist(mood.feeling, sessionTracks, limit);
 }
 
+// LEARNED feeling builder. Targets your personal centroid for this feeling and
+// seeds heavily from the songs you ACTUALLY play when you feel this way (recency-
+// weighted, taste-shuffled for session variety), then fills with on-centroid library
+// + discovery through the SAME shared tail as every other builder. Only invoked once
+// a feeling is "personalized" (enough check-ins + real drift) — see buildFeelingPlaylist.
+async function _buildLearnedFeeling(prof, sessionTracks, limit) {
+  const c = prof.learned;
+  const centroid = { energy: c.energy, valence: c.valence, bpm: c.bpm || null };
+  const radius = Math.max(0.08, 0.15 + _lerp(0.04, 0.30, _tVariety()) + _lerp(-0.05, 0.10, _tMoodFlow()));
+  const verdict = (t) => _centroidVerdict(t, centroid, radius);
+
+  const byId = new Map();
+  for (const e of combinedHistory()) if (e && e.id && !byId.has(e.id)) byId.set(e.id, e);
+  const sessionIds = new Set((sessionTracks || []).map(t => t.id).filter(Boolean));
+  const blocked = (t) => !t || t.energy == null || _sessionTrackIds.has(t.id) || sessionIds.has(t.id);
+
+  // Your anchor songs for this feeling (weighted), still in the library, unheard this session.
+  const anchors = [...prof.trackW.entries()].sort((a, b) => b[1] - a[1])
+    .map(([id]) => byId.get(id)).filter(t => !blocked(t));
+
+  // On-centroid library beyond the anchors, so it doesn't loop the same handful.
+  const anchorIds = new Set(anchors.map(t => t.id));
+  const pool = [];
+  for (const e of combinedHistory()) {
+    if (e.energy == null || e.valence == null || anchorIds.has(e.id) || blocked(e)) continue;
+    if (_clusterDist(centroid, e) > radius) continue;
+    pool.push(e);
+  }
+
+  const discoveryCount = Math.min(Math.ceil(limit * _tDiscoveryRatio()), 10);
+  const baseCount = Math.max(1, limit - discoveryCount);
+  // ~60% your real anchors (taste-shuffled so it varies each session), rest on-centroid.
+  const anchorN = Math.min(anchors.length, Math.ceil(baseCount * 0.6));
+  const base = [
+    ..._tasteWeightedPick(anchors, anchorN),
+    ..._tasteWeightedPick(pool, Math.max(0, baseCount - anchorN)),
+  ].slice(0, baseCount);
+
+  const seedSource = base.length ? base : (anchors.length ? anchors : pool);
+  const seedIds = [...seedSource].sort(() => Math.random() - 0.5).slice(0, 3).map(t => t.id).filter(Boolean);
+  const seedArtists = seedSource.map(t => t.artist).filter(Boolean);
+  const discovery = await _buildDiscovery(seedIds, seedArtists, discoveryCount, verdict);
+
+  let out = _excludeDisliked(_excludePlayed([...base, ...discovery]));
+  if (!out.length && pool.length)    out = _excludeDisliked([...pool]);
+  if (!out.length && anchors.length) out = _excludeDisliked([...anchors]);
+  return _spaceArtists(_tFlowOn() ? flowOrder(out) : out);
+}
+
 async function buildFeelingPlaylist(feelingKey, sessionTracks = [], limit = 20) {
   const def = FEELING_DEFS[feelingKey];
   if (!def) return [];
+
+  // Learned path: once your reported feeling has drifted meaningfully off the generic
+  // box (enough check-ins + real divergence), build from what you ACTUALLY play when
+  // you feel this way. Until then this is a no-op and the generic band below runs.
+  const prof = _learnedFeelingProfile(feelingKey);
+  if (prof && prof.personalized && prof.learned) {
+    const learned = await _buildLearnedFeeling(prof, sessionTracks, limit);
+    if (learned.length) {
+      console.log(`[Spotify] Feeling "${feelingKey}" → LEARNED (energy=${prof.learned.energy} valence=${prof.learned.valence}, drift=${prof.divergence}, ${prof.samples} check-ins, ${learned.length} tracks)`);
+      return learned;
+    }
+  }
 
   // The feeling's energy/valence window, widened by the Variety tolerance. Used to
   // filter the library pool AND to gate artist/genre-sourced discovery so it can't
@@ -5536,6 +5597,75 @@ function _guessFeeling(centroid) {
     if (score > bestScore) { bestScore = score; best = key; }
   }
   return best;
+}
+
+// Readiness gate constants for learned feelings, shared by the diagnostic and the
+// builder so the Data tab's "personalized" badge means EXACTLY "the learned profile
+// is now driving playback".
+const LEARNED_FEELING_MIN_SAMPLES = 4;     // check-ins before we trust it
+const LEARNED_FEELING_MIN_DRIFT   = 0.12;  // pull off the generic box to be worth it
+const LEARNED_FEELING_HALFLIFE_MS = 45 * 86400000; // recency weighting (taste drifts)
+
+// Raw learned profile for one feeling: the recency-weighted centroid of what you
+// ACTUALLY played when you reported feeling this way, the weighted anchor tracks/
+// artists, and how far that has drifted off the generic FEELING_DEFS box. `info`
+// (trackId → {title,artist}) can be passed to avoid rebuilding it per feeling.
+function _learnedFeelingProfile(feelingKey, info) {
+  const def = FEELING_DEFS[feelingKey];
+  if (!def) return null;
+  if (!info) { info = new Map(); for (const e of combinedHistory()) if (e && e.id && !info.has(e.id)) info.set(e.id, { title: e.title, artist: e.artist }); }
+  const now = Date.now();
+  const entries = _feelingLog.filter(e => e.feeling === feelingKey);
+  const genericE = (def.energy[0]  + def.energy[1])  / 2;
+  const genericV = (def.valence[0] + def.valence[1]) / 2;
+
+  let wE = 0, wV = 0, wB = 0, wsum = 0, bsum = 0;
+  const trackW = new Map(), artistW = new Map();
+  for (const e of entries) {
+    const w = Math.pow(0.5, (now - (e.ts || now)) / LEARNED_FEELING_HALFLIFE_MS);
+    if (e.energy != null && e.valence != null) {
+      wE += e.energy * w; wV += e.valence * w; wsum += w;
+      if (e.bpm) { wB += e.bpm * w; bsum += w; }
+    }
+    for (const id of e.trackIds || []) {
+      trackW.set(id, (trackW.get(id) || 0) + w);
+      const t = info.get(id);
+      if (t && t.artist) { const a = t.artist.toLowerCase(); artistW.set(a, (artistW.get(a) || 0) + w); }
+    }
+  }
+  const learned = wsum ? { energy: Math.round(wE / wsum), valence: Math.round(wV / wsum), bpm: bsum ? Math.round(wB / bsum) : null } : null;
+  const divergence = learned
+    ? +_clusterDist({ energy: learned.energy, valence: learned.valence, bpm: null }, { energy: genericE, valence: genericV, bpm: null }).toFixed(3)
+    : null;
+  return {
+    key: feelingKey, label: def.label, emoji: def.emoji,
+    samples: entries.length,
+    generic: { energy: Math.round(genericE), valence: Math.round(genericV) },
+    learned, divergence,
+    personalized: divergence != null && entries.length >= LEARNED_FEELING_MIN_SAMPLES && divergence >= LEARNED_FEELING_MIN_DRIFT,
+    trackW, artistW, info,
+  };
+}
+
+// Learned-feeling profiles formatted for the Data tab (display fields, no Maps).
+function computeLearnedFeelings() {
+  const info = new Map();
+  for (const e of combinedHistory()) if (e && e.id && !info.has(e.id)) info.set(e.id, { title: e.title, artist: e.artist });
+  const out = [];
+  for (const key of Object.keys(FEELING_DEFS)) {
+    const p = _learnedFeelingProfile(key, info);
+    const topTracks = [...p.trackW.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4)
+      .map(([id]) => info.get(id)).filter(Boolean).map(t => `${t.title} — ${t.artist}`);
+    const genreW = {};
+    for (const [a, w] of p.artistW) { const m = _trackMacroGenres({ artist: a }); if (m) for (const k of m) genreW[k] = (genreW[k] || 0) + w; }
+    const genres = Object.entries(genreW).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k]) => GENRE_BUCKET_BY_KEY[k]?.name || k);
+    out.push({
+      key: p.key, label: p.label, emoji: p.emoji, samples: p.samples,
+      generic: p.generic, learned: p.learned, divergence: p.divergence,
+      personalized: p.personalized, genres, topTracks,
+    });
+  }
+  return out.sort((a, b) => b.samples - a.samples);
 }
 
 // How many of the user's OWN songs the currently-active mood/vibe/feeling is
@@ -6056,6 +6186,7 @@ function buildDataDiagnostics() {
     },
     vibe,
     context: ctx ? { slot: ctx.timeSlot || null, suggestedMood: ctx.suggestedMoodName || null, suggestedEmoji: ctx.suggestedMoodEmoji || null } : null,
+    feelings: safe(computeLearnedFeelings, []),
     smartQueue,
     tuning: { ..._tuning },
     lastfm: !!_lastfmKey(),

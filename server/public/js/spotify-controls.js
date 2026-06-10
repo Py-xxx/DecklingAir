@@ -3458,6 +3458,31 @@ export function renderSpotifyInsights(ctrl) {
     }
     html += _section('Right now', nowInner);
 
+    // Learned feelings (measurement: how far your reported feelings drift from the
+    // generic energy×mood boxes — the signal for whether a personal feeling-play
+    // mode is worth building).
+    const feelings = (d.feelings || []).filter(f => f.samples > 0);
+    if (feelings.length) {
+      let fi = `<div class="sp-data-sub">From your "how do you feel?" check-ins. <b>Personalized</b> feelings now play from your own songs; the rest use the generic band until they drift far enough.</div><div class="sp-data-feelings">`;
+      for (const f of feelings) {
+        const tag = f.personalized ? '<span class="sp-data-feel-tag on">personalized · live</span>'
+                  : (f.samples >= 4 ? '<span class="sp-data-feel-tag">on the box</span>'
+                                    : '<span class="sp-data-feel-tag dim">learning</span>');
+        let detail = '';
+        if (f.learned) {
+          detail += `<div class="sp-data-feel-cmp">you: <b>⚡${f.learned.energy} ☺${f.learned.valence}</b> · generic: ⚡${f.generic.energy} ☺${f.generic.valence}${f.divergence != null ? ` · drift <b>${f.divergence}</b>` : ''}</div>`;
+        }
+        if (f.genres && f.genres.length) detail += `<div class="sp-data-feel-genres">leans ${_esc(f.genres.join(' / '))}</div>`;
+        if (f.topTracks && f.topTracks.length) detail += `<div class="sp-data-feel-anchors">${_esc(f.topTracks.slice(0, 3).join(' · '))}</div>`;
+        fi += `<div class="sp-data-feel">
+          <div class="sp-data-feel-head"><span class="sp-data-feel-name">${f.emoji} ${_esc(f.label)}</span><span class="sp-data-feel-n">${f.samples} check-in${f.samples === 1 ? '' : 's'}</span>${tag}</div>
+          ${detail}
+        </div>`;
+      }
+      fi += `</div>`;
+      html += _section('Your feelings (learned vs generic)', fi);
+    }
+
     // Smart queue
     const sqLines = [
       `Smart Queue: <b>${sq.enabled ? 'on' : 'off'}</b>${sq.running ? ' · running' : ' · idle'}`,

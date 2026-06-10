@@ -2851,6 +2851,23 @@
   background: var(--bg-3, #0f0f0f); border-radius: 12px; padding: 3px 9px;
 }
 .sp-data-bucket b { color: var(--text, #fff); }
+.sp-data-feelings { display: flex; flex-direction: column; gap: 6px; }
+.sp-data-feel {
+  background: var(--bg-3, #0f0f0f); border-radius: 8px; padding: 7px 9px;
+}
+.sp-data-feel-head { display: flex; align-items: center; gap: 8px; }
+.sp-data-feel-name { font-size: 13px; font-weight: 700; color: var(--text, #fff); }
+.sp-data-feel-n { font-size: 10px; color: var(--text-3, #888); }
+.sp-data-feel-tag {
+  margin-left: auto; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+  padding: 2px 7px; border-radius: 10px; background: rgba(255,255,255,0.07); color: var(--text-3, #888);
+}
+.sp-data-feel-tag.on { background: rgba(29,185,84,0.18); color: var(--sp-green, #1DB954); }
+.sp-data-feel-tag.dim { opacity: 0.7; }
+.sp-data-feel-cmp { font-size: 11px; color: var(--text-2, #aaa); margin-top: 4px; }
+.sp-data-feel-cmp b { color: var(--text, #fff); }
+.sp-data-feel-genres { font-size: 10px; color: var(--sp-green, #1DB954); margin-top: 2px; }
+.sp-data-feel-anchors { font-size: 10px; color: var(--text-3, #888); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sp-data-line { font-size: 12px; color: var(--text-2, #aaa); padding: 2px 0; }
 .sp-data-line b { color: var(--text, #fff); }
 .sp-data-line.sp-data-dim { color: var(--text-3, #888); }
