@@ -3675,8 +3675,8 @@ export function renderSpotifyIntelligence(ctrl) {
         <div class="sp-intel-predict" style="display:none">
           <span class="sp-intel-predict-emoji"></span>
           <div class="sp-intel-predict-info">
-            <div class="sp-intel-predict-name sp-marquee-loop"><span>—</span></div>
-            <div class="sp-intel-predict-sub sp-marquee-loop"><span></span></div>
+            <div class="sp-intel-predict-name"><span>—</span></div>
+            <div class="sp-intel-predict-sub"><span></span></div>
             <div class="sp-intel-predict-artists sp-marquee-loop" style="display:none"><span></span></div>
             <div class="sp-intel-predict-bars" style="display:none">
               <span class="sp-intel-predict-bar" title="Energy"><i class="sp-intel-predict-bar-e"></i></span>
