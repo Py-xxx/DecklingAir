@@ -3569,9 +3569,13 @@ async function _sqBuildSpotifyAnchors(count) {
 
   const filtered = _excludeDisliked(tracks || []).filter(t =>
     t && t.id && !_sq.noRepeat.has(t.id) && !_isRecentlyPlayed(t.id));
-  // Variety also gates the discovery spine: low variety keeps anchors close to the
-  // seed's sound, high variety lets them roam.
-  return _sqVarietyGate(filtered, seedId);
+  // Gate the discovery spine to the active mood/genre target. Without this the spine
+  // (≈half the queue) ignored the target entirely — e.g. a "Rock" mix spine full of
+  // off-genre, off-mood library picks. On-target leads; unjudgeable trail as filler.
+  const targeted = _gateToActiveTarget(filtered);
+  // Variety also gates the spine: low variety keeps anchors close to the seed's
+  // sound, high variety lets them roam.
+  return _sqVarietyGate(targeted, seedId);
 }
 
 // Plan the interleaving: keep the Spotify anchors in fixed order and insert our
@@ -4718,6 +4722,32 @@ function _activeVibeVerdict() {
   return null;
 }
 
+// Gate a candidate list to the active continuous target — genre (mix) AND mood.
+// Tracks KNOWN to be off-genre or off-mood are dropped; on-target tracks lead; tracks
+// we can't judge (no genre data / no audio features) trail as filler so a thin pool
+// never starves the queue. Used to stop the discovery spine from ignoring the target.
+function _gateToActiveTarget(tracks) {
+  const genreKey = (_sq && _sq.source === 'mix' && _activeMixTarget && _activeMixTarget.genre) || null;
+  const verdict  = _activeVibeVerdict();
+  if (!genreKey && !verdict) return tracks || [];
+  const onTarget = [], filler = [];
+  for (const t of tracks || []) {
+    let unknown = false;
+    if (genreKey) {
+      const macros = _trackMacroGenres(t);
+      if (macros && !macros.has(genreKey)) continue;     // known wrong genre → drop
+      if (macros == null) unknown = true;                // genre not resolved yet → filler
+    }
+    if (verdict) {
+      const v = verdict(t);
+      if (v === false) continue;                          // known off-mood → drop
+      if (v === null) unknown = true;                     // unjudgeable mood → filler
+    }
+    (unknown ? filler : onTarget).push(t);
+  }
+  return [...onTarget, ...filler];
+}
+
 // Warm features (bounded) for candidates we can't yet judge, then split into
 // on-vibe and unknown buckets — dropping anything known to be off-vibe. On-vibe
 // tracks come first; unknowns (genuinely new, unjudgeable) only fill the remainder
@@ -4880,6 +4910,10 @@ async function buildMixFromTarget(target, limit = 20) {
   const discovery = await _buildDiscovery(seedIds, seedArtists, discoveryCount, verdict, seedGenres);
 
   let all = _excludeDisliked(_excludePlayed([...base, ...discovery]));
+  // Discovery is seeded from the genre but artist-similar can still drift off-genre.
+  // Drop any pick we KNOW is off-genre (genuinely-new/unknown tracks pass through);
+  // the base pool is already on-genre so this only trims off-genre discovery.
+  if (genreKey) all = all.filter(t => { const m = _trackMacroGenres(t); return m == null || m.has(genreKey); });
   // A valid target with real nearby history should never come back empty.
   if (!all.length && pool.length) all = _excludeDisliked([...pool]);
   return _spaceArtists(_tFlowOn() ? flowOrder(all) : all);
