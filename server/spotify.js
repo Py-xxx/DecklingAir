@@ -5971,6 +5971,93 @@ function buildInsightsPayload() {
   };
 }
 
+// Read-only diagnostics for the "Data" tab — everything the smart queue knows about
+// the user and how it's being used to shape the queue. Pure in-memory, no network.
+function buildDataDiagnostics() {
+  const safe = (fn, fb) => { try { return fn(); } catch (e) { console.error('[Data] section failed:', e.message); return fb; } };
+  const hist = safe(combinedHistory, []);
+  const withFeat = hist.filter(e => e && e.energy != null).length;
+
+  // Per-artist play counts → top artists, blended with learned taste + rating + genre.
+  const plays = new Map();
+  for (const e of hist) if (e && e.artist) { const k = e.artist.toLowerCase(); plays.set(k, (plays.get(k) || 0) + 1); }
+  const topArtists = [...plays.entries()]
+    .map(([name, p]) => ({
+      name,
+      plays: p,
+      taste: _artistTaste.get(name) || 0,
+      rating: _artistRating.has(name) ? _artistRating.get(name) : null,
+      loved: safe(() => _isLovedArtist(name), false),
+      genres: [..._macroGenresOf(_artistGenres.get(name) || [])].map(k => GENRE_BUCKET_BY_KEY[k]?.name || k),
+    }))
+    .sort((a, b) => (b.taste - a.taste) || (b.plays - a.plays))
+    .slice(0, 15);
+
+  const ratingCounts = { love: 0, like: 0, dislike: 0, never: 0 };
+  for (const v of _artistRating.values()) {
+    if (v === 2) ratingCounts.love++; else if (v === 1) ratingCounts.like++;
+    else if (v === -1) ratingCounts.dislike++; else if (v === -2) ratingCounts.never++;
+  }
+
+  const fav   = safe(_favorites, { lovedArtists: new Set(), topTracks: new Set() });
+  const genre = safe(computeGenreProfile, { ready: false, buckets: [], known: 0, total: 0, pending: 0 });
+  const ctx   = safe(detectCurrentContext, null);
+  const dom   = safe(_currentDominantGenre, null);
+
+  const vibe = (_currentCentroid && _currentCentroid.energy != null) ? {
+    clusterSize: _currentCluster.length,
+    energy:  Math.round(_currentCentroid.energy),
+    valence: Math.round(_currentCentroid.valence),
+    bpm:     _currentCentroid.bpm ? Math.round(_currentCentroid.bpm) : null,
+    genre:   dom ? (GENRE_BUCKET_BY_KEY[dom]?.name || dom) : null,
+  } : null;
+
+  const mix = _activeMixState();
+  const smartQueue = {
+    enabled: _smartQueueEnabled,
+    running: !!_sq,
+    source:  _sq ? _sq.source : null,
+    windowSize: (_sq && Array.isArray(_sq.window)) ? _sq.window.length : 0,
+    poolSize: safe(_activePoolSize, null),
+    activeLabel: mix ? mix.label : (_activeMoodKey || _activeVibeKey || (_activeFeeling && _activeFeeling.label) || null),
+    activeGenre: (mix && mix.genre) ? (GENRE_BUCKET_BY_KEY[mix.genre]?.name || mix.genre) : null,
+  };
+
+  return {
+    library: {
+      total: hist.length,
+      withFeatures: withFeat,
+      own: _history.length,
+      seeded: _seededHistory.length,
+      librarySeeds: _librarySeeds.length,
+      sessions: _sessions.length,
+      featuresCached: _audioFeaturesCache.size,
+    },
+    taste: {
+      artistsLearned: _artistTaste.size,
+      rated: _artistRating.size,
+      ratingCounts,
+      dislikedTracks: _trackDislikes.size,
+      transitions: _transitions.size,
+      lovedArtists: fav.lovedArtists.size,
+      topTracks: fav.topTracks.size,
+      topArtists,
+    },
+    genres: {
+      ready: genre.ready,
+      known: genre.known, total: genre.total, pending: genre.pending,
+      tagged: _artistGenres.size,
+      buckets: genre.buckets,
+    },
+    vibe,
+    context: ctx ? { slot: ctx.timeSlot || null, suggestedMood: ctx.suggestedMoodName || null, suggestedEmoji: ctx.suggestedMoodEmoji || null } : null,
+    smartQueue,
+    tuning: { ..._tuning },
+    lastfm: !!_lastfmKey(),
+    genreFlow: { weight: +_tGenreFlowWeight().toFixed(3) }, // how strongly genre shapes transitions now
+  };
+}
+
 function buildStats() {
   const tracks = _sessionStats.tracksPlayed;
 
@@ -7049,6 +7136,16 @@ function init(io) {
       } catch (err) {
         console.error('[Spotify] get_insights error:', err.message);
         socket.emit('spotify:insights', { error: err.message });
+      }
+    });
+
+    // ----- spotify:get_data -----  (Data tab: read-only diagnostics)
+    socket.on('spotify:get_data', () => {
+      try {
+        socket.emit('spotify:data', buildDataDiagnostics());
+      } catch (err) {
+        console.error('[Spotify] get_data error:', err.message);
+        socket.emit('spotify:data', { error: err.message });
       }
     });
 

@@ -2766,6 +2766,63 @@
 }
 .sp-ins-mixmap-chip-rename:hover { color: var(--text, #fff); }
 
+/* ---------- DATA TAB (read-only diagnostics) ---------- */
+.sp-ins-data { display: flex; flex-direction: column; gap: 12px; }
+.sp-data-section {
+  background: var(--bg-2, #161616);
+  border: 1px solid var(--sp-border, rgba(255,255,255,0.07));
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.sp-data-head {
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--sp-green, #1DB954); margin-bottom: 8px;
+}
+.sp-data-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+}
+.sp-data-stat {
+  display: flex; flex-direction: column; align-items: center;
+  background: var(--bg-3, #0f0f0f); border-radius: 8px; padding: 8px 4px;
+}
+.sp-data-num { font-size: 18px; font-weight: 800; color: var(--text, #fff); line-height: 1.1; }
+.sp-data-lbl { font-size: 10px; color: var(--text-3, #888); text-align: center; margin-top: 2px; }
+.sp-data-sub {
+  font-size: 10px; color: var(--text-3, #888); text-transform: uppercase; letter-spacing: 0.05em;
+  margin: 10px 0 6px;
+}
+.sp-data-ratings { display: flex; gap: 10px; margin-top: 8px; font-size: 12px; color: var(--text-2, #aaa); }
+.sp-data-artists { display: flex; flex-direction: column; gap: 4px; }
+.sp-data-artist {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding: 4px 6px; background: var(--bg-3, #0f0f0f); border-radius: 6px;
+}
+.sp-data-artist-name { font-size: 12px; font-weight: 600; color: var(--text, #fff); text-transform: capitalize; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sp-data-artist-name.loved { color: var(--sp-green, #1DB954); }
+.sp-data-artist-meta { font-size: 10px; color: var(--text-3, #888); white-space: nowrap; flex-shrink: 0; text-transform: capitalize; }
+.sp-data-cover { display: flex; flex-direction: column; gap: 5px; }
+.sp-data-cover-bar { height: 8px; background: var(--bg-3, #0f0f0f); border-radius: 4px; overflow: hidden; }
+.sp-data-cover-bar i { display: block; height: 100%; background: var(--sp-green, #1DB954); border-radius: 4px; }
+.sp-data-cover-lbl { font-size: 11px; color: var(--text-2, #aaa); }
+.sp-data-buckets { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+.sp-data-bucket {
+  font-size: 11px; color: var(--text-2, #aaa);
+  background: var(--bg-3, #0f0f0f); border-radius: 12px; padding: 3px 9px;
+}
+.sp-data-bucket b { color: var(--text, #fff); }
+.sp-data-line { font-size: 12px; color: var(--text-2, #aaa); padding: 2px 0; }
+.sp-data-line b { color: var(--text, #fff); }
+.sp-data-line.sp-data-dim { color: var(--text-3, #888); }
+.sp-data-warn { font-size: 11px; color: #e0a030; margin-top: 8px; }
+.sp-data-tune {
+  display: grid; grid-template-columns: auto auto; column-gap: 8px;
+  padding: 5px 0; border-top: 1px solid var(--sp-border, rgba(255,255,255,0.05));
+}
+.sp-data-tune:first-child { border-top: 0; }
+.sp-data-tune-name { font-size: 12px; font-weight: 600; color: var(--text, #fff); }
+.sp-data-tune-val { font-size: 12px; font-weight: 700; color: var(--sp-green, #1DB954); text-align: right; }
+.sp-data-tune-desc { grid-column: 1 / -1; font-size: 10px; color: var(--text-3, #888); margin-top: 1px; }
+
 /* ---------- GENRES TAB (genre chips above the shared mood pad) ---------- */
 .sp-ins-genre-chips {
   display: flex;

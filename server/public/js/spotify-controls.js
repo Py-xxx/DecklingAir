@@ -2414,6 +2414,7 @@ export function renderSpotifyInsights(ctrl) {
         <button class="sp-ins-tab" data-tab="portraits">Portraits</button>
         <button class="sp-ins-tab" data-tab="mixes">Mixes</button>
         <button class="sp-ins-tab" data-tab="tuning">Tuning</button>
+        <button class="sp-ins-tab" data-tab="data">Data</button>
       </div>
       <div class="sp-ins-content">
 
@@ -2578,6 +2579,12 @@ export function renderSpotifyInsights(ctrl) {
           </div>
         </div>
 
+        <!-- DATA — read-only diagnostics: what the app knows about you. -->
+        <div class="sp-ins-panel" data-panel="data" style="display:none">
+          <div class="sp-ins-tune-intro">What the smart queue knows about you, and how it shapes your queue. Read-only.</div>
+          <div class="sp-ins-data"></div>
+        </div>
+
       </div>
       <div class="sp-ins-action-feedback" style="display:none"></div>
     </div>
@@ -2604,6 +2611,7 @@ export function renderSpotifyInsights(ctrl) {
       getGenreProfile();
       getMixMap(_selectedGenre === 'any' ? null : _selectedGenre);
     }
+    if (btn.dataset.tab === 'data') socket.emit('spotify:get_data');
   });
 
   // ---- Portraits tab (#9) + time-machine (#5) ----
@@ -3301,6 +3309,118 @@ export function renderSpotifyInsights(ctrl) {
   const _onGenreProfile = (data) => _renderGenreChips(data);
   socket.on('spotify:genre_profile', _onGenreProfile);
 
+  // ---- Data tab (read-only diagnostics) ----
+  const _dataEl = card.querySelector('.sp-ins-data');
+  const _RATE_LABEL = { '2': '❤️ Love', '1': '👍 Like', '-1': '👎 Dislike', '-2': '🚫 Never' };
+  const _TUNE_INFO = {
+    freshness:       ['Fresh vs Familiar', '% of each batch that is new discovery vs your library'],
+    variety:         ['Variety', 'how far it wanders from your core taste'],
+    fadeSmooth:      ['Fade smoothness', 'how closely consecutive tracks must blend (also drives genre-aware transitions)'],
+    moodFlow:        ['Mood lock vs Flow', '0 = lock to the chosen mood, 100 = roam'],
+    skipSensitivity: ['Skip sensitivity', 'how hard an early skip steers away from an artist'],
+    lookahead:       ['Lookahead', 'tracks staged per refill'],
+  };
+  function _stat(num, lbl) {
+    return `<div class="sp-data-stat"><span class="sp-data-num">${num}</span><span class="sp-data-lbl">${lbl}</span></div>`;
+  }
+  function _section(title, inner) {
+    return `<div class="sp-data-section"><div class="sp-data-head">${title}</div>${inner}</div>`;
+  }
+  function _renderData(d) {
+    if (!d || d.error) { _dataEl.innerHTML = `<div class="sp-ins-empty-msg">${d?.error ? _esc(d.error) : 'No data yet.'}</div>`; return; }
+    const lib = d.library || {}, taste = d.taste || {}, g = d.genres || {}, t = d.tuning || {}, sq = d.smartQueue || {};
+    let html = '';
+
+    // Library
+    html += _section('Library the engine draws from', `<div class="sp-data-grid">
+      ${_stat(lib.total ?? 0, 'tracks known')}
+      ${_stat(lib.withFeatures ?? 0, 'with audio features')}
+      ${_stat(lib.own ?? 0, 'your logged plays')}
+      ${_stat(lib.librarySeeds ?? 0, 'saved-library tracks')}
+      ${_stat(lib.sessions ?? 0, 'past sessions')}
+      ${_stat(lib.featuresCached ?? 0, 'features cached')}
+    </div>`);
+
+    // Taste
+    const rc = taste.ratingCounts || {};
+    let tasteInner = `<div class="sp-data-grid">
+      ${_stat(taste.artistsLearned ?? 0, 'artists learned')}
+      ${_stat(taste.lovedArtists ?? 0, 'loved artists')}
+      ${_stat(taste.rated ?? 0, 'rated by you')}
+      ${_stat(taste.dislikedTracks ?? 0, 'disliked tracks')}
+      ${_stat(taste.transitions ?? 0, 'transitions learned')}
+      ${_stat(taste.topTracks ?? 0, 'on-repeat tracks')}
+    </div>`;
+    if (rc.love || rc.like || rc.dislike || rc.never) {
+      tasteInner += `<div class="sp-data-ratings">${[['❤️', rc.love], ['👍', rc.like], ['👎', rc.dislike], ['🚫', rc.never]]
+        .filter(([, n]) => n).map(([e, n]) => `<span>${e} ${n}</span>`).join('')}</div>`;
+    }
+    if ((taste.topArtists || []).length) {
+      tasteInner += `<div class="sp-data-sub">Top artists (by learned taste, then plays)</div><div class="sp-data-artists">`;
+      for (const a of taste.topArtists) {
+        const bits = [`${a.plays}×`];
+        if (a.taste) bits.push(`taste ${a.taste > 0 ? '+' : ''}${a.taste}`);
+        if (a.rating != null && _RATE_LABEL[String(a.rating)]) bits.push(_RATE_LABEL[String(a.rating)]);
+        if (a.genres && a.genres.length) bits.push(a.genres.join('/'));
+        tasteInner += `<div class="sp-data-artist"><span class="sp-data-artist-name${a.loved ? ' loved' : ''}">${_esc(a.name)}</span><span class="sp-data-artist-meta">${_esc(bits.join(' · '))}</span></div>`;
+      }
+      tasteInner += `</div>`;
+    }
+    html += _section('What it has learned about your taste', tasteInner);
+
+    // Genres
+    const pct = g.total ? Math.round((g.known / g.total) * 100) : 0;
+    let genreInner = `<div class="sp-data-cover"><div class="sp-data-cover-bar"><i style="width:${pct}%"></i></div>
+      <span class="sp-data-cover-lbl">${g.known ?? 0}/${g.total ?? 0} artists genre-tagged (${pct}%)${g.pending ? ` · ${g.pending} pending` : ''}</span></div>`;
+    if ((g.buckets || []).length) {
+      genreInner += `<div class="sp-data-buckets">${g.buckets.map(b =>
+        `<span class="sp-data-bucket">${_esc(b.name)} <b>${b.count}</b></span>`).join('')}</div>`;
+    }
+    if (!d.lastfm) genreInner += `<div class="sp-data-warn">⚠ No Last.fm key set — genres can't be resolved.</div>`;
+    html += _section('Genre knowledge', genreInner);
+
+    // Right now
+    let nowInner = '';
+    if (d.vibe) {
+      nowInner += `<div class="sp-data-grid">
+        ${_stat(d.vibe.energy, 'energy')}
+        ${_stat(d.vibe.valence, 'positivity')}
+        ${_stat(d.vibe.bpm ?? '—', 'bpm')}
+        ${_stat(d.vibe.clusterSize, 'songs in vibe')}
+      </div>`;
+      if (d.vibe.genre) nowInner += `<div class="sp-data-line">Current vibe genre: <b>${_esc(d.vibe.genre)}</b></div>`;
+    } else {
+      nowInner += `<div class="sp-data-line sp-data-dim">No vibe detected yet — keep listening.</div>`;
+    }
+    if (d.context && (d.context.suggestedMood || d.context.slot)) {
+      nowInner += `<div class="sp-data-line">Time-of-day guess: <b>${_esc(`${d.context.suggestedEmoji || ''} ${d.context.suggestedMood || d.context.slot}`.trim())}</b></div>`;
+    }
+    html += _section('Right now', nowInner);
+
+    // Smart queue
+    const sqLines = [
+      `Smart Queue: <b>${sq.enabled ? 'on' : 'off'}</b>${sq.running ? ' · running' : ' · idle'}`,
+      sq.source ? `Source: <b>${_esc(sq.source)}</b>` : null,
+      sq.activeLabel ? `Active selection: <b>${_esc(sq.activeLabel)}</b>${sq.activeGenre ? ` (${_esc(sq.activeGenre)})` : ''}` : 'Active selection: <b>none</b>',
+      sq.poolSize != null ? `Drawing from <b>${sq.poolSize}</b> of your songs` : null,
+      sq.windowSize ? `Queue window: <b>${sq.windowSize}</b> slots` : null,
+      d.genreFlow ? `Genre-aware transitions: weight <b>${d.genreFlow.weight}</b>` : null,
+    ].filter(Boolean);
+    html += _section('Smart queue state', sqLines.map(l => `<div class="sp-data-line">${l}</div>`).join(''));
+
+    // Tuning
+    const tuneInner = Object.keys(_TUNE_INFO).map(k => {
+      const [name, desc] = _TUNE_INFO[k];
+      const val = t[k] != null ? (k === 'lookahead' ? t[k] : `${t[k]}%`) : '—';
+      return `<div class="sp-data-tune"><span class="sp-data-tune-name">${name}</span><span class="sp-data-tune-val">${val}</span><span class="sp-data-tune-desc">${desc}</span></div>`;
+    }).join('');
+    html += _section('Tuning (your dials)', tuneInner);
+
+    _dataEl.innerHTML = html;
+  }
+  const _onData = (d) => _renderData(d);
+  socket.on('spotify:data', _onData);
+
   // ---- Main data load ----
   function _loadAll(data) {
     if (!data) return;
@@ -3328,6 +3448,7 @@ export function renderSpotifyInsights(ctrl) {
       socket.off('spotify:continuous_state', _onContinuousState);
       socket.off('spotify:mix_map',         _onMixMap);
       socket.off('spotify:genre_profile',   _onGenreProfile);
+      socket.off('spotify:data',            _onData);
       socket.off('spotify:insights',        _onInsights);
       socket.off('spotify:portraits',       _onPortraits);
       socket.off('spotify:artist_ratings',  _onArtistRatings);
