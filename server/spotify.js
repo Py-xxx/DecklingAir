@@ -94,7 +94,7 @@ const FEATURE_WARM_INTERVAL    = 6 * 60 * 60 * 1000; // re-scan every 6h for new
 // alongside the first interactive player/queue/playlist loads.
 const SEED_START_DELAY         = 8 * 1000;           // history seed: after the first live read settles
 const RECONCILE_START_DELAY    = 60 * 1000;          // away-listening reconcile: 1 min after startup
-const GENRE_BACKFILL_START_DELAY = 3 * 60 * 1000;    // artist-genre backfill: after seed + feature warm kick off
+const GENRE_BACKFILL_START_DELAY = 90 * 1000;        // artist-genre backfill: soon after the history seed lands; it re-reads the DB each pass so library artists are picked up as they warm
 const FEATURE_WARM_DELAY_MS    = 1200;               // gentle pause between each ReccoBeats fetch
 
 const SESSION_PRUNE_DAYS       = 90;
@@ -563,7 +563,7 @@ function loadTasteProfile() {
     for (const [k, v] of Object.entries(obj.slotBias || {})) {
       if (v && typeof v === 'object') _slotBias.set(k, { dE: Number(v.dE) || 0, dV: Number(v.dV) || 0 });
     }
-    console.log(`[Spotify] Loaded taste profile — ${_artistTaste.size} artists, ${_artistRating.size} rated, ${_trackDislikes.size} disliked tracks, ${_transitions.size} transitions, ${_slotBias.size} slot biases`);
+    console.log(`[Spotify] Loaded taste profile — ${_artistTaste.size} artists, ${_artistRating.size} rated, ${_trackDislikes.size} disliked tracks, ${_transitions.size} transitions, ${_slotBias.size} slot biases, ${_artistGenres.size} genre-tagged artists`);
   } catch (err) {
     console.error('[Spotify] loadTasteProfile error:', err.message);
   }
@@ -2060,6 +2060,23 @@ function _applyTasteBias(tracks) {
     .map(x => x.t);
 }
 
+// Taste-WEIGHTED random pick of n tracks. Unlike _applyTasteBias (a hard sort that
+// always leads with your most-loved songs → the same picks every session), this gives
+// loved/rated artists higher ODDS while keeping genuine randomness, so a mix surfaces
+// DIFFERENT on-taste songs each time. Efraimidis–Spirakis weighted reservoir keys:
+// key = random^(1/weight); higher weight ⇒ key skews toward 1 ⇒ more likely chosen.
+function _tasteWeightedPick(tracks, n) {
+  if (!tracks || tracks.length <= n) return (tracks || []).slice();
+  return tracks
+    .map(t => {
+      const w = 1 + Math.max(0, _artistBoost(t.artist));            // 1 (unrated) … 9 (Loved)
+      return { t, k: Math.pow(Math.random() || 1e-9, 1 / w) };
+    })
+    .sort((a, b) => b.k - a.k)
+    .slice(0, n)
+    .map(x => x.t);
+}
+
 // Judge how the user felt about the track that just ended, from how much of it
 // they heard. `prev` is the previous poll's serialized state (the outgoing track).
 //   • finished / ≥80%      → engaged → +1 artist score, forgive past skips
@@ -2730,61 +2747,93 @@ async function _lastfmArtistTags(name) {
   if (!data || typeof data !== 'object') return [];
   if (data.error) return data.error === 6 ? [] : null; // 6 = artist not found (cache the miss)
   const tags = (data.toptags && data.toptags.tag) || [];
-  // Keep the meaningful tags only (count is 0–100 popularity); cap for tidiness.
+  // Keep a generous set of tags (count is 0–100 popularity) — we'd rather over-capture
+  // genre signal than miss it. Non-genre tags ("seen live", moods) are harmless: the
+  // bucket rollup only matches genre keywords and ignores the rest.
   return tags
-    .filter(t => t && t.name && (Number(t.count) || 0) >= 10)
-    .slice(0, 12)
+    .filter(t => t && t.name && (Number(t.count) || 0) >= 5)
+    .slice(0, 20)
     .map(t => String(t.name).toLowerCase());
 }
 
 // Backfill artist genres for the Genres tab via Last.fm (Spotify won't supply them).
-// Walks the distinct artist names across your history/library, resolves each to its
-// Last.fm genre tags, and caches permanently to disk (by name). Throttled and run in
-// bounded passes that reschedule until everything is covered — local-first friendly.
-const GENRE_BACKFILL_PER_PASS = 40;        // artists resolved per pass
-const GENRE_BACKFILL_GAP      = 250;       // ms between Last.fm calls (~4/sec, polite)
-const GENRE_BACKFILL_PASS_DELAY = 30 * 1000;
+// Goal: EVERY artist in the local DB gets a genre attached — we'd rather over-fetch
+// than under-cover. Walks the distinct artist names across history/seeds/library,
+// resolves each to its Last.fm genre tags, caches permanently to disk (by name), and
+// keeps running: bounded passes until everything's resolved, then a periodic re-scan
+// that picks up any newly-played artists. Throttled + rate-limit-gated (local-first).
+const GENRE_BACKFILL_PER_PASS = 50;        // artists resolved per pass
+const GENRE_BACKFILL_GAP      = 200;       // ms between Last.fm calls (~5/sec, polite)
+const GENRE_BACKFILL_PASS_DELAY = 8 * 1000;     // gap between active passes (fast warmup)
+const GENRE_RESCAN_INTERVAL     = 20 * 60 * 1000; // idle re-scan for new artists
+
+// Every distinct artist name across the whole local DB (history + seeds + library).
+function _allLocalArtistNames() {
+  const names = new Set();
+  for (const e of combinedHistory()) {
+    if (!e.artist) continue;
+    for (const part of e.artist.split(', ')) {
+      const n = part.trim().toLowerCase();
+      if (n) names.add(n);
+    }
+  }
+  return names;
+}
+
 async function backfillArtistGenres() {
   _genreBackfillTimer = null;
   try {
     if (!_lastfmKey()) {
-      console.log('[Spotify] Genre backfill skipped — no Last.fm API key (set LASTFM_API_KEY or "lastfmApiKey" in spotify-config.json)');
+      console.log('[Genre] Backfill skipped — no Last.fm API key (set it in Settings → Spotify, LASTFM_API_KEY, or "lastfmApiKey" in spotify-config.json)');
       return;
     }
-    // Distinct, still-unresolved artist names (individual, comma-split) from history.
-    const names = [];
-    const seen = new Set();
-    for (const e of combinedHistory()) {
-      if (!e.artist) continue;
-      for (const part of e.artist.split(', ')) {
-        const n = part.trim().toLowerCase();
-        if (n && !seen.has(n) && !_artistGenres.has(n)) { seen.add(n); names.push(n); }
-      }
-    }
-    if (!names.length) {
-      console.log(`[Spotify] Genre backfill complete — ${_artistGenres.size} artists covered`);
+    const all = _allLocalArtistNames();
+    const total = all.size;
+    const pending = [...all].filter(n => !_artistGenres.has(n));
+    const covered = total - pending.length;
+    const pct = total ? Math.round((covered / total) * 100) : 100;
+
+    // Fully saturated → idle re-scan so newly-played artists still get covered later.
+    if (!pending.length) {
+      console.log(`[Genre] ✓ Saturated — all ${total} local-DB artists have a genre (100%). Re-scanning in ${Math.round(GENRE_RESCAN_INTERVAL / 60000)} min for any new ones.`);
+      _genreBackfillTimer = setTimeout(backfillArtistGenres, GENRE_RESCAN_INTERVAL);
       return;
     }
-    let fetched = 0;
-    for (const name of names.slice(0, GENRE_BACKFILL_PER_PASS)) {
+    if (_spotifyRateLimited()) {
+      console.log(`[Genre] Rate-limited — pausing backfill (${covered}/${total} = ${pct}% covered, ${pending.length} pending).`);
+      _genreBackfillTimer = setTimeout(backfillArtistGenres, GENRE_BACKFILL_PASS_DELAY * 4);
+      return;
+    }
+
+    const batch = pending.slice(0, GENRE_BACKFILL_PER_PASS);
+    console.log(`[Genre] Resolving ${batch.length} of ${pending.length} pending artists (currently ${covered}/${total} = ${pct}% covered)…`);
+    let got = 0, tagged = 0, empty = 0;
+    for (const name of batch) {
       const tags = await _lastfmArtistTags(name);
-      if (tags === null) break;          // transient error — resume next pass
-      _artistGenres.set(name, tags);     // store [] for misses so we don't refetch
-      fetched++;
+      if (tags === null) { console.log(`[Genre]   · "${name}" — transient error, will retry next pass`); break; }
+      _artistGenres.set(name, tags);      // store [] for misses too, so we don't spin
+      got++;
+      if (tags.length) {
+        tagged++;
+        const buckets = [..._macroGenresOf(tags)];
+        console.log(`[Genre]   + ${name} → ${tags.slice(0, 4).join(', ')}${buckets.length ? `  ⇒ [${buckets.join(', ')}]` : '  ⇒ (no bucket match)'}`);
+      } else {
+        empty++;
+        console.log(`[Genre]   + ${name} → (no Last.fm tags)`);
+      }
       await new Promise(r => setTimeout(r, GENRE_BACKFILL_GAP));
     }
-    if (fetched) {
+    if (got) {
       _scheduleTasteSave();
-      console.log(`[Spotify] Genre backfill via Last.fm — +${fetched} artists (${names.length - fetched} remaining, ${_artistGenres.size} covered)`);
-      // Push fresh chips to any open Genres tab as coverage grows.
+      const nowCovered = covered + got;
+      console.log(`[Genre] Pass done: +${got} resolved (${tagged} tagged, ${empty} blank) → ${nowCovered}/${total} = ${Math.round((nowCovered / total) * 100)}% covered, ${total - nowCovered} pending.`);
       if (_io) { try { _io.emit('spotify:genre_profile', computeGenreProfile()); } catch { /* non-fatal */ } }
     }
-    // More to resolve (or we bailed on a transient error) → schedule the next pass.
-    if (names.length > fetched) {
-      _genreBackfillTimer = setTimeout(backfillArtistGenres, GENRE_BACKFILL_PASS_DELAY);
-    }
+    // Keep going every pass until saturated, then the top branch flips to re-scan.
+    _genreBackfillTimer = setTimeout(backfillArtistGenres, GENRE_BACKFILL_PASS_DELAY);
   } catch (err) {
-    console.error('[Spotify] backfillArtistGenres error:', err.message);
+    console.error('[Genre] backfillArtistGenres error:', err.message);
+    _genreBackfillTimer = setTimeout(backfillArtistGenres, GENRE_RESCAN_INTERVAL); // recover later
   }
 }
 
@@ -2835,6 +2884,44 @@ function computeGenreProfile() {
     total,
     pending: total - known,            // artists still awaiting genre backfill
   };
+}
+
+// Spotify's `genre:"…"` search filter still works for this app even though the
+// artist genres field is stripped — it's a search-index feature, not artist data.
+// We use it two ways: as a source of CONFIRMED on-genre discovery, and to build
+// genre data — stamping each result's (still-unresolved) artists with the searched
+// genre so the strict filter recognises them. Last.fm-resolved artists are left
+// untouched (artist-level tags are more authoritative than a single search hit).
+function _stampArtistGenre(artists, genreSeed) {
+  let added = 0;
+  for (const a of artists || []) {
+    if (!a || !a.name) continue;
+    const k = a.name.toLowerCase();
+    if (!_artistGenres.has(k)) { _artistGenres.set(k, [genreSeed]); added++; }
+  }
+  if (added) _scheduleTasteSave();
+}
+
+// Fetch fresh tracks Spotify classifies in a macro-genre bucket (confirmed on-genre),
+// stamping their artists into the genre map as a side effect. Excludes given ids.
+async function _genreSearchTracks(bucketKey, count, excludeIds = new Set()) {
+  const bucket = GENRE_BUCKET_BY_KEY[bucketKey];
+  if (!bucket || count <= 0 || _spotifyRateLimited()) return [];
+  const out = [];
+  const seen = new Set(excludeIds);
+  for (const g of bucket.seeds) {
+    if (out.length >= count) break;
+    try {
+      const res = await search(`genre:"${g}"`, 'track', 10, Math.floor(Math.random() * 250));
+      for (const t of (res?.tracks?.items || [])) {
+        if (!t || !t.id || seen.has(t.id)) continue;
+        seen.add(t.id);
+        _stampArtistGenre(t.artists, g);  // build genre data from the confirmed search
+        out.push(serializeTrack(t));
+      }
+    } catch (err) { /* non-fatal — genre search is best-effort */ }
+  }
+  return out;
 }
 
 // All track IDs the user already knows (everything in their listening history).
@@ -3548,16 +3635,24 @@ async function _sqBuildSpotifyAnchors(count) {
   // Only top up from the API when local can't fill the window AND we're outside the
   // cooldown — and never while rate-limited. This keeps API-backed discovery rare
   // and well-spaced, which is the whole point of local-first.
+  const genreKey = (_sq && _sq.source === 'mix' && _activeMixTarget && _activeMixTarget.genre) || null;
   const needApi = tracks.length < count;
   const cooled  = Date.now() - _sqLastApiAnchorFetch > SQ_API_ANCHOR_COOLDOWN;
   if (needApi && cooled && !_spotifyRateLimited()) {
     try {
-      const artistBreadth = 1 + Math.round(_tVariety() * 3);              // 1–4 seed artists
-      const seedArtists = (_lastState?.track?.artistIds || []).slice(0, artistBreadth);
-      const raw = await getSimilarTracks(seedId ? [seedId] : [], seedArtists, count + 4);
+      const have = new Set(tracks.map(t => t.id));
+      let raw;
+      if (genreKey) {
+        // Genre mix → top up with CONFIRMED on-genre search results. Artist-similar
+        // would just be dropped by the strict genre gate below, so don't waste it.
+        raw = await _genreSearchTracks(genreKey, count + 4, have);
+      } else {
+        const artistBreadth = 1 + Math.round(_tVariety() * 3);              // 1–4 seed artists
+        const seedArtists = (_lastState?.track?.artistIds || []).slice(0, artistBreadth);
+        raw = await getSimilarTracks(seedId ? [seedId] : [], seedArtists, count + 4);
+      }
       if (raw?.length) {
         _sqLastApiAnchorFetch = Date.now();
-        const have = new Set(tracks.map(t => t.id));
         tracks = [...tracks, ...raw.filter(t => t && t.id && !have.has(t.id))];
       }
     } catch (err) {
@@ -4734,9 +4829,10 @@ function _gateToActiveTarget(tracks) {
   for (const t of tracks || []) {
     let unknown = false;
     if (genreKey) {
+      // STRICT genre: only tracks confirmed in the bucket survive (unknown dropped too),
+      // so the discovery spine can't slip off-genre tracks into a genre mix.
       const macros = _trackMacroGenres(t);
-      if (macros && !macros.has(genreKey)) continue;     // known wrong genre → drop
-      if (macros == null) unknown = true;                // genre not resolved yet → filler
+      if (!macros || !macros.has(genreKey)) continue;
     }
     if (verdict) {
       const v = verdict(t);
@@ -4813,50 +4909,45 @@ function _activeMixState() {
   };
 }
 
-// Auto-vibe steering. As the live listening cluster firms up (the same signal
-// behind the Now Playing confidence bar), lock a Mix target onto its centroid so
-// the smart queue leans into the detected vibe — WITHOUT rebuilding the queue.
-// We only flip the existing session's source to 'mix' and point _activeMixTarget
-// at the centroid; the already-queued slots play out untouched and only future
-// window EXTENDS are steered. Re-steers when the vibe genuinely moves; never
-// overrides an explicit user choice (mood / vibe / feeling / hand-picked mix).
-const AUTO_VIBE_MIN_TRACKS = 5;   // cluster agreement before first auto-lock
-const AUTO_VIBE_RESTEER     = 0.18; // centroid move (0–1) needed to re-point
-function _maybeAutoSteerVibe() {
-  if (!_sq) return;                                              // no queue to steer
-  if (_activeMoodKey || _activeVibeKey || _activeFeeling) return; // user chose explicitly
-  if (_activeMixTarget && !_activeMixTarget.auto) return;         // hand-picked mix wins
-  // Only steer the everyday autoplay paths (search / playlist), or an already
-  // auto-steered mix — never an explicit 'mood'/'vibe'/'mix'/'rightnow' session.
-  const steerable = _sq.source === 'search' || _sq.source === 'playlist' ||
-                    (_sq.source === 'mix' && _activeMixTarget && _activeMixTarget.auto);
-  if (!steerable) return;
-  if (!_currentCentroid || _currentCluster.length < AUTO_VIBE_MIN_TRACKS) return;
+// Drift-disable. The Now Playing card only reflects an EXPLICIT user selection
+// (mix / genre / mood / vibe / feeling) — nothing is ever auto-detected. If the
+// music wanders off that selection for a few tracks in a row (wrong genre, or far
+// from the chosen mood point), we clear it so the card disappears and the queue
+// reverts to plain autoplay. It never re-engages on its own.
+const ACTIVE_DRIFT_MISSES = 3;   // consecutive off-target tracks before we clear
+let _targetMissStreak = 0;
 
-  const c = _currentCentroid;
-  if (_activeMixTarget && _activeMixTarget.auto) {
-    const moved = _clusterDist(
-      { energy: _activeMixTarget.energy, valence: _activeMixTarget.valence, bpm: null },
-      { energy: c.energy, valence: c.valence, bpm: null });
-    if (moved < AUTO_VIBE_RESTEER) {
-      // Same vibe — keep the centroid fresh but don't churn/emit.
-      _activeMixTarget.energy = c.energy;
-      _activeMixTarget.valence = c.valence;
-      return;
-    }
+// Is this track clearly NOT what the user selected? Known-wrong genre, or judgeably
+// outside the chosen mood region. Unknowns (no genre data / no features) don't count.
+function _trackOffActiveTarget(track) {
+  const genreKey = (_sq && _sq.source === 'mix' && _activeMixTarget && _activeMixTarget.genre) || null;
+  if (genreKey) {
+    const macros = _trackMacroGenres(track);
+    if (macros && !macros.has(genreKey)) return true; // known wrong genre
   }
+  const verdict = _activeVibeVerdict();
+  if (verdict && verdict(track) === false) return true; // known off-mood
+  return false;
+}
 
-  const target = {
-    energy: c.energy, valence: c.valence, spread: 0.15,
-    vibeKey: getVibeKey({ energy: c.energy, valence: c.valence }),
-    auto: true,
-  };
-  target.label = _mixTargetLabel(target);
-  const was = _activeMixTarget && _activeMixTarget.auto ? _activeMixTarget.label : null;
-  _activeMixTarget = target;
-  _sq.source = 'mix';   // steer future EXTENDS toward the vibe — no rebuild
-  console.log(`[SmartQueue] ◎ Auto-vibe ${was ? `re-steered ${was} →` : 'locked'} "${target.label}" (energy=${Math.round(c.energy)} valence=${Math.round(c.valence)}) — steering existing queue`);
-  if (_io) _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: null, activeMix: _activeMixState() });
+// Clear whatever the user had selected (and stop the queue claiming it).
+function _disableActiveSelection(reason) {
+  if (!(_activeMixTarget || _activeMoodKey || _activeVibeKey || _activeFeeling)) return;
+  _activeMixTarget = null; _activeMoodKey = null; _activeVibeKey = null; _activeFeeling = null;
+  _targetMissStreak = 0;
+  if (_sq) _sq.source = 'search'; // continue as plain autoplay — no auto re-detect
+  console.log(`[SmartQueue] Active selection cleared — ${reason}`);
+  if (_io) {
+    _io.emit('spotify:continuous_state', { activeMoodKey: null, activeVibeKey: null, activeMix: null });
+    _io.emit('spotify:feeling_expired'); // clears the Now Playing active card
+  }
+}
+
+// Per-track drift check, run as each play lands in the cluster.
+function _checkActiveTargetDrift(track) {
+  if (!(_activeMixTarget || _activeMoodKey || _activeVibeKey || _activeFeeling)) { _targetMissStreak = 0; return; }
+  if (_trackOffActiveTarget(track)) _targetMissStreak++; else _targetMissStreak = 0;
+  if (_targetMissStreak >= ACTIVE_DRIFT_MISSES) _disableActiveSelection('music drifted off the selection');
 }
 
 // ── Unified mix builder ───────────────────────────────────────────────────────
@@ -4869,9 +4960,13 @@ function _maybeAutoSteerVibe() {
 async function buildMixFromTarget(target, limit = 20) {
   if (!target || target.energy == null || target.valence == null) return [];
   const centroid = { energy: target.energy, valence: target.valence, bpm: null };
-  // Base spread (how wide a net around the point) widened by the Variety tuning,
-  // mirroring _vibeRadius so the pad behaves like the discovered clusters.
-  const radius = (target.spread != null ? target.spread : 0.15) + _lerp(0.04, 0.30, _tVariety());
+  // Mood-net width around the point: base spread, WIDENED by Variety, and
+  // tightened/loosened by Mood-Flow (0 = lock hard to the point, 100 = roam). So
+  // every mood-shaping slider actually moves this radius. Floored so it never collapses.
+  const radius = Math.max(0.08,
+    (target.spread != null ? target.spread : 0.15)
+      + _lerp(0.04, 0.30, _tVariety())
+      + _lerp(-0.05, 0.10, _tMoodFlow()));
   const verdict = (t) => _centroidVerdict(t, centroid, radius);
 
   // Optional genre filter: only keep tracks whose artist falls in the bucket.
@@ -4900,20 +4995,32 @@ async function buildMixFromTarget(target, limit = 20) {
   }
   const baseCount = Math.max(1, limit - discoveryCount);
 
-  // Shuffle within the on-target pool, then taste-bias so loved artists surface when
-  // the pool is truncated (identical to the vibe/feeling builders).
-  const base = _applyTasteBias([...pool].sort(() => Math.random() - 0.5)).slice(0, baseCount);
+  // Taste-WEIGHTED random pick from the on-target pool: loved/rated artists get higher
+  // odds, but the selection varies each session — not the same favourites every time.
+  const base = _tasteWeightedPick(pool, baseCount);
 
   const seedSource = base.length ? base : pool;
   const seedIds = [...seedSource].sort(() => Math.random() - 0.5).slice(0, 3).map(t => t.id).filter(Boolean);
   const seedArtists = seedSource.map(t => t.artist).filter(Boolean);
-  const discovery = await _buildDiscovery(seedIds, seedArtists, discoveryCount, verdict, seedGenres);
+
+  // Discovery. For a GENRE mix we source it from Spotify's genre search — those
+  // results are confirmed on-genre, and _genreSearchTracks stamps their artists into
+  // the genre map so the strict filter below recognises them. Otherwise the usual
+  // artist/centroid-seeded discovery.
+  let discovery;
+  if (genreKey) {
+    const excl = new Set([..._knownTrackIdSet(), ..._sessionTrackIds]);
+    const found = await _genreSearchTracks(genreKey, discoveryCount + 4, excl);
+    discovery = _excludeDisliked(found).slice(0, discoveryCount); // already confirmed on-genre
+  } else {
+    discovery = await _buildDiscovery(seedIds, seedArtists, discoveryCount, verdict, seedGenres);
+  }
 
   let all = _excludeDisliked(_excludePlayed([...base, ...discovery]));
-  // Discovery is seeded from the genre but artist-similar can still drift off-genre.
-  // Drop any pick we KNOW is off-genre (genuinely-new/unknown tracks pass through);
-  // the base pool is already on-genre so this only trims off-genre discovery.
-  if (genreKey) all = all.filter(t => { const m = _trackMacroGenres(t); return m == null || m.has(genreKey); });
+  // STRICT genre: keep only tracks confirmed in the bucket. The base pool is already
+  // on-genre and genre-search discovery was just stamped on-genre, so this drops only
+  // unresolved/unknown stragglers — "Rock" means rock, nothing else.
+  if (genreKey) all = all.filter(t => { const m = _trackMacroGenres(t); return m != null && m.has(genreKey); });
   // A valid target with real nearby history should never come back empty.
   if (!all.length && pool.length) all = _excludeDisliked([...pool]);
   return _spaceArtists(_tFlowOn() ? flowOrder(all) : all);
@@ -5498,6 +5605,10 @@ function _findStoredFeatures(trackId) {
 // Called after audio features are merged into a history entry.
 // Tracks the running cluster and fires check-in when confident.
 function _updateCluster(histEntry) {
+  // Drift check runs even for featureless tracks — the genre check is name-based and
+  // an off-genre track shouldn't be ignored just because we lack its audio features.
+  _checkActiveTargetDrift(histEntry);
+
   if (histEntry.energy == null || histEntry.valence == null) {
     console.log(`[Spotify] Cluster: skipping (no audio features) title="${histEntry.title}"`);
     return;
@@ -5521,21 +5632,8 @@ function _updateCluster(histEntry) {
     _currentCentroid = _computeCentroid(_currentCluster);
     _driftBuffer = [];
 
-    // Steer the autoplay toward this firming-up vibe (no queue rebuild) before we
-    // broadcast, so the same intelligence emit carries the freshly-locked mix.
-    _maybeAutoSteerVibe();
-
     // Always emit so the UI counter updates in real time
     _emitIntelligenceState();
-
-    // Check if active feeling's centroid has now drifted too far
-    if (_activeFeeling) {
-      const feelingDist = _clusterDist(_activeFeeling.centroid, _currentCentroid);
-      if (feelingDist > _tDriftThreshold() && _currentCluster.length >= 4) {
-        _activeFeeling = null;
-        if (_io) _io.emit('spotify:feeling_expired');
-      }
-    }
 
     // Trigger check-in when cluster first hits 5 tracks, then every 15 more
     const sz = _currentCluster.length;
@@ -5561,10 +5659,6 @@ function _updateCluster(histEntry) {
         _pendingCheckIn = null;
         if (_io) _io.emit('spotify:checkin_dismiss', { reason: 'vibe_changed' });
       }
-      // Re-steer once the new vibe has firmed up (this fresh cluster is only ~3
-      // tracks, so the old auto-vibe keeps steering until it reaches confidence —
-      // intentional stickiness so a brief detour doesn't yank the queue around).
-      _maybeAutoSteerVibe();
       _emitIntelligenceState();
     }
   }
@@ -6435,45 +6529,6 @@ function init(io) {
 
     // Send the Smart Queue toggle state so the Playback panel renders correctly
     socket.emit('spotify:smart_queue', { enabled: _smartQueueEnabled });
-
-    // ╔══════════════════════════════════════════════════════════════════════╗
-    // ║ TEST PANEL — temporary. To remove completely: delete this whole block  ║
-    // ║ and the file public/test-panel.html. Nothing else references it.       ║
-    // ║ Raw Spotify calls only: search, play one track, read the live queue.   ║
-    // ╚══════════════════════════════════════════════════════════════════════╝
-    socket.on('test:search', async ({ q } = {}) => {
-      try {
-        const res = await search(q || '', 'track', 10);
-        const items = (res?.tracks?.items || []).map(t => ({
-          uri: t.uri,
-          name: t.name,
-          artist: (t.artists || []).map(a => a.name).join(', '),
-          album: t.album?.name || '',
-          art: (t.album?.images || []).slice(-1)[0]?.url || null,
-        }));
-        socket.emit('test:search_results', { items });
-      } catch (err) {
-        socket.emit('test:error', { message: err.message });
-      }
-    });
-    socket.on('test:play', async ({ uri } = {}) => {
-      try {
-        await play({ uris: [uri] });                 // raw Spotify play, nothing else
-        socket.emit('test:played', { uri });
-      } catch (err) {
-        socket.emit('test:error', { message: err.message });
-      }
-    });
-    socket.on('test:get_queue', async () => {
-      try {
-        const q = await getQueue();                  // raw GET /me/player/queue
-        const fmt = (t) => t ? { uri: t.uri, name: t.name, artist: (t.artists || []).map(a => a.name).join(', ') } : null;
-        socket.emit('test:queue', { current: fmt(q?.currently_playing), queue: (q?.queue || []).map(fmt) });
-      } catch (err) {
-        socket.emit('test:error', { message: err.message });
-      }
-    });
-    // ╚════════════════════════════ END TEST PANEL ═══════════════════════════╝
 
     // ----- spotify:cmd -----
     socket.on('spotify:cmd', async ({ action, ...args } = {}) => {

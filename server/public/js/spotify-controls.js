@@ -2413,7 +2413,6 @@ export function renderSpotifyInsights(ctrl) {
         <button class="sp-ins-tab" data-tab="artists">Artists</button>
         <button class="sp-ins-tab" data-tab="portraits">Portraits</button>
         <button class="sp-ins-tab" data-tab="mixes">Mixes</button>
-        <button class="sp-ins-tab" data-tab="genres">Genres</button>
         <button class="sp-ins-tab" data-tab="tuning">Tuning</button>
       </div>
       <div class="sp-ins-content">
@@ -2489,44 +2488,10 @@ export function renderSpotifyInsights(ctrl) {
           <div class="sp-ins-portraits-empty" style="display:none">Keep listening — portraits appear once each part of your day has a few plays.</div>
         </div>
 
-        <!-- MIXES — one unified 2D mood map. Drag the puck anywhere in the
-             energy×mood space (or tap a named quick-pick) and we build a mix
-             targeting that exact point. The heat-cloud is your own listening. -->
+        <!-- MIXES — pick a genre (Hip-Hop, Rock, … or "Any") then drag the mood pad
+             to an exact energy×mood point. The heat-cloud is your own listening,
+             filtered to the chosen genre. Genre × mood, one builder. -->
         <div class="sp-ins-panel" data-panel="mixes" style="display:none">
-          <div class="sp-ins-mood-context"></div>
-          <div class="sp-ins-mixmap-intro">Drag anywhere to pick exactly the kind of music you want. The glow is where you actually listen.</div>
-          <div class="sp-ins-mixmap-wrap">
-            <span class="sp-ins-mixmap-axis sp-ins-mixmap-axis-top">Intense</span>
-            <span class="sp-ins-mixmap-axis sp-ins-mixmap-axis-bottom">Calm</span>
-            <span class="sp-ins-mixmap-axis sp-ins-mixmap-axis-left">Dark</span>
-            <span class="sp-ins-mixmap-axis sp-ins-mixmap-axis-right">Bright</span>
-            <div class="sp-ins-mixmap-pad" tabindex="0" role="slider" aria-label="Mood map">
-              <canvas class="sp-ins-mixmap-heat" width="220" height="220"></canvas>
-              <div class="sp-ins-mixmap-anchors"></div>
-              <div class="sp-ins-mixmap-puck" style="display:none"></div>
-            </div>
-          </div>
-          <div class="sp-ins-mixmap-readout">
-            <span class="sp-ins-mixmap-label">Pick a spot</span>
-            <button class="sp-ins-mixmap-play" disabled>Play this</button>
-          </div>
-          <div class="sp-ins-sub-title sp-ins-mixmap-chips-title" style="display:none">Quick picks</div>
-          <div class="sp-ins-mixmap-chips"></div>
-          <div class="sp-ins-mixmap-empty" style="display:none">
-            <div class="sp-ins-empty-icon">✨</div>
-            <div class="sp-ins-empty-msg">Keep listening to map your sound</div>
-            <div class="sp-ins-empty-sub sp-ins-vibe-progress"></div>
-          </div>
-          <!-- Shared active/stop footer -->
-          <div class="sp-ins-mood-footer" style="display:none">
-            <span class="sp-ins-mood-active-label"></span>
-            <button class="sp-ins-stop-btn sp-ins-mood-stop-btn">Stop</button>
-          </div>
-        </div>
-
-        <!-- GENRES — pick a macro-genre (Hip-Hop, Rock, …) then the same mood pad,
-             but the heat-cloud is filtered to that genre. Genre × mood combined. -->
-        <div class="sp-ins-panel" data-panel="genres" style="display:none">
           <div class="sp-ins-mixmap-intro">Pick a genre, then drag to the mood you want within it. The glow is where your music in that genre sits.</div>
           <div class="sp-ins-genre-chips"></div>
           <div class="sp-ins-genre-empty" style="display:none">
@@ -2627,18 +2592,15 @@ export function renderSpotifyInsights(ctrl) {
   const panels     = card.querySelectorAll('.sp-ins-panel');
   const feedback   = card.querySelector('.sp-ins-action-feedback');
 
-  let _activeTab = 'profile';   // routes mix_map responses to the right pad
   tabBar.addEventListener('click', (e) => {
     const btn = e.target.closest('.sp-ins-tab');
     if (!btn) return;
     tabBar.querySelectorAll('.sp-ins-tab').forEach(t => t.classList.remove('active'));
     btn.classList.add('active');
-    _activeTab = btn.dataset.tab;
     panels.forEach(p => p.style.display = p.dataset.panel === btn.dataset.tab ? '' : 'none');
     if (btn.dataset.tab === 'portraits') socket.emit('spotify:get_portraits');
     if (btn.dataset.tab === 'artists')   socket.emit('spotify:get_artist_ratings');
-    if (btn.dataset.tab === 'mixes')     getMixMap();
-    if (btn.dataset.tab === 'genres') {
+    if (btn.dataset.tab === 'mixes') {
       getGenreProfile();
       getMixMap(_selectedGenre === 'any' ? null : _selectedGenre);
     }
@@ -3136,23 +3098,12 @@ export function renderSpotifyInsights(ctrl) {
     return { render, resetPick() { userPicked = false; } };
   }
 
-  // Mixes tab pad (genre-less). _renderMixMap stays as the thin entry the data-load
-  // and live-update paths already call.
-  const _mixesPad = _createMoodPad(card.querySelector('.sp-ins-panel[data-panel="mixes"]'), {
-    context: true,
-    clusterChips: true,
-    onPlay: (t) => {
-      playMix(t);
-      _showFeedback(`Building "${t.label}"…`);
-      _spToast(`⏳ Loading "${t.label}" — building your queue…`);
-    },
-  });
-  function _renderMixMap(mixMap, context, activeMix) { _mixesPad.render(mixMap, context, activeMix); }
-
-  // ---- Genres tab — genre × mood ----
-  // Genre chips choose the macro-bucket; the pad picks the mood within it; the
-  // heat-cloud is filtered to the selected genre. Play targets { …, genre }.
-  const _genresPanel  = card.querySelector('.sp-ins-panel[data-panel="genres"]');
+  // ---- Mixes tab — genre × mood ----
+  // (Internally still the "genre+mood" pad — it replaced the old genre-less Mixes tab.)
+  // Genre chips choose the macro-bucket ("Any" = no genre filter, the old Mixes
+  // behaviour); the pad picks the mood within it; the heat-cloud is filtered to the
+  // selected genre. Play targets { …, genre }.
+  const _genresPanel  = card.querySelector('.sp-ins-panel[data-panel="mixes"]');
   const _genreChipsEl = card.querySelector('.sp-ins-genre-chips');
   const _genreEmptyEl = card.querySelector('.sp-ins-genre-empty');
   let _selectedGenre = 'any';
@@ -3338,22 +3289,15 @@ export function renderSpotifyInsights(ctrl) {
   const _onContinuousState = (data) => _updateContinuousState(data);
   socket.on('spotify:continuous_state', _onContinuousState);
 
-  // Live mix-map refresh. Routed to whichever pad is showing: a genre-filtered map
-  // (data.genre set) always belongs to the Genres pad; otherwise it follows the
-  // active tab (the "Any" genre map and the Mixes map both have no genre).
-  let _lastContext = null;
+  // Live mix-map refresh → the (only) Mixes pad.
   const _onMixMap = (data) => {
     if (!data) return;
-    if (data.genre || _activeTab === 'genres') {
-      _genresPad.render(data, null, data.activeMix);
-    } else {
-      _renderMixMap(data, _lastContext, data.activeMix);
-    }
+    _genresPad.render(data, null, data.activeMix);
     _updateContinuousState({ activeMix: data.activeMix });
   };
   socket.on('spotify:mix_map', _onMixMap);
 
-  // Genre profile → Genres tab chips.
+  // Genre profile → Mixes tab genre chips.
   const _onGenreProfile = (data) => _renderGenreChips(data);
   socket.on('spotify:genre_profile', _onGenreProfile);
 
@@ -3362,8 +3306,6 @@ export function renderSpotifyInsights(ctrl) {
     if (!data) return;
     _renderProfile(data.profile  || {});
     _renderPatterns(data.patterns || { grid: [], max: 1, blockNames: [], dayNames: [], total: 0 });
-    _lastContext = data.context || null;
-    _renderMixMap(data.mixMap, _lastContext, data.activeMix);
     // Tuning sliders
     if (data.tuning) _applyTuningState(data.tuning);
     // Shared continuous footer
@@ -3653,11 +3595,9 @@ export function renderSpotifyIntelligence(ctrl) {
       vibeRow.style.display    = 'none';
       idleEl.style.display     = 'none';
     } else if (activeMix && activeMix.label) {
-      // Unified mood-map mix — either picked from the pad or auto-detected from
-      // your live listening (auto-steer leans the queue into the current vibe).
+      // Unified mood-map mix the user picked from the Mixes/Genres pad.
       vibeLabelEl.textContent  = activeMix.label;
-      const _tag = activeMix.auto ? 'auto vibe' : 'mix';
-      if (vibeSub) vibeSub.textContent = _poolText ? `${_tag} · ${_poolText} · keeps going ∞` : `${_tag} · keeps going ∞`;
+      if (vibeSub) vibeSub.textContent = _poolText ? `mix · ${_poolText} · keeps going ∞` : `mix · keeps going ∞`;
       vibeRow.style.display    = '';
       feelingRow.style.display = 'none';
       idleEl.style.display     = 'none';
