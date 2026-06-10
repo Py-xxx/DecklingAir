@@ -671,5 +671,53 @@
   </script>
   <script src="/vendor/socket.io.js"></script>
   <script type="module" src="js/app.js"></script>
+
+  <!-- ╔══ TEST PANEL LAUNCHER — temporary. Delete this whole block (and the file ══╗
+       ║ public/test-panel.html + the TEST PANEL block in server/spotify.js) to     ║
+       ║ remove it completely. Floating button opens the panel as an overlay.       ║
+       ╚════════════════════════════════════════════════════════════════════════════╝ -->
+  <style>
+    #tp-launch {
+      position: fixed; right: 14px; bottom: 14px; z-index: 9998;
+      background: #1DB954; color: #07210f; border: none; border-radius: 22px;
+      font: 700 13px system-ui, sans-serif; padding: 9px 15px; cursor: pointer;
+      box-shadow: 0 3px 12px rgba(0,0,0,.5); opacity: .85;
+    }
+    #tp-launch:hover { opacity: 1; }
+    #tp-overlay { position: fixed; inset: 0; z-index: 9999; background: rgba(0,0,0,.6); display: none; }
+    #tp-overlay.open { display: block; }
+    #tp-overlay .tp-frame-wrap {
+      position: absolute; inset: 4%; background: #0a0a0a;
+      border-radius: 12px; overflow: hidden; box-shadow: 0 10px 40px rgba(0,0,0,.7);
+    }
+    #tp-overlay iframe { width: 100%; height: 100%; border: 0; }
+    #tp-close {
+      position: absolute; top: 8px; right: 12px; z-index: 1;
+      background: #222; color: #fff; border: 1px solid rgba(255,255,255,.2);
+      border-radius: 16px; font: 700 13px system-ui; padding: 6px 12px; cursor: pointer;
+    }
+  </style>
+  <button id="tp-launch" title="Open the Spotify test panel">🧪 Test</button>
+  <div id="tp-overlay">
+    <div class="tp-frame-wrap">
+      <button id="tp-close">✕ Close</button>
+      <iframe id="tp-frame" title="Spotify Test Panel"></iframe>
+    </div>
+  </div>
+  <script>
+    (function () {
+      var overlay = document.getElementById('tp-overlay');
+      var frame = document.getElementById('tp-frame');
+      document.getElementById('tp-launch').addEventListener('click', function () {
+        if (!frame.src) frame.src = '/test-panel.html'; // load lazily on first open
+        overlay.classList.add('open');
+      });
+      document.getElementById('tp-close').addEventListener('click', function () {
+        overlay.classList.remove('open');
+      });
+      overlay.addEventListener('click', function (e) { if (e.target === overlay) overlay.classList.remove('open'); });
+    })();
+  </script>
+  <!-- ╚══════════════════════════ END TEST PANEL LAUNCHER ══════════════════════════╝ -->
 </body>
 </html>
