@@ -142,6 +142,7 @@ function _tMoodPad()        { return Math.round(_lerp(-6, _lerp(0, 25, _tVariety
 function _tMoodFlow()       { return _clampNum(_tuning.moodFlow / 100, 0, 1); }     // 0 lock … 1 flow
 function _tDiscoveryGenres(){ return 2 + Math.round(_tVariety() * 3); }            // 2–5 genres searched
 function _tFlowOn()         { return _tuning.fadeSmooth >= 50; }                   // harmonic flow ordering
+function _tGenreFlowWeight(){ return _lerp(0.03, 0.15, _tuning.fadeSmooth / 100); } // how much genre coherence shapes transitions
 function _tDriftThreshold() { return _lerp(0.45, 0.20, _tuning.moodFlow / 100); } // lock → flow
 function _tSkipStrong()     { return _lerp(0.08, 0.25, _tuning.skipSensitivity / 100); }
 function _tSkipSoft()       { return _lerp(0.35, 0.60, _tuning.skipSensitivity / 100); }
@@ -2703,6 +2704,60 @@ function _trackMatchesGenre(track, bucketKey) {
   return macros ? macros.has(bucketKey) : false;
 }
 
+// A track's RAW genre tags (union over its artists' Last.fm tags). Finer-grained
+// than macro buckets — used for transition similarity, where "metalcore↔hardcore"
+// must read as close while "metal↔bedroom pop" reads as far. null = unknown.
+function _trackRawGenres(track) {
+  const raw = (track && track.artist) ? track.artist : '';
+  if (!raw) return null;
+  const candidates = [raw.trim().toLowerCase(), ...raw.split(', ').map(n => n.trim().toLowerCase())];
+  const out = new Set();
+  let known = false;
+  for (const name of candidates) {
+    const tags = _artistGenres.get(name);
+    if (tags) { known = true; for (const g of tags) out.add(g); }
+  }
+  return known ? out : null;
+}
+
+// Soft genre similarity between two tracks: Jaccard overlap of their raw tag sets,
+// 0 (nothing shared) … 1 (identical). null when either side's genre is unknown, so
+// callers treat it as NEUTRAL — an unresolved track is never penalised by genre.
+function _genreSim(a, b) {
+  const A = _trackRawGenres(a), B = _trackRawGenres(b);
+  if (!A || !B || !A.size || !B.size) return null;
+  let inter = 0;
+  for (const g of A) if (B.has(g)) inter++;
+  const union = A.size + B.size - inter;
+  return union ? inter / union : null;
+}
+
+// The dominant macro-genre of what's playing right now (the live cluster) — the
+// "current vibe genre" used to softly steer the normal queue. null when unknown.
+function _currentDominantGenre() {
+  if (!_currentCluster || !_currentCluster.length) return null;
+  const counts = {};
+  for (const e of _currentCluster) {
+    const macros = _trackMacroGenres(e);
+    if (macros) for (const k of macros) counts[k] = (counts[k] || 0) + 1;
+  }
+  let best = null, bestN = 0;
+  for (const k of Object.keys(counts)) if (counts[k] > bestN) { bestN = counts[k]; best = k; }
+  return best;
+}
+
+// Small additive selection nudge: candidates sharing the current vibe's genre get a
+// gentle boost; UNKNOWN-genre tracks get a slight exploration boost so they get
+// played (and resolved by the backfill → DB grows). Never a filter, never a penalty.
+const GENRE_VIBE_BOOST       = 0.05; // on-vibe-genre candidate
+const GENRE_UNKNOWN_EXPLORE  = 0.04; // unresolved-genre candidate (play & learn)
+function _genreVibeBoost(track, dom) {
+  const macros = _trackMacroGenres(track);
+  if (macros == null) return GENRE_UNKNOWN_EXPLORE;     // unknown → explore
+  if (!dom) return 0;
+  return macros.has(dom) ? GENRE_VIBE_BOOST : 0;
+}
+
 // Record genres from FULL Spotify artist objects, keyed by name. Spotify now strips
 // the `genres` field for this app, so this is effectively dormant — kept only so a
 // future restoration (or a different tier) would slot back in for free.
@@ -3476,6 +3531,7 @@ function _sqLibraryCandidates(count) {
   // jitter so the familiar pool reshuffles toward more variety (explore).
   const mode = _engagementMomentum().mode;
   const jitter = mode === 'restless' ? 0.30 : mode === 'locked' ? 0.05 : 0.12;
+  const domGenre = _currentDominantGenre(); // current vibe's genre, computed once
   let maxBoost = 0;
   for (const t of pool) { const b = _artistBoost(t.artist); if (b > maxBoost) maxBoost = b; }
   const ranked = pool.map(t => {
@@ -3487,9 +3543,13 @@ function _sqLibraryCandidates(count) {
     const base = setCloser
       ? artist * 0.40 + ctx * 0.35 + cool * 0.25 + Math.random() * jitter
       : artist * 0.55 + ctx * 0.45 + Math.random() * jitter;
+    // Soft genre vibe: gently favour candidates matching the current vibe's genre,
+    // and slightly favour unknown-genre tracks so they get played & resolved. Small
+    // additive nudge — supporting, never a filter.
+    const gv = _genreVibeBoost(t, domGenre);
     // Explicit "Dislike"/"Never" ratings strongly suppress how often the artist is
     // picked, without ever removing them from the pool entirely.
-    const s = base * _artistRatingMult(t.artist);
+    const s = (base + gv) * _artistRatingMult(t.artist);
     return { t, s };
   });
   ranked.sort((a, b) => b.s - a.s);
@@ -4618,7 +4678,14 @@ function _trackFlowScore(a, b) {
   const base = _camelotScore(a._cam, b._cam) * 0.35 +
                _bpmScore(a.bpm, b.bpm)        * 0.35 +
                _energyScore(a.energy, b.energy) * 0.30;
-  return base + _transitionBias(a, b) * TRANSITION_WEIGHT;
+  let score = base + _transitionBias(a, b) * TRANSITION_WEIGHT;
+  // Soft genre coherence: nudge toward genre-matched transitions and away from the
+  // jarring "same key, opposite genre" ones (a hype track → a sad track that only
+  // lined up harmonically). Centered at 0.5 so it shifts ±weight; UNKNOWN genre →
+  // null → no change, so unresolved tracks are never penalised. Scales with Fade/Smooth.
+  const g = _genreSim(a, b);
+  if (g != null) score += (g - 0.5) * 2 * _tGenreFlowWeight();
+  return score;
 }
 
 // Greedy nearest-neighbour ordering for harmonic, BPM-smooth, energy-smooth playlists.
