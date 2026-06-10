@@ -6436,6 +6436,45 @@ function init(io) {
     // Send the Smart Queue toggle state so the Playback panel renders correctly
     socket.emit('spotify:smart_queue', { enabled: _smartQueueEnabled });
 
+    // ╔══════════════════════════════════════════════════════════════════════╗
+    // ║ TEST PANEL — temporary. To remove completely: delete this whole block  ║
+    // ║ and the file public/test-panel.html. Nothing else references it.       ║
+    // ║ Raw Spotify calls only: search, play one track, read the live queue.   ║
+    // ╚══════════════════════════════════════════════════════════════════════╝
+    socket.on('test:search', async ({ q } = {}) => {
+      try {
+        const res = await search(q || '', 'track', 10);
+        const items = (res?.tracks?.items || []).map(t => ({
+          uri: t.uri,
+          name: t.name,
+          artist: (t.artists || []).map(a => a.name).join(', '),
+          album: t.album?.name || '',
+          art: (t.album?.images || []).slice(-1)[0]?.url || null,
+        }));
+        socket.emit('test:search_results', { items });
+      } catch (err) {
+        socket.emit('test:error', { message: err.message });
+      }
+    });
+    socket.on('test:play', async ({ uri } = {}) => {
+      try {
+        await play({ uris: [uri] });                 // raw Spotify play, nothing else
+        socket.emit('test:played', { uri });
+      } catch (err) {
+        socket.emit('test:error', { message: err.message });
+      }
+    });
+    socket.on('test:get_queue', async () => {
+      try {
+        const q = await getQueue();                  // raw GET /me/player/queue
+        const fmt = (t) => t ? { uri: t.uri, name: t.name, artist: (t.artists || []).map(a => a.name).join(', ') } : null;
+        socket.emit('test:queue', { current: fmt(q?.currently_playing), queue: (q?.queue || []).map(fmt) });
+      } catch (err) {
+        socket.emit('test:error', { message: err.message });
+      }
+    });
+    // ╚════════════════════════════ END TEST PANEL ═══════════════════════════╝
+
     // ----- spotify:cmd -----
     socket.on('spotify:cmd', async ({ action, ...args } = {}) => {
       try {
