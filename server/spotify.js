@@ -132,6 +132,9 @@ function _lerp(a, b, t) { return a + (b - a) * _clampNum(t, 0, 1); }
 
 // Derived engine knobs — every feature reads these, never the raw slider values.
 function _tDiscoveryRatio() { return _clampNum(_tuning.freshness / 100, 0, 0.9); }
+// How many of a `limit`-sized batch should be genuinely-new discovery. Scales with
+// Freshness with NO hard cap (80% Freshness ⇒ ~80% new), leaving ≥1 familiar anchor.
+function _discoveryCount(limit) { return _clampNum(Math.round(limit * _tDiscoveryRatio()), 0, Math.max(1, limit - 1)); }
 function _tVariety()        { return _clampNum(_tuning.variety / 100, 0, 1); }
 // Feeling-band padding. Variety sets the MAX widening (±0–25); moodFlow gates how
 // much of it actually applies. At moodFlow=0 (lock) we even TIGHTEN a little below
@@ -263,15 +266,47 @@ function _addStaged(uris) { for (const u of (uris || [])) if (u) _stagedUris.add
 // songs when a narrow vibe pool ran dry, causing the same track to come back after
 // only 3-5 songs. We hard-block anything in this window from being re-staged.
 let _recentPlayIds = [];
-const RECENT_PLAY_GUARD = 30; // no song repeats until this many others have played
+const RECENT_PLAY_GUARD = 8; // hard floor: no back-to-back repeats within this many plays (tolerance governs the rest)
 function _notePlayed(id) {
   if (!id) return;
+  _notePlayCount(id); // session-play tolerance (survives mood switches)
   const i = _recentPlayIds.indexOf(id);
   if (i !== -1) _recentPlayIds.splice(i, 1); // move to most-recent
   _recentPlayIds.push(id);
   if (_recentPlayIds.length > RECENT_PLAY_GUARD) _recentPlayIds.shift();
 }
 function _isRecentlyPlayed(id) { return !!id && _recentPlayIds.includes(id); }
+
+// ── Repeat tolerance ──────────────────────────────────────────────────────────
+// Instead of hard-banning a song for the rest of the session, each play raises a
+// "tolerance" it must beat to come back. The penalty grows super-linearly with the
+// session play-count, so a 1×-played song needs only a decent fit to return while a
+// 3×-played one needs a near-perfect fit. This breaks the favourites feedback loop
+// (play → score up → play more) and frees room for variety + discovery. Survives
+// mood/mix switches; cleared only by a 30-min silence or the manual Reset button.
+let _sessionPlays = new Map();   // trackId → times played this session
+let _lastPlayTs    = 0;
+const REPEAT_RESET_GAP_MS  = 30 * 60 * 1000; // 30-min break wipes the tolerance
+const REPEAT_PENALTY_BASE  = 0.30;
+const REPEAT_PENALTY_EXP   = 1.8;
+function _notePlayCount(id) {
+  if (!id) return;
+  const now = Date.now();
+  if (_lastPlayTs && now - _lastPlayTs > REPEAT_RESET_GAP_MS) _sessionPlays.clear(); // long break → fresh slate
+  _lastPlayTs = now;
+  _sessionPlays.set(id, (_sessionPlays.get(id) || 0) + 1);
+}
+// Score penalty for replaying a track this session (0 for unplayed).
+function _repeatPenalty(id) {
+  const n = id ? (_sessionPlays.get(id) || 0) : 0;
+  return n > 0 ? REPEAT_PENALTY_BASE * Math.pow(n, REPEAT_PENALTY_EXP) : 0;
+}
+// HARD block: only the last few plays (no back-to-back) and whatever is already staged
+// into the CURRENT window (no double-queue). Everything else is governed by the soft
+// penalty above, so a song CAN recur within a session if it's a strong fit.
+function _repeatBlocked(id) {
+  return !!id && (_isRecentlyPlayed(id) || (_sq && _sq.noRepeat.has(id)));
+}
 
 // ── Adaptive engagement ───────────────────────────────────────────────────────
 // _artistTaste:  lowercase artist → durable net score, PERSISTED across sessions.
@@ -900,6 +935,8 @@ function resetSessionState() {
   _sessionTrackIds  = new Set();
   _stagedUris       = new Set();
   _recentPlayIds    = [];     // fresh session = no recent-repeat history to guard against
+  _sessionPlays     = new Map(); // wipe the repeat-tolerance counts on a manual reset
+  _lastPlayTs       = 0;
   _transitionPrevId = null;   // new session = no prior track to chain a transition from
   // Durable taste (artist scores + track dislikes) intentionally survives a reset —
   // it's a long-term profile, not session state.
@@ -1590,6 +1627,7 @@ async function api(method, endpoint, opts = {}) {
   const _noisy = method === 'GET' && (_short === '/me/player' || _short.startsWith('/me/player/queue'));
 
   const _started = Date.now();
+  _lastApiTs = _started; // for idle detection (background discovery warmer)
   try {
     const data = await _spotifySend(method, urlStr, { headers, body, raw: opts.raw }, _short, opts.priority || 'high');
     _apiMetrics.calls++; _apiMetrics.ok++;
@@ -1815,9 +1853,11 @@ async function _queueTrack(t) {
 // reorder endpoint, so manual search adds now use addToQueue() (append-only) and
 // are mirrored into the in-memory window via _sqRegisterUserQueued().
 
-// Drop any tracks already played or queued during this session.
+// Drop only tracks HARD-blocked from recurring right now (last few plays + whatever's
+// staged in the current window). Earlier-played songs pass through and are instead
+// down-weighted by the repeat-tolerance penalty in the selection scorers.
 function _excludePlayed(tracks) {
-  return (tracks || []).filter(t => t && t.id && !_sessionTrackIds.has(t.id));
+  return (tracks || []).filter(t => t && t.id && !_repeatBlocked(t.id));
 }
 
 // Durable net engagement score for an artist (each hard skip −1, each engaged listen
@@ -2071,7 +2111,11 @@ function _tasteWeightedPick(tracks, n) {
   return tracks
     .map(t => {
       const w = 1 + Math.max(0, _artistBoost(t.artist));            // 1 (unrated) … 9 (Loved)
-      return { t, k: Math.pow(Math.random() || 1e-9, 1 / w) };
+      // Subtract the repeat-tolerance penalty from the sampling key so a song already
+      // played this session needs a much higher draw to be re-picked (and loved songs
+      // no longer dominate just because they keep getting replayed).
+      const k = Math.pow(Math.random() || 1e-9, 1 / w) - _repeatPenalty(t.id);
+      return { t, k };
     })
     .sort((a, b) => b.k - a.k)
     .slice(0, n)
@@ -3551,9 +3595,12 @@ function _sqLibraryCandidates(count) {
     // Seed fit: on a search/playlist session, pull the familiar pool toward the song
     // you actually played — its energy/valence and (especially) its genre.
     const sf = _sqSeedFit(t, seedProf);
+    // Repeat tolerance: a song already played this session is down-weighted the more
+    // it's recurred, so it only comes back if it's still a strong fit.
+    const rp = _repeatPenalty(t.id);
     // Explicit "Dislike"/"Never" ratings strongly suppress how often the artist is
     // picked, without ever removing them from the pool entirely.
-    const s = (base + gv + sf) * _artistRatingMult(t.artist);
+    const s = (base + gv + sf - rp) * _artistRatingMult(t.artist);
     return { t, s };
   });
   ranked.sort((a, b) => b.s - a.s);
@@ -3742,6 +3789,22 @@ async function _sqBuildOurCandidates(count) {
 // off the last-known track/artists. Filtered against this session's no-repeat
 // memory, disliked artists and the recent-play guard.
 async function _sqBuildSpotifyAnchors(count) {
+  // For an explicit target (mix / mood / vibe) the spine must be ON-TARGET music too.
+  // The generic library+gate path below STARVES it: it pulls taste-ranked library
+  // tracks and then drops everything not near the target, leaving ~1 anchor and a
+  // 2-song queue. Source the spine from the SAME on-target builder as our picks (the
+  // window dedupes the two halves), so the window saturates with on-target songs.
+  if (_sq) {
+    let onTarget = null;
+    if      (_sq.source === 'mix'  && _activeMixTarget) onTarget = await buildMixFromTarget(_activeMixTarget, count + 4);
+    else if (_sq.source === 'mood' && _activeMoodKey)  onTarget = await buildMoodPlaylist(_activeMoodKey, count + 4);
+    else if (_sq.source === 'vibe' && _activeVibeKey)  onTarget = await buildVibePlaylist(_activeVibeKey, count + 4);
+    if (onTarget) {
+      return _excludeDisliked(onTarget).filter(t =>
+        t && t.id && !_sq.noRepeat.has(t.id) && !_isRecentlyPlayed(t.id));
+    }
+  }
+
   const seedId = _sq?.lastSeedId || _lastState?.track?.id || null;
   // Local-first: fill the discovery spine from the warmed library/history (zero
   // API cost) before reaching for the live API.
@@ -5106,18 +5169,19 @@ async function buildMixFromTarget(target, limit = 20) {
   for (const e of combinedHistory()) {
     if (e.energy == null || e.valence == null) continue;
     if (seen.has(e.id)) continue;
-    if (_sessionTrackIds.has(e.id)) continue;
+    if (_repeatBlocked(e.id)) continue; // soft: earlier plays return via the tolerance penalty
     if (_clusterDist(centroid, e) > radius) continue;
     if (genreKey && !_trackMatchesGenre(e, genreKey)) continue;
     seen.add(e.id);
     pool.push(e);
   }
 
-  let discoveryCount = Math.min(Math.ceil(limit * _tDiscoveryRatio()), 10);
-  // Lean into discovery when the genre-filtered library is thin: if we own fewer
-  // on-genre/on-target tracks than the batch needs, make up the deficit with fresh
-  // in-genre finds (uncapped beyond the usual 10) so a sparse genre still fills.
-  if (genreKey && pool.length < limit) {
+  let discoveryCount = _discoveryCount(limit);
+  // Lean HARD into discovery whenever your on-target library is thin — which is exactly
+  // when you're reaching away from your core taste (a sparse genre, or a mood you rarely
+  // play). Make up the whole deficit with fresh finds so it discovers instead of
+  // circling back to the same few familiar songs.
+  if (pool.length < limit) {
     discoveryCount = Math.min(limit, Math.max(discoveryCount, limit - pool.length));
   }
   const baseCount = Math.max(1, limit - discoveryCount);
@@ -5161,7 +5225,7 @@ async function buildVibePlaylist(vibeKey, limit = 25) {
 
   // Skip anything already played/queued this session so the vibe never loops
   const pool = _excludePlayed([...cluster.tracks]);
-  const discoveryCount = Math.min(Math.ceil(limit * _tDiscoveryRatio()), 10);
+  const discoveryCount = _discoveryCount(limit);
   const baseCount = Math.max(1, limit - discoveryCount);
 
   // Gate discovery to this vibe's sound: within a Variety-scaled radius of the
@@ -5217,7 +5281,7 @@ async function _buildLearnedFeeling(prof, sessionTracks, limit) {
   const byId = new Map();
   for (const e of combinedHistory()) if (e && e.id && !byId.has(e.id)) byId.set(e.id, e);
   const sessionIds = new Set((sessionTracks || []).map(t => t.id).filter(Boolean));
-  const blocked = (t) => !t || t.energy == null || _sessionTrackIds.has(t.id) || sessionIds.has(t.id);
+  const blocked = (t) => !t || t.energy == null || _repeatBlocked(t.id) || sessionIds.has(t.id);
 
   // Your anchor songs for this feeling (weighted), still in the library, unheard this session.
   const anchors = [...prof.trackW.entries()].sort((a, b) => b[1] - a[1])
@@ -5232,7 +5296,7 @@ async function _buildLearnedFeeling(prof, sessionTracks, limit) {
     pool.push(e);
   }
 
-  const discoveryCount = Math.min(Math.ceil(limit * _tDiscoveryRatio()), 10);
+  const discoveryCount = _discoveryCount(limit);
   const baseCount = Math.max(1, limit - discoveryCount);
   // ~60% your real anchors (taste-shuffled so it varies each session), rest on-centroid.
   const anchorN = Math.min(anchors.length, Math.ceil(baseCount * 0.6));
@@ -5280,7 +5344,7 @@ async function buildFeelingPlaylist(feelingKey, sessionTracks = [], limit = 20) 
   const pool = [];
   for (const e of all) {
     if (seen.has(e.id)) continue;
-    if (_sessionTrackIds.has(e.id)) continue; // already played/queued this session
+    if (_repeatBlocked(e.id)) continue; // soft: earlier plays return via the tolerance penalty
     if (e.energy == null) continue;
     if (e.energy  < band.eMin || e.energy  > band.eMax) continue;
     if (e.valence < band.vMin || e.valence > band.vMax) continue;
@@ -5298,7 +5362,7 @@ async function buildFeelingPlaylist(feelingKey, sessionTracks = [], limit = 20) 
     pool.sort((a, b) => (_artistBoost(b.artist) - _artistBoost(a.artist)) || (Math.random() - 0.5));
   }
 
-  const discoveryCount = Math.min(Math.ceil(limit * _tDiscoveryRatio()), 10);
+  const discoveryCount = _discoveryCount(limit);
   const baseCount = Math.max(1, limit - discoveryCount);
 
   // Include a few recent session tracks (confirmed to match) that haven't been queued yet
@@ -5324,44 +5388,130 @@ async function buildFeelingPlaylist(feelingKey, sessionTracks = [], limit = 20) 
 // `verdict` (optional) gates every candidate against the active mood/vibe's audio
 // profile — see _gateDiscovery. Off-vibe tracks are dropped so artist/genre-sourced
 // discovery can't contradict the chosen sound.
+function _shuffleArr(a) { return (a || []).map(x => [Math.random(), x]).sort((p, q) => p[0] - q[0]).map(([, x]) => x); }
+
+// The Spotify-searchable genre terms the user actually listens to — derived from the
+// Last.fm genre profile (Spotify strips artist genres, so /me/top/artists is empty).
+let _userGenreCache = { seeds: [], ts: 0 };
+function _userDiscoveryGenres() {
+  if (_userGenreCache.seeds.length && Date.now() - _userGenreCache.ts < 10 * 60 * 1000) return _userGenreCache.seeds;
+  const seeds = [];
+  try {
+    for (const b of (computeGenreProfile().buckets || [])) {
+      const bucket = GENRE_BUCKET_BY_KEY[b.key];
+      if (bucket) seeds.push(...bucket.seeds);
+    }
+  } catch { /* fall through */ }
+  const out = seeds.length ? [...new Set(seeds)] : ['pop', 'rock', 'hip-hop', 'indie', 'electronic'];
+  _userGenreCache = { seeds: out, ts: Date.now() };
+  return out;
+}
+
+// Genuine new-music discovery via /search — the ONLY live source. (Recommendations,
+// related-artists, curated "This Is …" playlists and artist-album deep-cuts are all
+// blocked for this app's tier.) Mines genre × varied-year-window searches with DEEP
+// random offsets so it reaches well past the same handful of hits, stamps the genre
+// data it confirms, and excludes everything you already know so results are NEW.
+async function _searchDiscovery(genres, want, excludeIds = new Set()) {
+  const out = [];
+  const seen = new Set(excludeIds);
+  const yr = new Date().getFullYear();
+  const yearBands = [`${yr - 2}-${yr}`, `${yr - 6}-${yr - 3}`, `${yr - 12}-${yr - 7}`, '']; // recent → older → any
+  const gList = _shuffleArr([...new Set((genres || []).filter(Boolean))]);
+  if (!gList.length || want <= 0) return out;
+  const maxSearches = Math.min(5, Math.max(2, Math.ceil(want / 8))); // bound API per build
+  for (let i = 0; i < maxSearches && out.length < want; i++) {
+    if (_spotifyRateLimited()) break;
+    const g = gList[i % gList.length];
+    const band = yearBands[Math.floor(Math.random() * yearBands.length)];
+    const q = band ? `genre:"${g}" year:${band}` : `genre:"${g}"`;
+    const offset = Math.floor(Math.random() * 250); // reach far past the popular hits
+    try {
+      const res = await search(q, 'track', 10, offset);
+      for (const raw of (res?.tracks?.items || [])) {
+        const t = serializeTrack(raw);
+        if (!t || !t.id || seen.has(t.id)) continue;
+        seen.add(t.id);
+        _stampArtistGenre(raw.artists, g);   // build genre data from the confirmed search
+        out.push(t);
+      }
+    } catch { /* keep going */ }
+  }
+  return out;
+}
+
+// ── Background discovery pool ─────────────────────────────────────────────────
+// Discovery is API-bound (one live /search source), so instead of only fetching at
+// build time, we continuously DISCOVER in the background whenever the API is idle and
+// stash the fresh tracks here. Builds then serve from this deep, pre-warmed pool
+// instantly (no API wait), and the warmer tops it back up using spare capacity.
+let _lastApiTs       = 0;
+let _discoveryPool   = [];     // fresh, unknown, genre-tagged tracks ready to serve
+let _discoveryWarmTimer = null;
+const DISCOVERY_POOL_MAX     = 400;
+const DISCOVERY_IDLE_QUIET_MS = 3500;     // only warm when no API call landed this recently
+const DISCOVERY_WARM_INTERVAL = 18 * 1000;
+
+// Drop pool tracks that have since become known/played/disliked.
+function _pruneDiscoveryPool() {
+  const known = _knownTrackIdSet();
+  _discoveryPool = _excludeDisliked(_discoveryPool.filter(t =>
+    t && t.id && !known.has(t.id) && !_sessionTrackIds.has(t.id)));
+}
+
+// Runs on a timer; only acts when the API is genuinely idle so it never competes with
+// playback polls or an in-flight window build.
+async function warmDiscovery() {
+  try {
+    if (!isAuthed() || _spotifyRateLimited()) return;
+    if (Date.now() - _lastApiTs < DISCOVERY_IDLE_QUIET_MS) return; // API busy → stay out of the way
+    if (_sq && _sq.building) return;                              // mid window build → wait
+    _pruneDiscoveryPool();
+    if (_discoveryPool.length >= DISCOVERY_POOL_MAX) return;      // full enough
+    const genres = _userDiscoveryGenres();
+    const have = new Set([..._knownTrackIdSet(), ..._sessionTrackIds, ..._discoveryPool.map(t => t.id)]);
+    const fresh = await _searchDiscovery(genres, 30, have);       // bounded (≤5 searches/pass)
+    if (fresh.length) {
+      _discoveryPool.push(...fresh);
+      if (_discoveryPool.length > DISCOVERY_POOL_MAX) _discoveryPool = _discoveryPool.slice(-DISCOVERY_POOL_MAX);
+      console.log(`[Discovery] Warmed +${fresh.length} fresh tracks (pool ${_discoveryPool.length}/${DISCOVERY_POOL_MAX})`);
+    }
+  } catch (err) {
+    console.error('[Discovery] warm error:', err.message);
+  }
+}
+
 async function _buildDiscovery(seedIds, seedArtists, count, verdict = null, seedGenres = null) {
   if (count <= 0) return [];
   const known = _knownTrackIdSet();
-  const excludeIds = new Set([...known, ..._sessionTrackIds]);
-  // When a genre filter is active, source fresh tracks FROM that genre (genre
-  // search / "{Genre} Mix") rather than your overall top genres — so a sparse
-  // genre still fills with genuinely in-genre discoveries.
-  const topGenres = (seedGenres && seedGenres.length) ? seedGenres : await _getTopGenres();
+  const fresh = (t) => t && t.id && !known.has(t.id) && !_repeatBlocked(t.id);
 
-  // Over-fetch each source so there's slack to gate against the vibe and still fill.
-  const fetch = verdict ? (count * 2 + 4) : (count + 4);
-  const [curated, similar, fresh] = await Promise.all([
-    getCuratedTracks(seedArtists, topGenres, excludeIds, fetch).catch(() => []),
-    getSimilarTracks(seedIds, [], fetch + 1).catch(() => []),
-    getDiscoveryTracks(seedArtists, excludeIds, fetch).catch(() => []),
-  ]);
-
-  // Curated (Spotify CF) first — strongest cross-user signal — then fresh search
-  // finds, then unfamiliar similar. Keep only genuinely new (unknown) tracks.
-  const newCurated = _excludePlayed(curated).filter(t => t.id && !known.has(t.id));
-  const newSimilar = _excludePlayed(similar).filter(t => t.id && !known.has(t.id));
-  let pool = _excludeDisliked([...newCurated, ...fresh, ...newSimilar]);
-  // De-dupe by id, preserving the priority order above.
-  const seenIds = new Set();
-  pool = pool.filter(t => t.id && !seenIds.has(t.id) && seenIds.add(t.id));
-
-  // Gate the deduped pool against the vibe (drops off-vibe, prefers on-vibe), then
-  // cap to count. Without a verdict this is just the slice as before.
+  // 1) Serve from the pre-warmed pool first — instant, no API wait, already excludes
+  //    everything you know. Genre-bias it when a target genre is given.
+  let pool = _excludeDisliked(_shuffleArr(_discoveryPool.filter(fresh)));
+  if (seedGenres && seedGenres.length) {
+    const want = new Set(seedGenres.map(s => String(s).toLowerCase()));
+    pool.sort((a, b) => (_trackInSeedGenres(b, want) - _trackInSeedGenres(a, want)));
+  }
   let discovery = await _gateDiscovery(pool, verdict, count);
 
-  // Top up with known-but-unplayed similar so a batch is never short — gated too.
-  if (discovery.length < count) {
-    const have = new Set(discovery.map(t => t.id));
-    const filler = _excludeDisliked(_excludePlayed(similar)).filter(t => !have.has(t.id));
-    const gatedFiller = await _gateDiscovery(filler, verdict, count - discovery.length);
-    discovery = [...discovery, ...gatedFiller].slice(0, count);
+  // 2) Top up with a live search only if the pool couldn't fill the batch.
+  if (discovery.length < count && !_spotifyRateLimited()) {
+    const have = new Set([...known, ..._sessionTrackIds, ...discovery.map(t => t.id)]);
+    const genres = (seedGenres && seedGenres.length) ? seedGenres : _userDiscoveryGenres();
+    const found = await _searchDiscovery(genres, (count - discovery.length) * 2 + 4, have);
+    const gated = await _gateDiscovery(_excludeDisliked(found), verdict, count - discovery.length);
+    discovery = [...discovery, ...gated];
   }
-  return discovery;
+  return discovery.slice(0, count);
+}
+
+// Cheap genre overlap test for pool ordering (raw tag vs requested genre seeds).
+function _trackInSeedGenres(track, wantSet) {
+  const raw = _trackRawGenres(track);
+  if (!raw) return 0;
+  for (const g of raw) if (wantSet.has(g)) return 1;
+  return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -6765,6 +6915,11 @@ function startPolling() {
   if (!_featureWarmTimer) {
     setTimeout(() => warmFeatureLibrary().catch(() => {}), FEATURE_WARM_START_DELAY);
     _featureWarmTimer = setInterval(() => warmFeatureLibrary().catch(() => {}), FEATURE_WARM_INTERVAL);
+  }
+  // Background discovery: keep a deep pool of fresh tracks topped up during idle API
+  // time so builds always have new music ready to weave in.
+  if (!_discoveryWarmTimer) {
+    _discoveryWarmTimer = setInterval(() => warmDiscovery().catch(() => {}), DISCOVERY_WARM_INTERVAL);
   }
   // Backfill artist genres for the Genres tab — runs after seeding so history is
   // populated, then self-reschedules in small batches until every artist is covered.
