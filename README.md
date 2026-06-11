@@ -1,231 +1,299 @@
-# VoiceMeeter Control
+# DecklingAir
 
-A web-based remote control panel for VoiceMeeter Potato, running on a Raspberry Pi and accessible from any device on your network (iPad, phone, etc.).
+A self-hosted, touch-friendly control panel that runs on a Raspberry Pi and is reachable from any device on your network (iPad, phone, laptop). It is two things in one app:
+
+1. **A VoiceMeeter remote** — faders, mutes, routing, macros and desktop shortcuts for a Windows PC running VoiceMeeter Potato, driven over the network through a small Python bridge.
+2. **A deep, self-learning Spotify dashboard** — a player, search, playlists, and an *intelligence engine* that builds and continuously steers your queue around your taste, mood, genre and time-of-day, entirely locally.
+
+The grid is fully editable: you drag, drop, resize and configure cards, organise them into pages, and the layout persists on the Pi.
+
+---
+
+## Table of contents
+
+- [Architecture](#architecture)
+- [Setup](#setup)
+- [The control surface](#the-control-surface)
+  - [VoiceMeeter controls](#voicemeeter-controls)
+  - [Desktop shortcuts](#desktop-shortcuts)
+- [The Spotify dashboard](#the-spotify-dashboard)
+  - [Player, Search, Playlists, Queue](#player-search-playlists-queue)
+  - [The Smart Queue engine](#the-smart-queue-engine)
+  - [The Insights card](#the-insights-card)
+  - [Mixes — the genre × mood map](#mixes--the-genre--mood-map)
+  - [The genre system](#the-genre-system)
+  - [Taste learning & artist ratings](#taste-learning--artist-ratings)
+  - [Feelings & check-ins](#feelings--check-ins)
+  - [Now Playing intelligence](#now-playing-intelligence)
+  - [Tuning — the dials](#tuning--the-dials)
+  - [Data — the diagnostics tab](#data--the-diagnostics-tab)
+- [How it works under the hood](#how-it-works-under-the-hood)
+- [Configuration & data files](#configuration--data-files)
+- [Troubleshooting](#troubleshooting)
+
+---
 
 ## Architecture
 
 ```
-iPad / Browser
-      │  Socket.io (port 3000)
-      ▼
-Raspberry Pi  ←──── server/
-  (Node.js server)
-      │  WebSocket (port 3001)
-      ▼
-Windows PC  ←──── bridge/
-  (Python bridge)
-      │  ctypes DLL
-      ▼
-VoiceMeeter Potato
+ iPad / phone / browser
+        │   Socket.IO  (HTTP :3002)
+        ▼
+ Raspberry Pi  ───────────────  server/   (Node.js: Express + Socket.IO)
+   • serves the web UI                     • Spotify intelligence engine
+   • persists your layout + learned data   • talks to Spotify / ReccoBeats / Last.fm
+        │   WebSocket  (:3003)
+        ▼
+ Windows PC   ───────────────  bridge/   (Python)
+   • polls + sets VoiceMeeter params
+        │   ctypes → VoiceMeeter Remote DLL
+        ▼
+ VoiceMeeter Potato
 ```
+
+- The **Pi** is the brain and the only thing your devices connect to.
+- The **bridge** is optional — you only need it for the VoiceMeeter half. The Spotify half works on its own. (A `macos_bridge.py` is included for driving a Mac instead of a Windows PC.)
+- Everything the engine learns about you lives in flat files on the Pi (`server/data/`) — nothing leaves your network except the calls to Spotify.
 
 ---
 
-## Raspberry Pi Setup
+## Setup
 
-### 1. Install Node.js (if not already installed)
+### 1. Raspberry Pi (the server)
 
 ```bash
+# Install Node.js 20+
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt-get install -y nodejs
-```
 
-### 2. Clone and install
-
-```bash
-git clone https://github.com/YOUR_USERNAME/voicemeeter-control.git
-cd voicemeeter-control/server
+# Clone & install
+git clone https://github.com/py-xxx/DecklingAir.git
+cd DecklingAir/server
 npm install
+
+# Run it
+npm start          # → http://<Pi-IP>:3002
 ```
 
-### 3. Test it runs
+Auto-start on boot with **PM2**:
 
 ```bash
-npm start
-# Open http://<Pi-IP>:3000 in a browser
-```
-
-### 4. Auto-start with PM2
-
-```bash
-# Install PM2 globally
 sudo npm install -g pm2
-
-# Start the server
-cd ~/voicemeeter-control/server
 pm2 start index.js --name "vm-control"
-
-# Save so it restarts on boot
 pm2 save
-pm2 startup   # Follow the printed command (copy-paste it)
-```
-
-> **Note on the existing app:** If you already have another app running on PM2, this just adds a second process. They run independently. Check with `pm2 list`.
-
-### 5. Check it's running
-
-```bash
-pm2 list
+pm2 startup        # run the command it prints
 pm2 logs vm-control
 ```
 
-To find your Pi's IP: `hostname -I`
+Find the Pi's IP with `hostname -I`. Open `http://<Pi-IP>:3002` on any device (on iPad, *Add to Home Screen* for an app-like experience).
+
+> Ports: web UI **3002**, bridge **3003** (override with `PORT` / `BRIDGE_PORT`).
+
+### 2. Connect Spotify
+
+1. Create an app at [developer.spotify.com](https://developer.spotify.com) and set the Redirect URI to `http://<Pi-IP>:3002/api/spotify/callback`.
+2. In the panel: **Settings → Spotify**, paste your **Client ID** and **Client Secret**, click **Connect Spotify**, and authorise.
+
+### 3. Add a Last.fm key (for genres)
+
+1. Get a free key at [last.fm/api/account/create](https://www.last.fm/api/account/create) (you only need the **API key**, not the shared secret).
+2. **Settings → Spotify → Last.fm API Key → Save.** The genre backfill starts immediately — watch `pm2 logs` for the `[Genre]` lines.
+
+### 4. (Optional) Windows bridge for VoiceMeeter
+
+Only needed for the VoiceMeeter half.
+
+1. Install Python 3.9+ and VoiceMeeter Potato (have VoiceMeeter running first).
+2. Edit `bridge/config.json` → set `pi_host` to your Pi's IP and `bridge_port` to `3003`.
+3. `pip install -r bridge/requirements.txt`, then `python bridge.py` (a tray icon appears).
+4. Auto-start it via the Startup folder, Task Scheduler, or build a standalone exe with `bridge/build.bat`. (Use `macos_bridge.py` to drive a Mac instead.)
 
 ---
 
-## Windows Bridge Setup
+## The control surface
 
-### Prerequisites
+Enter **Edit** mode (top-right) to add, move, resize and configure cards; tap **+** to add one. Drag cards to rearrange, drag the corner to resize. Group cards into **Pages** (Settings → Pages) — e.g. *Gaming*, *Music*, *Streaming* — shown as tabs.
 
-- Python 3.9+ installed ([python.org](https://python.org))
-- VoiceMeeter Potato installed and running
-- Python added to PATH during install
+### VoiceMeeter controls
 
-### 1. Edit the config
+| Card | What it does |
+|------|--------------|
+| **Fader** | A vertical gain slider for any strip or bus. |
+| **Strip Panel** | A full input channel strip — fader, mute, and A/B bus routing toggles. |
+| **Bus Panel** | An output bus with fader and mute. |
+| **Toggle** | An on/off button bound to any parameter (mute, solo, A1–A5 / B1–B3 routing…). |
+| **Macro** | One button that sets several parameters at once. Optional **Momentary** mode un-does the change on release (push-to-talk style). |
+| **VU Meter** | A live animated level display. |
+| **Label** | A text header / separator for organising the grid. |
 
-Open `bridge/config.json` and set your Pi's IP address:
+Live levels and parameter state stream back from VoiceMeeter through the bridge, so faders and meters reflect the real mixer in real time.
 
-```json
-{
-  "pi_host": "192.168.1.100",   ← change this to your Pi's IP
-  "bridge_port": 3001,
-  "poll_interval_ms": 50,
-  "log_level": "INFO"
-}
-```
+### Desktop shortcuts
 
-### 2. Install Python dependencies
+A **Shortcut** card fires actions on the Windows PC:
 
-```batch
-cd bridge
-pip install -r requirements.txt
-```
+- **Launch app / open file**, **Open URL**
+- **Media keys** — Play/Pause, Next, Previous
+- **System** — Volume Up/Down, Mute, Screenshot, Lock, Sleep
+- **Custom key combo** — e.g. `ctrl+shift+esc`, `win+d`
 
-### 3. Test it
-
-```batch
-python bridge.py
-```
-
-You should see a tray icon appear. If VoiceMeeter is running, it will connect and the web UI will show "Connected".
-
-### 4. Auto-start on Windows boot
-
-**Option A — Startup folder (easiest):**
-
-1. Press `Win + R`, type `shell:startup`, press Enter
-2. Create a shortcut to `startup.bat` in that folder
-3. The bridge will launch minimized at login
-
-**Option B — Task Scheduler (more reliable, starts before login):**
-
-1. Open Task Scheduler
-2. Create Basic Task → "VM Control Bridge"
-3. Trigger: "When the computer starts"
-4. Action: Start a program → `pythonw.exe`
-5. Arguments: `"C:\path\to\bridge\bridge.py"`
-6. Start in: `C:\path\to\bridge\`
-7. Enable "Run whether user is logged on or not" if desired
-
-**Option C — Build a standalone .exe (no Python required after):**
-
-```batch
-cd bridge
-build.bat
-```
-
-The `dist\VMControlBridge.exe` can be used instead of `python bridge.py`. Place a shortcut to it in the Startup folder.
+Screenshots are saved on the PC under `Pictures\VM Control Screenshots`.
 
 ---
 
-## Usage
+## The Spotify dashboard
 
-1. Open `http://<Pi-IP>:3000` in any browser on your network
-2. Bookmark it on your iPad for easy access (Add to Home Screen for app-like experience)
-3. The header shows connection status — it will say "Potato" (or your VM version) when the bridge is connected
+This is where most of the depth lives. Connect your Spotify account once (Settings → Spotify) and you get a full player plus an engine that treats your queue as something to be *built and steered*, not just played.
 
-### Adding Controls
+A guiding principle runs through the whole thing: **local-first and API-frugal.** Spotify has progressively locked down its Web API — audio features, recommendations, related-artists, and even artist *genres* are blocked or stripped for ordinary apps. Rather than fight that, the engine learns from your own listening on the Pi, leans on free fallbacks (ReccoBeats for audio features, Last.fm for genres), and spends live API calls rarely and deliberately.
 
-1. Click **Edit** in the top-right
-2. Click the **+** button (bottom right)
-3. Choose a control type:
-   - **Fader** — vertical gain slider for any strip or bus
-   - **Strip Panel** — full channel strip (fader + mute + routing)
-   - **Bus Panel** — output bus with fader and mute
-   - **Toggle** — on/off button for any parameter (mute, solo, A1/B1 routing...)
-   - **Macro** — one button that sets multiple parameters at once
-   - **Shortcut** — desktop actions like launching apps, screenshots, media keys, volume, lock, sleep, or custom key combos
-   - **VU Meter** — animated level display
-   - **Label** — text separator/header
-4. Configure and click **Save**
-5. Click **Edit** again to exit edit mode
+### Player, Search, Playlists, Queue
 
-### Drag to Reorder
+- **Player** — album art, title/artist (with a marquee for long names), scrubber, transport, shuffle/repeat, like, and device picker.
+- **Search** — find and play any track.
+- **Playlists** — browse and play your playlists, with a "Recent" sort.
+- **Queue ("Up Next")** — the real upcoming queue, annotated with *why* each pick is there. When the engine rebuilds the queue (e.g. you pick a mix), a **loading overlay** covers it until the new queue is built and playing.
 
-In edit mode, drag any control card to reorder it.
+### The Smart Queue engine
 
-### Pages
+Spotify's Web API won't autoplay a bare track — start a single song via the API and "Up Next" stays empty. So the engine sources its own continuation:
 
-Add multiple pages (e.g. Gaming, Music, Streaming) via **Settings → Pages**. Tabs appear at the top.
+1. It builds a **window** — a short spine of discovery "anchors" with **your** taste-tuned picks woven into the gaps where the flow between anchors is roughest (so each of your songs does the most bridging work).
+2. It **enqueues that window** into Spotify's native Up Next, so the queue populates immediately and looks exactly like normal playback.
+3. As the current track advances and few slots remain, it **extends** the window — fetching a fresh batch that bridges from the last song — so playback never runs dry.
+4. If you manually skip or play something new (which clears Spotify's queue), it **rebuilds** from where you are.
 
-### Macro Example — "Mute all mics"
+**Flow ordering** sequences picks harmonically — Camelot key compatibility, BPM and energy smoothness — and is **genre-aware**: a soft genre-similarity term (using your artists' Last.fm tags, so *metalcore↔hardcore* reads as close while *metal↔bedroom-pop* reads as far) nudges transitions toward genre coherence and away from the jarring "same key, opposite genre" jump. The whole window also avoids repeating an artist back-to-back and won't replay a song until many others have passed.
 
-Add a Macro control with these actions:
-- `Strip[0].Mute` = 1
-- `Strip[1].Mute` = 1
-- `Strip[2].Mute` = 1
+**Fit-to-the-song.** When you search a track and play it, the queue is pulled toward *that* song — its energy/valence neighbourhood and (weighted most strongly) its **genre** — so Up Next actually matches what you played, not just the seed artist. How tightly it sticks is governed by the Variety slider.
 
-Enable **Momentary** if you want it to un-mute when released (push-to-talk style).
+Toggle the whole engine on/off from the Queue card's **Auto** pill; when off, playback falls back to Spotify's own anchors.
 
-### Desktop Shortcut Examples
+### The Insights card
 
-- Launch Discord: action `Launch App / File`, target `C:\Users\YourName\AppData\Local\Discord\Update.exe`, args `--processStart Discord.exe`
-- Open Spotify Web: action `Open URL`, target `https://open.spotify.com`
-- Media hotkeys: `Play / Pause`, `Next Track`, `Previous Track`
-- System actions: `Screenshot`, `Volume Up`, `Volume Down`, `Mute / Unmute`, `Lock PC`
-- Custom shortcut: action `Key Combo`, target `ctrl+shift+esc` or `win+d`
+A tabbed card that is the cockpit for the intelligence engine:
 
-Screenshots are saved on the Windows PC under `Pictures\VM Control Screenshots`.
+**Profile · Artists · Portraits · Mixes · Tuning · Data**
+
+- **Profile** — your listening at a glance: totals, a time-of-day/day-of-week heatmap, and patterns.
+- **Artists** — every recently-played artist with a 5-level rating (see [ratings](#taste-learning--artist-ratings)).
+- **Portraits** — "your day in music": who you are at each part of the day, plus a *time-machine* that can replay a real past track from this same slot.
+- **Mixes** — the genre × mood builder (below).
+- **Tuning** — the six dials that shape every pick (below).
+- **Data** — a read-only diagnostics view of everything the engine knows (below).
+
+### Mixes — the genre × mood map
+
+One unified way to say "play exactly this kind of music":
+
+- A **2D pad** where the X axis is mood (Dark ↔ Bright = sad ↔ happy / low ↔ high valence) and the Y axis is energy (Calm ↔ Intense). The glowing **heat-cloud** is your *own* listening, so you can see where your music actually lives. Drag the puck anywhere to target an exact point; it defaults onto the song you're currently playing.
+- A row of **genre chips** (Hip-Hop, Rock, Pop, … plus **Any**) layered on top. Pick **Any** for a pure mood mix; pick a genre to constrain the mix to it.
+
+Behind a single **Play this** button, both feed one builder: it pulls your library/history near the chosen point, gates fresh discovery to that region, then runs the shared taste/flow/spacing tail — so a mood, a genre, or a genre-and-mood are all the same engine with different parameters. A running mix **keeps going** (continuous), and **auto-disables** if the music drifts too far from what you picked.
+
+### The genre system
+
+Spotify no longer returns genres for ordinary apps (the field is stripped from artist objects, and the bulk-artist endpoint 403s). So genres come from **Last.fm**:
+
+- A background job resolves **every artist in your local library** to its Last.fm genre tags, rolls those granular tags up into ~10 macro-buckets (Hip-Hop, Pop, Rock, Electronic, R&B/Soul, Metal, Indie/Alt, Country, Jazz, Classical), and caches them permanently to disk. It runs in throttled passes until 100% covered, then re-scans periodically for newly-played artists. The console logs progress (`[Genre] … 467/467 = 100% covered`).
+- Picking a genre is **strict** — a "Rock" mix plays only confirmed-rock tracks, and fresh discovery is sourced from Spotify's `genre:"rock"` *search* (which still works), whose results are also used to *build* the genre DB further.
+- Genre also acts as a **soft, supporting signal** in the everyday queue — smoothing transitions and gently biasing selection — without ever hard-filtering, so unknown-genre songs still play (and get resolved over time).
+
+You provide a free Last.fm API key once (Settings → Spotify → Last.fm API Key).
+
+### Taste learning & artist ratings
+
+The engine builds a durable model of what you like:
+
+- **Artist ratings** (on the Artists tab) — an explicit 5-level scale: ❤️ Love · 👍 Like · 😐 Neutral · 👎 Dislike · 🚫 Never. These **override** the engine's guesses — *Love/Like* surfaces an artist more, *Dislike/Never* strongly down-weights it (but never hard-blocks it; you can still hear them occasionally).
+- **Learned scores** — every engaged listen nudges an artist up; every early skip nudges it down (how hard is the Skip-sensitivity dial). Skips also remember the *context* they happened in.
+- **Transition memory** — it learns which song→song sequences survive in *your* listening and reinforces those "bonded pairs."
+- **Favourites** — most-played artists and on-repeat tracks are detected from history.
+- Selection is **taste-weighted but randomised**, so loved artists are far more likely without the queue becoming the same songs every session.
+
+### Feelings & check-ins
+
+Occasionally the app asks **"How are you feeling?"** with a quick set of moods (Sad, Chill, Focused, Happy, Energetic, Hype, Angsty). Crucially, an answer is a **label, not a command** — it doesn't change what's playing. It records the association between *how you said you felt* and *what you were actually listening to* at that moment.
+
+That log powers two things:
+
+- The **time-of-day prediction** ("It's Wednesday 9pm — your evenings usually feel angsty") on the Now Playing card.
+- A **learned, personal feeling** mode: over time the app discovers that *your* "sad" might sit nowhere near the textbook definition — maybe it's mid-energy and indie-leaning. Once a feeling has enough check-ins **and** has drifted meaningfully off its generic box, playing it draws from the songs *you* actually reach for when you feel that way (recency-weighted). Until then it falls back to the generic energy/valence band. You can watch this divergence accumulate on the Data tab.
+
+### Now Playing intelligence
+
+A compact card focused on the current moment. It shows the **active selection** (a mix/genre/mood and its "drawing from N of your songs" pool) only when you've picked one, and a **time-of-day prediction** card with a ▶ to play it. A confidence bar reflects how firmly it has read your current vibe. The artist line scrolls as a smooth, continuous marquee.
+
+### Tuning — the dials
+
+Six sliders shape **every** feature — autoplay, mixes, genres, feelings, the lot:
+
+| Dial | Effect |
+|------|--------|
+| **Fresh vs Familiar** | How much of each batch is new discovery vs your own library. |
+| **Variety** | How far the engine wanders from your core taste / the seed; also how tightly a search-play sticks to the played song. |
+| **Fade smoothness** | How closely consecutive tracks must blend — drives harmonic flow ordering **and** how strongly genre shapes transitions. |
+| **Mood lock vs Flow** | 0 = lock tight to the chosen mood point, 100 = roam. |
+| **Skip sensitivity** | How hard an early skip steers away from an artist. |
+| **Lookahead** | How many tracks are staged per refill. |
+
+Changes apply live and persist.
+
+### Data — the diagnostics tab
+
+A read-only window into everything the engine knows about you and how it's using it:
+
+- **Library** — tracks known, how many have audio features, your logged plays, saved-library size, sessions, features cached.
+- **Taste** — artists learned, loved/rated counts, disliked tracks, transitions learned, and your top artists (with taste score, rating badge and genres).
+- **Genre knowledge** — coverage bar and per-bucket counts.
+- **Right now** — the live vibe (energy/valence/bpm/genre) and the time-of-day guess.
+- **Your feelings (learned vs generic)** — per feeling: how many check-ins, your learned energy/valence vs the generic box, the **drift**, the genre lean, and your anchor songs — tagged `personalized · live`, `on the box`, or `learning`.
+- **Smart queue state** — on/off, source, active selection, pool size, window size, and the current genre-aware-transition weight.
+- **Tuning** — your current dial values, explained.
 
 ---
 
-## VoiceMeeter Parameters Reference
+## How it works under the hood
 
-| Parameter | Range | Notes |
-|-----------|-------|-------|
-| `Strip[n].Gain` | -60 to +12 | dB. n=0-7 |
-| `Strip[n].Mute` | 0 or 1 | |
-| `Strip[n].Solo` | 0 or 1 | |
-| `Strip[n].A1` … `A5` | 0 or 1 | Hardware bus routing |
-| `Strip[n].B1` … `B3` | 0 or 1 | Virtual bus routing |
-| `Bus[n].Gain` | -60 to +12 | dB. n=0-7 |
-| `Bus[n].Mute` | 0 or 1 | |
-| `Command.Restart` | 1 | Restart audio engine |
+- **Local-first.** All learning — history, taste, ratings, transitions, genres, feelings — lives in flat files on the Pi and is computed in-memory. The queue is built from your own data first; live API calls are a last resort, rate-limit-gated, and well-spaced.
+- **Audio features via ReccoBeats.** Spotify's `/audio-features` is blocked, so energy/valence/bpm/key come from the free [ReccoBeats](https://reccobeats.com) API (serialised + backed-off to avoid 429s) and are cached to disk.
+- **Genres via Last.fm.** As above — `artist.getTopTags`, rolled into macro-buckets, cached forever.
+- **No recommendations endpoint.** Spotify's recommendation/radio API is also blocked, which is precisely why the Smart Queue sources its own continuation rather than relying on native autoplay.
+- **Resilient.** A health monitor watches the Spotify API (success rate, 429s, a circuit breaker) and the engine degrades gracefully — a failed analysis can never blank the dashboard.
 
-Strip indices: 0-4 = Hardware inputs, 5-7 = Virtual inputs  
-Bus indices: 0-4 = A1-A5 (hardware), 5-7 = B1-B3 (virtual)
+---
+
+## Configuration & data files
+
+Everything the engine persists lives under `server/data/` (git-ignored):
+
+| File | Contents |
+|------|----------|
+| `layout.json` | Your grid: pages, cards, settings. |
+| `spotify-config.json` | Spotify Client ID/Secret, Last.fm key, timezone override. |
+| `spotify-tokens.json` | Spotify OAuth tokens. |
+| history / sessions | Your play history and past listening sessions. |
+| taste profile | Learned artist scores, ratings, disliked tracks, transitions, **artist→genre tags**, slot biases. |
+| feature cache | Cached audio features (ReccoBeats). |
+| feeling log | Your check-in labels + the snapshots behind them. |
+| user prefs | Tuning, Smart-Queue toggle, check-in auto. |
+
+A **timezone override** (Settings, or the Tuning tab) corrects hour-of-day/weekday for the heatmap, vibes and predictions — and repairs past history when changed.
 
 ---
 
 ## Troubleshooting
 
-**Bridge won't connect to VoiceMeeter:**
-- Make sure VoiceMeeter is open before starting the bridge
-- Check the DLL path in `voicemeeter.py` matches your installation
+**Web UI won't load** — check `pm2 logs vm-control`; confirm port 3002 is reachable and you're on the same network.
 
-**Web UI shows "Offline":**
-- Check the bridge is running (look for tray icon)
-- Verify `config.json` has the correct Pi IP
-- Ensure port 3001 is not blocked by Windows Firewall
-  - Run: `netsh advfirewall firewall add rule name="VM Bridge" dir=in action=allow protocol=TCP localport=3001`
-  - (Actually the Pi connects *to* Windows, so Windows firewall outbound rules apply — usually fine by default)
+**Spotify actions fail** — re-check Client ID/Secret and that the Redirect URI exactly matches `http://<Pi-IP>:3002/api/spotify/callback`. If likes/search/playlists error, disconnect and reconnect (token scopes).
 
-**iPad can't reach the Pi:**
-- Confirm both devices are on the same WiFi network
-- Check Pi IP with `hostname -I`
-- Test with `http://<Pi-IP>:3000` in Safari
+**No genres / empty Mixes genre chips** — make sure a **Last.fm key** is saved; watch the `[Genre]` log lines climb toward `100% covered`. Artists Last.fm doesn't know stay genre-less (a small minority).
 
-**Controls don't respond:**
-- Check `pm2 logs vm-control` on the Pi for errors
-- Check the bridge console/log for errors
-# DecklingAir
+**"Audio features unavailable"** — ReccoBeats was momentarily unreachable; it retries and caches. Harmless and transient.
+
+**Queue stops after one song / feels generic** — confirm the **Auto** pill on the Queue card is on (Smart Queue enabled).
+
+**VoiceMeeter shows "Offline"** — make sure VoiceMeeter is open *before* the bridge, the bridge's `config.json` points at the right Pi IP/port, and the bridge tray icon is present. Check both the Pi (`pm2 logs`) and the bridge console.
+
+**iPad can't reach the Pi** — same Wi-Fi, correct IP (`hostname -I`), try `http://<Pi-IP>:3002` directly.

@@ -3532,6 +3532,7 @@ function _sqLibraryCandidates(count) {
   const mode = _engagementMomentum().mode;
   const jitter = mode === 'restless' ? 0.30 : mode === 'locked' ? 0.05 : 0.12;
   const domGenre = _currentDominantGenre(); // current vibe's genre, computed once
+  const seedProf = _sqSeedProfile();        // fit-to-the-played-song (search/playlist only)
   let maxBoost = 0;
   for (const t of pool) { const b = _artistBoost(t.artist); if (b > maxBoost) maxBoost = b; }
   const ranked = pool.map(t => {
@@ -3547,9 +3548,12 @@ function _sqLibraryCandidates(count) {
     // and slightly favour unknown-genre tracks so they get played & resolved. Small
     // additive nudge — supporting, never a filter.
     const gv = _genreVibeBoost(t, domGenre);
+    // Seed fit: on a search/playlist session, pull the familiar pool toward the song
+    // you actually played — its energy/valence and (especially) its genre.
+    const sf = _sqSeedFit(t, seedProf);
     // Explicit "Dislike"/"Never" ratings strongly suppress how often the artist is
     // picked, without ever removing them from the pool entirely.
-    const s = (base + gv) * _artistRatingMult(t.artist);
+    const s = (base + gv + sf) * _artistRatingMult(t.artist);
     return { t, s };
   });
   ranked.sort((a, b) => b.s - a.s);
@@ -3602,6 +3606,50 @@ function _sqLibraryCandidates(count) {
 // sit within a Variety-scaled radius of the SEED track's sound. Low variety → songs
 // that sound like the seed; high → anything. In-radius picks come first; out-of-radius
 // and unjudgeable tracks trail as filler so we never starve.
+// ── Seed-fit: tighten the everyday search/playlist queue to the song you played ──
+// Searching a track and playing it should make Up Next FIT it — same energy/valence
+// neighbourhood and (especially) the same genre — not just wander off the seed artist.
+// Weights ride the Variety slider (low = stick close, high = roam); genre is weighted
+// higher than energy/valence and never fully fades. Only applies to search/playlist
+// sessions (mood/vibe/mix carry their own targets).
+function _sqSeedEvWeight()    { return _lerp(0.18, 0.04, _tVariety()); }
+function _sqSeedGenreWeight() { return _lerp(0.28, 0.12, _tVariety()); }
+
+function _sqSeedProfile() {
+  if (!_sq) return null;
+  if (_sq.source !== 'search' && _sq.source !== 'playlist') return null;
+  if (_sq.seedProfile && _sq.seedProfile.energy != null) return _sq.seedProfile;
+  const seedId = _sq.lastSeedId || _lastState?.track?.id || null;
+  if (!seedId) return null;
+  const feat = _findStoredFeatures(seedId);
+  const seedTrack = (_lastState?.track && _lastState.track.id === seedId) ? _lastState.track : null;
+  const genres = seedTrack?.artist ? _trackMacroGenres({ artist: seedTrack.artist }) : null;
+  const prof = {
+    energy:  feat?.energy  ?? null,
+    valence: feat?.valence ?? null,
+    bpm:     feat?.bpm     ?? null,
+    genres:  (genres && genres.size) ? genres : null,
+  };
+  if (prof.energy != null) _sq.seedProfile = prof; // cache once the seed's features land
+  return prof;
+}
+
+// Additive bias for how well a candidate fits the seed: energy/valence closeness +
+// genre overlap (stronger). 0 when nothing's known, so it never penalises unknowns.
+function _sqSeedFit(track, prof) {
+  if (!prof) return 0;
+  let fit = 0;
+  if (prof.energy != null) {
+    const f = _trackFeatures(track);
+    if (f && f.energy != null) fit += Math.max(0, 1 - _clusterDist(prof, f)) * _sqSeedEvWeight();
+  }
+  if (prof.genres) {
+    const tg = _trackMacroGenres(track);
+    if (tg) { for (const g of tg) if (prof.genres.has(g)) { fit += _sqSeedGenreWeight(); break; } }
+  }
+  return fit;
+}
+
 function _sqVarietyGate(tracks, seedId) {
   const seedFeat = seedId ? _findStoredFeatures(seedId) : null;
   if (!seedFeat || seedFeat.energy == null) return tracks;
@@ -3611,6 +3659,13 @@ function _sqVarietyGate(tracks, seedId) {
     const f = _trackFeatures(t);
     if (!f || f.energy == null) { rest.push(t); continue; }   // unknown → allow as filler
     (_clusterDist(seedFeat, f) <= radius ? within : rest).push(t);
+  }
+  // Pull the seed's genre (and closest energy/valence) to the front of the in-radius set.
+  const prof = _sqSeedProfile();
+  if (prof) {
+    const fit = new Map();
+    for (const t of within) fit.set(t, _sqSeedFit(t, prof));
+    within.sort((a, b) => fit.get(b) - fit.get(a));
   }
   return [...within, ...rest];
 }
