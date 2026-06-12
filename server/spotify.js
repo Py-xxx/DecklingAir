@@ -2602,12 +2602,12 @@ async function getDevices() {
   return api('GET', '/me/player/devices');
 }
 
-async function search(query, types = 'track', limit = 10, offset = 0) {
+async function search(query, types = 'track', limit = 10, offset = 0, priority = 'high') {
   // Feb 2026: search limit reduced from max 50 to max 10
   const safeLimit = Math.min(limit, 10);
   const params = { q: query, type: types, limit: String(safeLimit) };
   if (offset > 0) params.offset = String(Math.min(offset, 950)); // Spotify caps offset at ~1000
-  return api('GET', '/search', { params });
+  return api('GET', '/search', { params, priority });
 }
 
 async function getQueue() {
@@ -5043,14 +5043,10 @@ async function _gateDiscovery(tracks, verdict, limit) {
   const list = (tracks || []).filter(t => t && t.id);
   if (!list.length || !verdict) return list.slice(0, limit);
 
-  const toWarm = [];
-  for (const t of list) {
-    if (t.energy != null) continue;
-    if (_findStoredFeatures(t.id)) continue;
-    toWarm.push(t.id);
-  }
-  if (toWarm.length) { try { await getBatchAudioFeatures(toWarm.slice(0, 24)); } catch { /* warm best-effort */ } }
-
+  // NOTE: we deliberately do NOT feature-warm here. Discovery tracks are obscure/new,
+  // ReccoBeats usually times out on them, and warming ~24/build blocked the request
+  // queue and starved the player poll. Unknown-feature tracks just pass as filler
+  // below; their features get fetched naturally if/when they actually play.
   const onVibe = [], unknown = [];
   for (const t of list) {
     const v = verdict(t);
@@ -5427,7 +5423,7 @@ async function _searchDiscovery(genres, want, excludeIds = new Set()) {
     const q = band ? `genre:"${g}" year:${band}` : `genre:"${g}"`;
     const offset = Math.floor(Math.random() * 250); // reach far past the popular hits
     try {
-      const res = await search(q, 'track', 10, offset);
+      const res = await search(q, 'track', 10, offset, 'low'); // background: yield to playback polls
       for (const raw of (res?.tracks?.items || [])) {
         const t = serializeTrack(raw);
         if (!t || !t.id || seen.has(t.id)) continue;
@@ -5493,7 +5489,8 @@ async function _buildDiscovery(seedIds, seedArtists, count, verdict = null, seed
     const want = new Set(seedGenres.map(s => String(s).toLowerCase()));
     pool.sort((a, b) => (_trackInSeedGenres(b, want) - _trackInSeedGenres(a, want)));
   }
-  let discovery = await _gateDiscovery(pool, verdict, count);
+  // Only gate a bounded slice — gating the whole 400-track pool every build is wasteful.
+  let discovery = await _gateDiscovery(pool.slice(0, count * 3 + 6), verdict, count);
 
   // 2) Top up with a live search only if the pool couldn't fill the batch.
   if (discovery.length < count && !_spotifyRateLimited()) {
@@ -6003,9 +6000,8 @@ function _findStoredFeatures(trackId) {
     console.log(`[Spotify] Features: found in history but energy=null for id=${trackId} — keys: ${Object.keys(historyMatchNoFeatures).join(',')}`);
   } else if (seededMatchNoFeatures) {
     console.log(`[Spotify] Features: found in seeded but energy=null for id=${trackId} — keys: ${Object.keys(seededMatchNoFeatures).join(',')}`);
-  } else {
-    console.log(`[Spotify] Features: id=${trackId} not found in history(${_history.length}) or seeded(${_seededHistory.length})`);
   }
+  // New discovery tracks are expected to be unknown — don't log those (it floods).
   return null;
 }
 
@@ -6917,9 +6913,14 @@ function startPolling() {
     _featureWarmTimer = setInterval(() => warmFeatureLibrary().catch(() => {}), FEATURE_WARM_INTERVAL);
   }
   // Background discovery: keep a deep pool of fresh tracks topped up during idle API
-  // time so builds always have new music ready to weave in.
+  // time so builds always have new music ready to weave in. Starts after the boot
+  // seed/feature-warm settle, and its searches run at LOW priority so they always
+  // yield to the live player poll.
   if (!_discoveryWarmTimer) {
-    _discoveryWarmTimer = setInterval(() => warmDiscovery().catch(() => {}), DISCOVERY_WARM_INTERVAL);
+    setTimeout(() => {
+      warmDiscovery().catch(() => {});
+      _discoveryWarmTimer = setInterval(() => warmDiscovery().catch(() => {}), DISCOVERY_WARM_INTERVAL);
+    }, 60 * 1000);
   }
   // Backfill artist genres for the Genres tab — runs after seeding so history is
   // populated, then self-reschedules in small batches until every artist is covered.
