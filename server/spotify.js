@@ -312,6 +312,22 @@ function _repeatBlocked(id) {
   return !!id && (_isRecentlyPlayed(id) || (_sq && _sq.noRepeat.has(id)));
 }
 
+// ── Favorites ──────────────────────────────────────────────────────────────
+// A hand-curated set of "these are genuinely my best songs", mirrored to a real
+// Spotify playlist ("DecklingAir Favorites") so it stays editable in BOTH the app
+// and Spotify. Favorites are a HIGH-TRUST signal: they bias the mix/Now-Playing
+// SEED and get a small additive pick boost in candidate scoring. The boost is
+// deliberately kept BELOW the repeat penalty (REPEAT_PENALTY_BASE) so an
+// under-heard favourite surfaces when it hasn't played this session, yet still
+// backs off naturally once it's been played — a trusted anchor, never a repeat
+// machine.
+const FAV_PLAYLIST_NAME = 'DecklingAir Favorites';
+const FAVORITE_BOOST    = 0.12;  // additive pick nudge; < REPEAT_PENALTY_BASE (0.30) by design
+let _favoriteIds   = new Set();  // bare track IDs (in-memory mirror of the Spotify playlist)
+let _favPlaylistId = null;       // id of the Spotify "DecklingAir Favorites" playlist
+function _isFavorite(id)    { return !!id && _favoriteIds.has(id); }
+function _favoriteBoost(id) { return _isFavorite(id) ? FAVORITE_BOOST : 0; }
+
 // ── Adaptive engagement ───────────────────────────────────────────────────────
 // _artistTaste:  lowercase artist → durable net score, PERSISTED across sessions.
 //                Each hard skip −1, each engaged listen +1 (clamped). An artist is
@@ -612,6 +628,8 @@ function loadTasteProfile() {
     for (const [k, v] of Object.entries(obj.slotBias || {})) {
       if (v && typeof v === 'object') _slotBias.set(k, { dE: Number(v.dE) || 0, dV: Number(v.dV) || 0 });
     }
+    if (Array.isArray(obj.favoriteIds)) _favoriteIds = new Set(obj.favoriteIds.filter(x => typeof x === 'string'));
+    if (typeof obj.favPlaylistId === 'string') _favPlaylistId = obj.favPlaylistId;
     console.log(`[Spotify] Loaded taste profile — ${_artistTaste.size} artists, ${_artistRating.size} rated, ${_trackDislikes.size} disliked tracks, ${_transitions.size} transitions, ${_slotBias.size} slot biases, ${_artistGenres.size} genre-tagged artists`);
   } catch (err) {
     console.error('[Spotify] loadTasteProfile error:', err.message);
@@ -631,6 +649,8 @@ function saveTasteProfile() {
       skipSlot:      Object.fromEntries(_skipSlot),
       transitions:   Object.fromEntries(_transitions),
       slotBias:      Object.fromEntries(_slotBias),
+      favoriteIds:   [..._favoriteIds],
+      favPlaylistId: _favPlaylistId || undefined,
     };
     fs.writeFileSync(TASTE_PROFILE_FILE, JSON.stringify(obj, null, 2));
   } catch (err) {
@@ -2128,7 +2148,7 @@ function _tasteWeightedPick(tracks, n) {
       // Subtract the repeat-tolerance penalty from the sampling key so a song already
       // played this session needs a much higher draw to be re-picked (and loved songs
       // no longer dominate just because they keep getting replayed).
-      const k = Math.pow(Math.random() || 1e-9, 1 / w) - _repeatPenalty(t.id);
+      const k = Math.pow(Math.random() || 1e-9, 1 / w) - _repeatPenalty(t.id) + _favoriteBoost(t.id);
       return { t, k };
     })
     .sort((a, b) => b.k - a.k)
@@ -2659,6 +2679,80 @@ async function createPlaylist(userId, name, description = '') {
   });
   _playlistsCache = { items: null, ts: 0 }; // playlist set changed — drop the cache
   return r;
+}
+
+async function removeTracksFromPlaylist(playlistId, uris) {
+  return api('DELETE', `/playlists/${playlistId}/tracks`, {
+    body: { tracks: uris.map(u => ({ uri: u })) },
+  });
+}
+
+// ── Favorites playlist sync ─────────────────────────────────────────────────
+// Find the user's "DecklingAir Favorites" playlist WITHOUT creating it (null if
+// none yet) — used on cold start so we never make a playlist the user never asked
+// for.
+async function _findFavPlaylist() {
+  if (_favPlaylistId) return _favPlaylistId;
+  try {
+    if (!_userId) await getUserProfile();
+    const { items } = await getAllPlaylists();
+    const found = (items || []).find(p =>
+      p && p.name === FAV_PLAYLIST_NAME && p.owner && p.owner.id === _userId);
+    if (found) { _favPlaylistId = found.id; _scheduleTasteSave(); return _favPlaylistId; }
+  } catch (err) {
+    console.error('[Favorites] playlist lookup failed:', err.message);
+  }
+  return null;
+}
+
+// Like _findFavPlaylist, but creates the playlist if it doesn't exist yet.
+async function _ensureFavPlaylist() {
+  const found = await _findFavPlaylist();
+  if (found) return found;
+  if (!_userId) await getUserProfile();
+  const pl = await createPlaylist(_userId, FAV_PLAYLIST_NAME,
+    'Your hand-picked favourites. DecklingAir learns from these for stronger seeds & recommendations.');
+  _favPlaylistId = pl.id; _scheduleTasteSave();
+  console.log(`[Favorites] Created "${FAV_PLAYLIST_NAME}" playlist (${_favPlaylistId})`);
+  return _favPlaylistId;
+}
+
+// Pull the playlist's current contents from Spotify into _favoriteIds so edits
+// made directly in Spotify show up in the app. create=false skips making the
+// playlist on a cold start where nothing has been favourited yet.
+async function syncFavorites(create = false) {
+  try {
+    const id = create ? await _ensureFavPlaylist() : await _findFavPlaylist();
+    if (!id) return _favoriteIds;
+    const entries = await getAllPlaylistTracks(id);
+    const next = new Set();
+    for (const e of entries) {
+      const it = e && (e.item || e.track);
+      const tid = it && (it.id || (it.uri || '').split(':').pop());
+      if (tid) next.add(tid);
+    }
+    _favoriteIds = next;
+    _scheduleTasteSave();
+    console.log(`[Favorites] Synced ${_favoriteIds.size} favourite(s) from Spotify`);
+  } catch (err) {
+    console.error('[Favorites] sync failed:', err.message);
+  }
+  return _favoriteIds;
+}
+
+// Add/remove a track to the Favorites playlist AND the in-memory mirror.
+async function toggleFavorite(trackUri, add) {
+  const id  = await _ensureFavPlaylist();
+  const tid = (trackUri || '').split(':').pop();
+  if (add) {
+    await addTracksToPlaylist(id, [trackUri]);
+    if (tid) _favoriteIds.add(tid);
+  } else {
+    await removeTracksFromPlaylist(id, [trackUri]);
+    if (tid) _favoriteIds.delete(tid);
+  }
+  _scheduleTasteSave();
+  return !!add;
 }
 
 /**
@@ -3418,6 +3512,7 @@ function serializeState(raw) {
       ? { type: raw.context.type, uri: raw.context.uri }
       : null,
     liked: false,
+    favorite: false,
   };
 }
 
@@ -3621,7 +3716,10 @@ function _sqLibraryCandidates(count) {
     const rp = _repeatPenalty(t.id);
     // Explicit "Dislike"/"Never" ratings strongly suppress how often the artist is
     // picked, without ever removing them from the pool entirely.
-    const s = (base + gv + sf - rp) * _artistRatingMult(t.artist);
+    // Favourites get a small additive nudge so under-heard picks surface — kept
+    // below the repeat penalty so a played favourite still backs off this session.
+    const fb = _favoriteBoost(t.id);
+    const s = (base + gv + sf - rp + fb) * _artistRatingMult(t.artist);
     return { t, s };
   });
   ranked.sort((a, b) => b.s - a.s);
@@ -3702,6 +3800,41 @@ function _sqSeedProfile() {
   return prof;
 }
 
+// Build a mix-style TARGET from the searched/played seed song so a search session's
+// recommendations are CENTERED on that song's energy/valence/genre — not just softly
+// re-ranked. Spotify's recommendation endpoint is dead (getSimilarTracks now returns
+// your own top tracks, ignoring the seed), so seeding has to happen via the on-target
+// builder. Resolves lazily + caches once the seed's ReccoBeats features land; returns
+// null until then (the build falls back to the generic blend for that one tick).
+async function _sqEnsureSeedTarget() {
+  if (!_sq) return null;
+  if (_sq.source !== 'search' && _sq.source !== 'playlist') return null;
+  if (_sq.seedTarget) return _sq.seedTarget;
+  const seedId = _sq.lastSeedId || _lastState?.track?.id || null;
+  if (!seedId) return null;
+  let feat = _findStoredFeatures(seedId);
+  if (!feat || feat.energy == null) {
+    try { await getAudioFeatures(seedId); } catch { } // caches into _audioFeaturesCache (0-1 raw)
+    feat = _findStoredFeatures(seedId);               // now returns the 0-100 entry shape
+  }
+  if (!feat || feat.energy == null) return null;      // features not in yet → retry next build
+  const seedTrack = (_lastState?.track && _lastState.track.id === seedId) ? _lastState.track : null;
+  let genre = null;
+  if (seedTrack?.artist) {
+    const macros = _trackMacroGenres({ artist: seedTrack.artist });
+    if (macros && macros.size) genre = [...macros][0];  // dominant macro-bucket of the seed's artist
+  }
+  _sq.seedTarget = {
+    energy:  feat.energy,
+    valence: feat.valence != null ? feat.valence : 50,
+    bpm:     feat.bpm || null,
+    spread:  _lerp(0.12, 0.30, _tVariety()),
+    genre,
+  };
+  console.log(`[SmartQueue] Search seed resolved → recommendations centered on energy=${Math.round(feat.energy)} valence=${Math.round(feat.valence)}${genre ? ` · ${genre}` : ''} (seed ${seedId})`);
+  return _sq.seedTarget;
+}
+
 // Additive bias for how well a candidate fits the seed: energy/valence closeness +
 // genre overlap (stronger). 0 when nothing's known, so it never penalises unknowns.
 function _sqSeedFit(track, prof) {
@@ -3753,6 +3886,11 @@ async function _sqBuildOurCandidates(count) {
     } else if (_sq.source === 'rightnow') {
       const rn = computeRightNow();
       tracks = rn.ready ? [...rn.topTracks] : [];
+    } else if ((_sq.source === 'search' || _sq.source === 'playlist') && await _sqEnsureSeedTarget()) {
+      // Seed the queue from the song you just played: build on-target picks centered on
+      // its energy/valence/genre (the same engine mixes use). This is what actually makes
+      // the recommendations "fit" the searched song.
+      tracks = await buildMixFromTarget(_sq.seedTarget, count);
     } else {
       // search / playlist / generic discovery. The sliders shape this everyday path:
       //   • Freshness  → split between NEW Spotify discovery and FAMILIAR library picks
@@ -3820,6 +3958,11 @@ async function _sqBuildSpotifyAnchors(count) {
     if      (_sq.source === 'mix'  && _activeMixTarget) onTarget = await buildMixFromTarget(_activeMixTarget, count + 4);
     else if (_sq.source === 'mood' && _activeMoodKey)  onTarget = await buildMoodPlaylist(_activeMoodKey, count + 4);
     else if (_sq.source === 'vibe' && _activeVibeKey)  onTarget = await buildVibePlaylist(_activeVibeKey, count + 4);
+    else if ((_sq.source === 'search' || _sq.source === 'playlist') && await _sqEnsureSeedTarget()) {
+      // Search/playlist seed → spine the window with on-target music too, so even the
+      // discovery anchors fit the song you searched (not your generic top tracks).
+      onTarget = await buildMixFromTarget(_sq.seedTarget, count + 4);
+    }
     if (onTarget) {
       return _excludeDisliked(onTarget).filter(t =>
         t && t.id && !_sq.noRepeat.has(t.id) && !_isRecentlyPlayed(t.id));
@@ -4628,7 +4771,7 @@ async function _sqTick(state) {
 // Falls back to the closest on-target song (any artist) when you own no loved-artist
 // track near the spot. Returns a history entry (has .uri) or null.
 function _pickVibeSeed(centroid, radius, genreKey = null) {
-  let loved = null, lovedD = Infinity, any = null, anyD = Infinity;
+  let fav = null, favD = Infinity, loved = null, lovedD = Infinity, any = null, anyD = Infinity;
   for (const e of combinedHistory()) {
     if (!e || !e.id || !e.uri || e.energy == null || e.valence == null) continue;
     if (_repeatBlocked(e.id)) continue;                                   // not a just-played song
@@ -4637,10 +4780,17 @@ function _pickVibeSeed(centroid, radius, genreKey = null) {
     if (d > radius) continue;
     if (d < anyD) { anyD = d; any = e; }
     if (d < lovedD && _isLovedArtist(e.artist)) { lovedD = d; loved = e; }
+    if (d < favD && _isFavorite(e.id)) { favD = d; fav = e; }
   }
-  // Prefer the loved-artist match — but only if it's a genuinely close match to the
-  // spot. If your closest loved track is notably looser than the single closest song,
-  // anchor on the tighter one instead (a high-confidence seed beats a loose loved one).
+  // A favourited TRACK is the highest-trust seed signal — prefer it whenever it's a
+  // close enough match to the spot (same confidence gate as loved artists).
+  if (fav && favD <= anyD + 0.08) {
+    console.log(`[SmartQueue] Seed = favourite "${fav.title} — ${fav.artist}" (vibe match ${(1 - favD).toFixed(2)})`);
+    return fav;
+  }
+  // Otherwise prefer the loved-artist match — but only if it's a genuinely close match
+  // to the spot. If your closest loved track is notably looser than the single closest
+  // song, anchor on the tighter one instead (a high-confidence seed beats a loose one).
   if (loved && lovedD <= anyD + 0.08) {
     console.log(`[SmartQueue] Seed = loved "${loved.title} — ${loved.artist}" (vibe match ${(1 - lovedD).toFixed(2)})`);
     return loved;
@@ -4649,7 +4799,7 @@ function _pickVibeSeed(centroid, radius, genreKey = null) {
     console.log(`[SmartQueue] Seed = "${any.title} — ${any.artist}" (vibe match ${(1 - anyD).toFixed(2)}${loved ? `, loved was ${(1 - lovedD).toFixed(2)}` : ''})`);
     return any;
   }
-  return loved || null;
+  return loved || fav || null;
 }
 
 async function _sqPickMoodVibeSeed(source, key) {
@@ -6912,6 +7062,10 @@ async function poll() {
         state.liked = _lastState.liked;
       }
 
+      // Favourite flag — recomputed every poll so a toggle (here or in Spotify)
+      // reflects on the same playing track without waiting for a track change.
+      state.favorite = _isFavorite(state.track.id);
+
       _lastTrackId = state.track.id;
 
       // Smart Queue owns the queue while it's active — it drives all just-in-time
@@ -7042,6 +7196,9 @@ function startPolling() {
   if (!_genreBackfillTimer) {
     _genreBackfillTimer = setTimeout(() => backfillArtistGenres().catch(() => {}), GENRE_BACKFILL_START_DELAY);
   }
+  // Sync the Favorites playlist once at startup (no-create) so favourites you edited
+  // in Spotify are reflected in the in-memory mirror used by seeds + scoring.
+  setTimeout(() => syncFavorites(false).catch(() => {}), 8 * 1000);
 }
 
 function stopPolling() {
@@ -7989,6 +8146,28 @@ function init(io) {
       }
     });
 
+    // ----- spotify:toggle_favorite -----  (bookmark on the player → DecklingAir Favorites)
+    socket.on('spotify:toggle_favorite', async ({ trackUri, add } = {}) => {
+      const tid = (trackUri || '').split(':').pop();
+      try {
+        await toggleFavorite(trackUri, !!add);
+        console.log(`[Favorites] ${add ? 'Added' : 'Removed'} ${trackUri} (${_favoriteIds.size} total)`);
+        if (_io) _io.emit('spotify:favorite_status', { trackId: tid, favorite: !!add });
+        socket.emit('spotify:toast', { message: add ? 'Added to Favorites ✓' : 'Removed from Favorites' });
+      } catch (err) {
+        const status = err.status ? ` (HTTP ${err.status})` : '';
+        console.error(`[Favorites] toggle error${status}:`, err.message);
+        socket.emit('spotify:favorite_status', { trackId: tid, favorite: !add }); // revert optimistic UI
+        socket.emit('spotify:error', { message: `Favorite failed${status}: ${err.message}` });
+      }
+    });
+
+    // ----- spotify:get_favorites -----
+    socket.on('spotify:get_favorites', async () => {
+      try { await syncFavorites(false); } catch { }
+      socket.emit('spotify:favorites', { ids: [..._favoriteIds], playlistId: _favPlaylistId });
+    });
+
     // ----- spotify:save_config -----
     socket.on('spotify:save_config', ({ clientId, clientSecret } = {}) => {
       try {
@@ -8071,6 +8250,8 @@ function init(io) {
       _autoQueueCount = 0;
       _userProfile = null;
       _userId = null;
+      _favPlaylistId = null;        // a different account may reconnect — re-resolve the playlist
+      _favoriteIds = new Set();
       io.emit('spotify:auth_status', { connected: false, configured: true });
       io.emit('spotify:state', null);
     });

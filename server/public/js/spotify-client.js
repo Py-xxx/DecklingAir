@@ -291,6 +291,20 @@ export function addToPlaylist(trackUri, playlistId) {
   socket.emit('spotify:add_to_playlist', { trackUri, playlistId });
 }
 
+/**
+ * Add/remove a track to the "DecklingAir Favorites" playlist.
+ * @param {string} trackUri
+ * @param {boolean} add  true = add, false = remove
+ */
+export function toggleFavorite(trackUri, add) {
+  socket.emit('spotify:toggle_favorite', { trackUri, add });
+}
+
+/** Request the current favorite track-id set (also re-syncs from Spotify). */
+export function getFavorites() {
+  socket.emit('spotify:get_favorites');
+}
+
 // ---------------------------------------------------------------------------
 // Config / auth
 // ---------------------------------------------------------------------------

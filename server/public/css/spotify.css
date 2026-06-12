@@ -242,6 +242,8 @@
 .sp-icon-btn:active { opacity: 0.7; }
 .sp-heart-btn.liked { color: var(--accent, #e05); }
 .sp-heart-btn.liked:hover { color: var(--accent, #e05); opacity: 0.8; }
+.sp-fav-btn.faved { color: var(--accent, #e05); }
+.sp-fav-btn.faved:hover { color: var(--accent, #e05); opacity: 0.8; }
 
 /* Seek row — full-width scrubber, time sits below */
 .sp-seek-row {

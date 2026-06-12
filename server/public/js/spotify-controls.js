@@ -20,6 +20,7 @@ import {
   getSpotifyQueue,
   getSpotifyDevices,
   addToPlaylist,
+  toggleFavorite,
   getSpotifyInsights,
   renameVibe,
   setSmartQueue,
@@ -181,6 +182,18 @@ const SVG = {
       xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
     <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
   </svg>`,
+
+  bookmark: (filled) => filled
+    ? `<svg width="20" height="20" viewBox="0 0 24 24" fill="var(--accent)"
+          stroke="var(--accent)" stroke-width="2" stroke-linecap="round"
+          stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+         <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
+       </svg>`
+    : `<svg width="20" height="20" viewBox="0 0 24 24" fill="none"
+          stroke="currentColor" stroke-width="2" stroke-linecap="round"
+          stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+         <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
+       </svg>`,
 
   speaker: () => `<svg width="20" height="20" viewBox="0 0 24 24" fill="none"
       stroke="currentColor" stroke-width="2" stroke-linecap="round"
@@ -699,6 +712,7 @@ function renderSpotifyPlayer(ctrl) {
         </div>
         <div class="sp-action-btns">
           <button class="sp-icon-btn sp-heart-btn" aria-label="Like">${SVG.heart(false)}</button>
+          <button class="sp-icon-btn sp-fav-btn"   aria-label="Add to Favorites" title="Favorite — a high-trust pick the smart queue learns from">${SVG.bookmark(false)}</button>
           <button class="sp-icon-btn sp-add-btn"   aria-label="Add to playlist">${SVG.plus()}</button>
           <button class="sp-icon-btn sp-device-btn" aria-label="Select device">${SVG.speaker()}</button>
         </div>
@@ -753,6 +767,7 @@ function renderSpotifyPlayer(ctrl) {
   const titleEl     = card.querySelector('.sp-track-title');
   const artistEl    = card.querySelector('.sp-track-artist');
   const heartBtn    = card.querySelector('.sp-heart-btn');
+  const favBtn      = card.querySelector('.sp-fav-btn');
   const addBtn      = card.querySelector('.sp-add-btn');
   const deviceBtn   = card.querySelector('.sp-device-btn');
   const seekBar     = card.querySelector('.sp-seek-bar');
@@ -797,6 +812,7 @@ function renderSpotifyPlayer(ctrl) {
   let _liveState  = null;
   let _currentTrack = null;
   let _liked      = false;
+  let _isFav      = false;
   let _repeat     = 'off';
   let _shuffle    = false;
   let _seekDragging = false;
@@ -924,10 +940,30 @@ function renderSpotifyPlayer(ctrl) {
     }
   });
 
+  function _setFavState(fav) {
+    _isFav = fav;
+    favBtn.innerHTML = SVG.bookmark(_isFav);
+    favBtn.classList.toggle('faved', _isFav);
+    favBtn.setAttribute('aria-label', _isFav ? 'Remove from Favorites' : 'Add to Favorites');
+  }
+
+  favBtn.addEventListener('pointerup', () => {
+    if (isEditMode()) return;
+    if (!_currentTrack) return;
+    const next = !_isFav;
+    _setFavState(next);                              // optimistic; server confirms/reverts
+    toggleFavorite(_currentTrack.uri, next);
+  });
+
   addBtn.addEventListener('pointerup', () => {
     if (isEditMode()) return;
     if (!_currentTrack) return;
     showPlaylistPicker(addBtn, _currentTrack.uri);
+  });
+
+  // Server confirmation / cross-client sync / revert-on-error for favorites.
+  socket.on('spotify:favorite_status', ({ trackId, favorite } = {}) => {
+    if (_currentTrack && _currentTrack.id === trackId) _setFavState(!!favorite);
   });
 
   deviceBtn.addEventListener('pointerup', () => {
@@ -973,7 +1009,7 @@ function renderSpotifyPlayer(ctrl) {
       return;
     }
 
-    const { track, isPlaying, progress, shuffle, repeat, liked } = state;
+    const { track, isPlaying, progress, shuffle, repeat, liked, favorite } = state;
 
     // Was this same track already playing in the bar? (Captured BEFORE we
     // overwrite _currentTrack below.) Used to smooth out tiny backward jumps.
@@ -988,6 +1024,7 @@ function renderSpotifyPlayer(ctrl) {
 
     _currentTrack = track;
     _liked   = !!liked;
+    _isFav   = !!favorite;
     _repeat  = repeat || 'off';
     _shuffle = !!shuffle;
 
@@ -1012,6 +1049,7 @@ function renderSpotifyPlayer(ctrl) {
     }
 
     _setHeartState(_liked);
+    _setFavState(_isFav);
     _applyRepeat();
     shuffleBtn.classList.toggle('active', _shuffle);
 
