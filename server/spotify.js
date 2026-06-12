@@ -2620,6 +2620,9 @@ async function getBatchAudioFeatures(trackIds, priority = 'high') {
 //     user owns/collaborates on — editorial/Spotify-owned playlists 403/404 now.
 //   • Several tracks READ → GET /tracks/{id} per id. The batch GET /tracks?ids=
 //     was REMOVED (403). resolveTrackIds is local-first + capped to avoid storms.
+//   • Playlist tracks WRITE → POST/DELETE /playlists/{id}/ITEMS (was /tracks, now
+//     403 — same migration as the READ side). Bodies unchanged: {uris} to add,
+//     {tracks:[{uri}]} to remove. See addTracksToPlaylist/removeTracksFromPlaylist.
 //   • WRITES → generic endpoints: PUT/DELETE /me/library, GET /me/library/contains.
 //
 // The centralized red logging in api() is the safety net: if any of these starts
@@ -2669,8 +2672,12 @@ async function unlikeTrack(trackUri) {
   return r;
 }
 
+// Mar-2026 migration: the /playlists/{id}/tracks endpoint was REMOVED for Dev-Mode
+// apps (403 Forbidden) — same as the READ side (GET …/tracks → …/items). The live
+// write endpoint is /playlists/{id}/ITEMS. Body shape is unchanged ({uris} to add,
+// {tracks:[{uri}]} to remove). This is what fixes "Add to playlist → HTTP 403".
 async function addTracksToPlaylist(playlistId, uris) {
-  return api('POST', `/playlists/${playlistId}/tracks`, { body: { uris } });
+  return api('POST', `/playlists/${playlistId}/items`, { body: { uris } });
 }
 
 async function createPlaylist(userId, name, description = '') {
@@ -2682,7 +2689,8 @@ async function createPlaylist(userId, name, description = '') {
 }
 
 async function removeTracksFromPlaylist(playlistId, uris) {
-  return api('DELETE', `/playlists/${playlistId}/tracks`, {
+  // Mar-2026 migration: …/tracks → …/items for Dev-Mode apps (see addTracksToPlaylist).
+  return api('DELETE', `/playlists/${playlistId}/items`, {
     body: { tracks: uris.map(u => ({ uri: u })) },
   });
 }
