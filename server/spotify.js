@@ -155,8 +155,12 @@ function _tLookahead()      { return _clampNum(Math.round(_tuning.lookahead), 1,
 // current track before we extend. Capped small (≤5 anchors) on purpose — the app
 // is local-first now and a shallow window means rare, well-spaced discovery fetches
 // instead of building a deep queue that hammers the API.
-function _sqAnchorCount()   { return _clampNum(_tLookahead() + 1, 3, 5); }
-function _sqExtendAhead()   { return _clampNum(Math.ceil(_tLookahead() / 2), 2, 4); }
+// Window depth + extend trigger. Kept a touch deeper and extending EARLIER than before
+// so the queue never runs dry — the only moment Spotify injects its own (uncontrolled)
+// native-autoplay picks. Discovery now serves from the pre-warmed pool, so a slightly
+// deeper window costs little extra API.
+function _sqAnchorCount()   { return _clampNum(_tLookahead() + 2, 4, 6); }
+function _sqExtendAhead()   { return _clampNum(Math.ceil(_tLookahead() / 2) + 1, 3, 5); }
 
 // Validate + apply an incoming tuning patch, clamping each field to its range.
 function _applyTuning(patch = {}) {
@@ -326,6 +330,12 @@ let _artistRating  = new Map();
 // We key by NAME (not id) because stored history/seeds only carry artist names —
 // that's the universal join key across every track source. Powers the Genres tab.
 let _artistGenres  = new Map();
+// _artistGenresSearch: LOW-CONFIDENCE genres derived from Spotify genre-search results
+// (a `genre:"rock"` search returning a track ⇒ "that artist is rock"). Spotify search
+// is imperfect, so these are kept SEPARATE and are always overridden by the
+// authoritative Last.fm tags in _artistGenres — and the Last.fm backfill keeps trying
+// these artists, so a wrong stamp self-corrects instead of poisoning the DB forever.
+let _artistGenresSearch = new Map();
 let _genreBackfillTimer = null;
 let _trackDislikes = new Map();
 // _skipSlot: trackId → the time-slot key ("weekday:evening") of its LAST hard skip.
@@ -587,6 +597,9 @@ function loadTasteProfile() {
     for (const [k, v] of Object.entries(obj.artistGenres || {})) {
       if (Array.isArray(v)) _artistGenres.set(k, v);
     }
+    for (const [k, v] of Object.entries(obj.artistGenresSearch || {})) {
+      if (Array.isArray(v) && !_artistGenres.has(k)) _artistGenresSearch.set(k, v); // Last.fm wins
+    }
     for (const [k, v] of Object.entries(obj.trackDislikes || {})) {
       if (typeof v === 'number') _trackDislikes.set(k, v);
     }
@@ -613,6 +626,7 @@ function saveTasteProfile() {
       artistScores:  Object.fromEntries(_artistTaste),
       artistRatings: Object.fromEntries(_artistRating),
       artistGenres:  Object.fromEntries(_artistGenres),
+      artistGenresSearch: Object.fromEntries(_artistGenresSearch),
       trackDislikes: Object.fromEntries(_trackDislikes),
       skipSlot:      Object.fromEntries(_skipSlot),
       transitions:   Object.fromEntries(_transitions),
@@ -2726,6 +2740,12 @@ function _macroGenresOf(rawGenres) {
 // NAME (track.artist is a "A, B" join). Returns null when we have NO genre data
 // for any of the track's artists, so callers can distinguish "unknown" from
 // "known, matches nothing".
+// Genre tags for an artist NAME: authoritative Last.fm tags first, else the
+// low-confidence search-derived stamp. Last.fm always wins.
+function _artistGenreTags(name) {
+  return _artistGenres.get(name) || _artistGenresSearch.get(name) || null;
+}
+
 function _trackMacroGenres(track) {
   const raw = (track && track.artist) ? track.artist : '';
   if (!raw) return null;
@@ -2735,7 +2755,7 @@ function _trackMacroGenres(track) {
   const out = new Set();
   let known = false;
   for (const name of candidates) {
-    const g = _artistGenres.get(name);
+    const g = _artistGenreTags(name);
     if (g) { known = true; for (const k of _macroGenresOf(g)) out.add(k); }
   }
   return known ? out : null;
@@ -2758,7 +2778,7 @@ function _trackRawGenres(track) {
   const out = new Set();
   let known = false;
   for (const name of candidates) {
-    const tags = _artistGenres.get(name);
+    const tags = _artistGenreTags(name);
     if (tags) { known = true; for (const g of tags) out.add(g); }
   }
   return known ? out : null;
@@ -2996,7 +3016,8 @@ function _stampArtistGenre(artists, genreSeed) {
   for (const a of artists || []) {
     if (!a || !a.name) continue;
     const k = a.name.toLowerCase();
-    if (!_artistGenres.has(k)) { _artistGenres.set(k, [genreSeed]); added++; }
+    // Never overwrite an authoritative Last.fm tag, and only stamp once.
+    if (!_artistGenres.has(k) && !_artistGenresSearch.has(k)) { _artistGenresSearch.set(k, [genreSeed]); added++; }
   }
   if (added) _scheduleTasteSave();
 }
@@ -4600,7 +4621,59 @@ async function _sqTick(state) {
 
 // Pick the single highest-confidence seed track for a mood/vibe to seed the
 // session's first play + recommendation anchors. Returns a track object (or null).
+// Strongest possible seed for a target vibe: a LOVED-artist song that is the CLOSEST
+// match to the exact energy/valence point (and genre, if any). The seed anchors the
+// whole session — Spotify's recommendation queue and our window both branch off it —
+// so the highest-confidence match keeps everything on-vibe from the first second.
+// Falls back to the closest on-target song (any artist) when you own no loved-artist
+// track near the spot. Returns a history entry (has .uri) or null.
+function _pickVibeSeed(centroid, radius, genreKey = null) {
+  let loved = null, lovedD = Infinity, any = null, anyD = Infinity;
+  for (const e of combinedHistory()) {
+    if (!e || !e.id || !e.uri || e.energy == null || e.valence == null) continue;
+    if (_repeatBlocked(e.id)) continue;                                   // not a just-played song
+    if (genreKey && genreKey !== 'any' && !_trackMatchesGenre(e, genreKey)) continue;
+    const d = _clusterDist(centroid, e);
+    if (d > radius) continue;
+    if (d < anyD) { anyD = d; any = e; }
+    if (d < lovedD && _isLovedArtist(e.artist)) { lovedD = d; loved = e; }
+  }
+  // Prefer the loved-artist match — but only if it's a genuinely close match to the
+  // spot. If your closest loved track is notably looser than the single closest song,
+  // anchor on the tighter one instead (a high-confidence seed beats a loose loved one).
+  if (loved && lovedD <= anyD + 0.08) {
+    console.log(`[SmartQueue] Seed = loved "${loved.title} — ${loved.artist}" (vibe match ${(1 - lovedD).toFixed(2)})`);
+    return loved;
+  }
+  if (any) {
+    console.log(`[SmartQueue] Seed = "${any.title} — ${any.artist}" (vibe match ${(1 - anyD).toFixed(2)}${loved ? `, loved was ${(1 - lovedD).toFixed(2)}` : ''})`);
+    return any;
+  }
+  return loved || null;
+}
+
 async function _sqPickMoodVibeSeed(source, key) {
+  // Prefer a loved-artist, highest-confidence seed for the exact mood/vibe.
+  try {
+    if (source === 'mood') {
+      const mood = MOOD_STATES.find(m => m.key === key);
+      const def = mood && FEELING_DEFS[mood.feeling];
+      if (def) {
+        const centroid = { energy: (def.energy[0] + def.energy[1]) / 2, valence: (def.valence[0] + def.valence[1]) / 2, bpm: null };
+        const s = _pickVibeSeed(centroid, 0.28 + _lerp(0, 0.15, _tVariety()), null);
+        if (s) return s;
+      }
+    } else if (source === 'vibe') {
+      const cluster = computeVibes().clusters?.find(c => c.key === key);
+      if (cluster && cluster.avgEnergy != null) {
+        const centroid = { energy: cluster.avgEnergy, valence: cluster.avgValence, bpm: cluster.avgBpm || null };
+        const s = _pickVibeSeed(centroid, 0.28 + _lerp(0, 0.15, _tVariety()), null);
+        if (s) return s;
+      }
+    }
+  } catch (err) { console.error('[SmartQueue] Loved-seed pick failed:', err.message); }
+
+  // Fallback: the builder's best-fit-first track.
   let pool = [];
   try {
     if (source === 'mood') pool = await buildMoodPlaylist(key, 12);
@@ -4793,14 +4866,21 @@ function _energyScore(eA, eB) {
   return 1 - Math.abs(eA - eB) / 100;
 }
 
+function _valenceScore(vA, vB) {
+  if (vA == null || vB == null) return 0.5;
+  return 1 - Math.abs(vA - vB) / 100;
+}
+
 function _trackFlowScore(a, b) {
-  // Harmonic/BPM/energy smoothness, then nudged by what we've learned actually
-  // survives in sequence (Feature 6). The transition term can only shift the
-  // base score by ±TRANSITION_WEIGHT, so learning refines but never overrides
-  // harmonic mixing.
-  const base = _camelotScore(a._cam, b._cam) * 0.35 +
-               _bpmScore(a.bpm, b.bpm)        * 0.35 +
-               _energyScore(a.energy, b.energy) * 0.30;
+  // Harmonic/BPM/energy/VALENCE smoothness, then nudged by what we've learned actually
+  // survives in sequence (Feature 6). Valence is in here now so a hype→sad transition
+  // can't read as "smooth" just because the key and BPM line up. The transition term
+  // can only shift the base by ±TRANSITION_WEIGHT, so learning refines but never
+  // overrides harmonic mixing.
+  const base = _camelotScore(a._cam, b._cam)        * 0.30 +
+               _bpmScore(a.bpm, b.bpm)              * 0.25 +
+               _energyScore(a.energy, b.energy)     * 0.25 +
+               _valenceScore(a.valence, b.valence)  * 0.20;
   let score = base + _transitionBias(a, b) * TRANSITION_WEIGHT;
   // Soft genre coherence: nudge toward genre-matched transitions and away from the
   // jarring "same key, opposite genre" ones (a hype track → a sad track that only
@@ -4972,7 +5052,7 @@ function _vibeRadius(tracks, centroid) {
     .map(t => _trackFeatures(t)).filter(Boolean)
     .map(f => _clusterDist(centroid, f)).sort((a, b) => a - b);
   const spread = dists.length ? dists[Math.floor(dists.length * 0.85)] : 0.18;
-  return spread + _lerp(0.04, 0.30, _tVariety());
+  return spread + _lerp(0.03, 0.22, _tVariety());
 }
 
 // Build the verdict fn for one vibe key (or null if the vibe has no data yet).
@@ -4993,7 +5073,7 @@ function _activeVibeVerdict() {
   // A running mix is the primary continuous target now — gate to its energy×valence point.
   if (_activeMixTarget) {
     const centroid = { energy: _activeMixTarget.energy, valence: _activeMixTarget.valence, bpm: null };
-    const radius = (_activeMixTarget.spread != null ? _activeMixTarget.spread : 0.15) + _lerp(0.04, 0.30, _tVariety());
+    const radius = (_activeMixTarget.spread != null ? _activeMixTarget.spread : 0.15) + _lerp(0.03, 0.22, _tVariety());
     return (t) => _centroidVerdict(t, centroid, radius);
   }
   let feelingKey = null;
@@ -5055,10 +5135,13 @@ async function _gateDiscovery(tracks, verdict, limit) {
     // v === false → known off-vibe, dropped
   }
   const out = onVibe.slice(0, limit);
-  // Unjudgeable (features-unknown) tracks are a gamble — they MIGHT be off-mood.
-  // moodFlow gates how many we allow as filler: locked → few (stay pure, accept a
-  // shorter batch), flow → fill freely so we never starve.
-  let unknownBudget = Math.round((limit - out.length) * _lerp(0.2, 1, _tMoodFlow()));
+  // HARD CEILING on mood-UNVERIFIED (features-unknown) tracks — never more than this
+  // fraction of the batch, regardless of Freshness/Flow. The pool warmer features most
+  // discovery in the background, so this just bounds the unverifiable remainder: the
+  // queue stays anchored on songs we can actually check against the mood, rather than
+  // drifting off it. Mood-Flow only nudges WITHIN the ceiling (15% locked → 35% flow).
+  const unknownCap = Math.round(limit * _lerp(0.15, 0.35, _tMoodFlow()));
+  let unknownBudget = Math.min(unknownCap, limit - out.length);
   for (const t of unknown) {
     if (out.length >= limit || unknownBudget <= 0) break;
     out.push(t);
@@ -5151,7 +5234,7 @@ async function buildMixFromTarget(target, limit = 20) {
   // every mood-shaping slider actually moves this radius. Floored so it never collapses.
   const radius = Math.max(0.08,
     (target.spread != null ? target.spread : 0.15)
-      + _lerp(0.04, 0.30, _tVariety())
+      + _lerp(0.03, 0.22, _tVariety())
       + _lerp(-0.05, 0.10, _tMoodFlow()));
   const verdict = (t) => _centroidVerdict(t, centroid, radius);
 
@@ -5271,7 +5354,7 @@ async function buildMoodPlaylist(moodKey, limit = 25) {
 async function _buildLearnedFeeling(prof, sessionTracks, limit) {
   const c = prof.learned;
   const centroid = { energy: c.energy, valence: c.valence, bpm: c.bpm || null };
-  const radius = Math.max(0.08, 0.15 + _lerp(0.04, 0.30, _tVariety()) + _lerp(-0.05, 0.10, _tMoodFlow()));
+  const radius = Math.max(0.08, 0.15 + _lerp(0.03, 0.22, _tVariety()) + _lerp(-0.05, 0.10, _tMoodFlow()));
   const verdict = (t) => _centroidVerdict(t, centroid, radius);
 
   const byId = new Map();
@@ -5448,11 +5531,35 @@ const DISCOVERY_POOL_MAX     = 400;
 const DISCOVERY_IDLE_QUIET_MS = 3500;     // only warm when no API call landed this recently
 const DISCOVERY_WARM_INTERVAL = 18 * 1000;
 
+const DISCOVERY_FEATURE_PER_PASS = 8; // ReccoBeats lookups per warm pass (background)
+
 // Drop pool tracks that have since become known/played/disliked.
 function _pruneDiscoveryPool() {
   const known = _knownTrackIdSet();
   _discoveryPool = _excludeDisliked(_discoveryPool.filter(t =>
     t && t.id && !known.has(t.id) && !_sessionTrackIds.has(t.id)));
+}
+
+// Background-feature unfeatured pool tracks via ReccoBeats so discovery becomes
+// MOOD-AWARE before it's ever served. Bounded per pass, negative-cached on miss/timeout
+// so we never retry a track ReccoBeats can't resolve. Runs only in idle time (caller
+// gate), off the build path — the opposite of the old synchronous gate-warming that
+// stalled playback. Features are attached straight onto the pool track objects, so the
+// mood verdict can judge them like any library track.
+async function _warmPoolFeatures(maxFetch) {
+  let got = 0;
+  for (const t of _discoveryPool) {
+    if (got >= maxFetch || _spotifyRateLimited()) break;
+    if (!t || !t.id || t.energy != null || _negCached(t.id)) continue;
+    const cached = _audioFeaturesCache.get(t.id);
+    if (cached) { _applyFeatToSeed(t, cached); continue; } // already known → attach, no API
+    try {
+      const recco = await getReccoBeatsFeatures(t.id);
+      if (recco) { _cacheFeatures(t.id, recco); _applyFeatToSeed(t, recco); got++; }
+      else _audioFeaturesNegCache.set(t.id, Date.now());
+    } catch { _audioFeaturesNegCache.set(t.id, Date.now()); }
+  }
+  return got;
 }
 
 // Runs on a timer; only acts when the API is genuinely idle so it never competes with
@@ -5463,14 +5570,22 @@ async function warmDiscovery() {
     if (Date.now() - _lastApiTs < DISCOVERY_IDLE_QUIET_MS) return; // API busy → stay out of the way
     if (_sq && _sq.building) return;                              // mid window build → wait
     _pruneDiscoveryPool();
-    if (_discoveryPool.length >= DISCOVERY_POOL_MAX) return;      // full enough
-    const genres = _userDiscoveryGenres();
-    const have = new Set([..._knownTrackIdSet(), ..._sessionTrackIds, ..._discoveryPool.map(t => t.id)]);
-    const fresh = await _searchDiscovery(genres, 30, have);       // bounded (≤5 searches/pass)
-    if (fresh.length) {
-      _discoveryPool.push(...fresh);
-      if (_discoveryPool.length > DISCOVERY_POOL_MAX) _discoveryPool = _discoveryPool.slice(-DISCOVERY_POOL_MAX);
-      console.log(`[Discovery] Warmed +${fresh.length} fresh tracks (pool ${_discoveryPool.length}/${DISCOVERY_POOL_MAX})`);
+    // 1) Top up with fresh tracks (search) when the pool isn't full.
+    if (_discoveryPool.length < DISCOVERY_POOL_MAX) {
+      const genres = _userDiscoveryGenres();
+      const have = new Set([..._knownTrackIdSet(), ..._sessionTrackIds, ..._discoveryPool.map(t => t.id)]);
+      const fresh = await _searchDiscovery(genres, 30, have);     // bounded (≤5 searches/pass)
+      if (fresh.length) {
+        _discoveryPool.push(...fresh);
+        if (_discoveryPool.length > DISCOVERY_POOL_MAX) _discoveryPool = _discoveryPool.slice(-DISCOVERY_POOL_MAX);
+        console.log(`[Discovery] Warmed +${fresh.length} fresh tracks (pool ${_discoveryPool.length}/${DISCOVERY_POOL_MAX})`);
+      }
+    }
+    // 2) Feature a few unfeatured pool tracks so discovery becomes mood-aware before serving.
+    const featured = await _warmPoolFeatures(DISCOVERY_FEATURE_PER_PASS);
+    if (featured) {
+      const withFeat = _discoveryPool.filter(t => t && t.energy != null).length;
+      console.log(`[Discovery] Featured +${featured} (pool ${withFeat}/${_discoveryPool.length} mood-aware)`);
     }
   } catch (err) {
     console.error('[Discovery] warm error:', err.message);
@@ -5881,7 +5996,7 @@ function _activePoolSize() {
   try {
     if (_activeMixTarget) {
       const centroid = { energy: _activeMixTarget.energy, valence: _activeMixTarget.valence, bpm: null };
-      const radius = (_activeMixTarget.spread != null ? _activeMixTarget.spread : 0.15) + _lerp(0.04, 0.30, _tVariety());
+      const radius = (_activeMixTarget.spread != null ? _activeMixTarget.spread : 0.15) + _lerp(0.03, 0.22, _tVariety());
       let n = 0;
       for (const e of combinedHistory()) {
         if (e.energy == null || e.valence == null) continue;
@@ -7578,8 +7693,16 @@ function init(io) {
           vibeKey: vibeKey || null,
           genre:   genreKey,
         };
-        const seedPool = await buildMixFromTarget(target, 12);
-        const seed = (seedPool || []).find(t => t && (t.uri || t.id));
+        // Seed with the strongest match: a loved-artist song closest to the exact spot
+        // (and genre). Falls back to the builder's best pick only if you own nothing
+        // loved near there.
+        const seedCentroid = { energy: target.energy, valence: target.valence, bpm: null };
+        const seedRadius = Math.max(0.08, target.spread + _lerp(0.03, 0.22, _tVariety()) + _lerp(-0.05, 0.10, _tMoodFlow()));
+        let seed = _pickVibeSeed(seedCentroid, seedRadius, target.genre);
+        if (!seed) {
+          const seedPool = await buildMixFromTarget(target, 12);
+          seed = (seedPool || []).find(t => t && (t.uri || t.id));
+        }
         if (!seed) {
           socket.emit('spotify:insights_action', { ok: false, msg: 'No songs near that spot yet — keep listening' });
           return;
