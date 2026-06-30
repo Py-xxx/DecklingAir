@@ -352,6 +352,21 @@ export function getSmartQueue() {
   socket.emit('spotify:get_smart_queue');
 }
 
+/**
+ * Master kill-switch for ALL Spotify features. When false the server makes zero
+ * outbound calls to Spotify/ReccoBeats/Last.fm (polling + every background job is
+ * torn down).
+ * @param {boolean} enabled
+ */
+export function setSpotifyFeaturesEnabled(enabled) {
+  socket.emit('spotify:set_features_enabled', { enabled });
+}
+
+/** Ask the server for the current master features-enabled state. */
+export function getSpotifyFeaturesEnabled() {
+  socket.emit('spotify:get_features_enabled');
+}
+
 /** Respond to a feeling check-in prompt. */
 export function respondToCheckIn(feeling) {
   socket.emit('spotify:checkin_response', { feeling });

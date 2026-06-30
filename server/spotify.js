@@ -197,6 +197,11 @@ let _autoQueueCount = 0;
 // searched songs / playlist-ends to Spotify's own native Autoplay untouched —
 // BUT moods & vibes ALWAYS run on Smart Queue regardless of this flag.
 let _smartQueueEnabled = true;
+// Master kill-switch for ALL Spotify intelligence. When false the app makes ZERO
+// outbound calls to Spotify, ReccoBeats or Last.fm: polling + every background job
+// is torn down, and api()/_reccoGet/_lastfmArtistTags hard-refuse as a backstop.
+// Persisted in user prefs; default ON.
+let _spotifyEnabled = true;
 // The single active Smart Queue session, or null. Shape documented at the
 // Smart Queue engine section (window[], pos, noRepeat, ourUris, …).
 let _sq = null;
@@ -674,6 +679,7 @@ function loadUserPrefs() {
       const prefs = JSON.parse(fs.readFileSync(USER_PREFS_FILE, 'utf8'));
       if (prefs.checkInAuto != null) _checkInAutoEnabled = !!prefs.checkInAuto;
       if (prefs.smartQueue != null) _smartQueueEnabled = !!prefs.smartQueue;
+      if (prefs.spotifyEnabled != null) _spotifyEnabled = !!prefs.spotifyEnabled;
       if (prefs.tuning && typeof prefs.tuning === 'object') {
         _applyTuning(prefs.tuning);
       }
@@ -684,7 +690,7 @@ function loadUserPrefs() {
 function saveUserPrefs() {
   try {
     fs.mkdirSync(path.dirname(USER_PREFS_FILE), { recursive: true });
-    fs.writeFileSync(USER_PREFS_FILE, JSON.stringify({ checkInAuto: _checkInAutoEnabled, smartQueue: _smartQueueEnabled, tuning: _tuning }, null, 2));
+    fs.writeFileSync(USER_PREFS_FILE, JSON.stringify({ checkInAuto: _checkInAutoEnabled, smartQueue: _smartQueueEnabled, spotifyEnabled: _spotifyEnabled, tuning: _tuning }, null, 2));
   } catch (err) { console.error('[Spotify] Failed to save user prefs:', err.message); }
 }
 
@@ -995,7 +1001,7 @@ function resetSessionState() {
 // ── Away-listening reconciliation ─────────────────────────────────────────────
 
 async function reconcileRecentlyPlayed() {
-  if (!isAuthed() || _spotifyRateLimited()) return;
+  if (!_spotifyEnabled || !isAuthed() || _spotifyRateLimited()) return;
   try {
     const rp = await api('GET', '/me/player/recently-played', { params: { limit: 50 }, priority: 'low' });
     const items = rp?.items || [];
@@ -1099,7 +1105,7 @@ function combinedHistory() {
  * Called once on startup (after auth) and lazily refreshed every hour.
  */
 async function seedFromSpotify() {
-  if (!isAuthed() || _spotifyRateLimited()) return;
+  if (!_spotifyEnabled || !isAuthed() || _spotifyRateLimited()) return;
   if (_seedInFlight) return; // already seeding — don't stack a second pass
   _seedInFlight = true;
   try {
@@ -1227,7 +1233,7 @@ let _featureWarmRunning = false;
  * up newly-liked songs.
  */
 async function warmFeatureLibrary() {
-  if (_featureWarmRunning || !isAuthed() || _spotifyRateLimited()) return;
+  if (!_spotifyEnabled || _featureWarmRunning || !isAuthed() || _spotifyRateLimited()) return;
   _featureWarmRunning = true;
   try {
     // 1. Gather library + top-track metadata (deduped by id)
@@ -1632,6 +1638,10 @@ function _logApi(method, short, status, ms, outcome) {
 }
 
 async function api(method, endpoint, opts = {}) {
+  // Master kill-switch backstop: refuse every Spotify call (incl. token refresh)
+  // the instant features are disabled. Tagged so the catch in callers/api() stays
+  // silent (no red ✗ spam) — the disable path already tears the loop down.
+  if (!_spotifyEnabled) { const e = new Error('Spotify features disabled'); e.disabled = true; throw e; }
   const token = await getToken();
 
   let urlStr = SPOTIFY_API + endpoint;
@@ -2489,6 +2499,7 @@ function _reccoThrottle(fn) {
 // Serialized + backed-off GET against ReccoBeats. Throws on final failure so callers
 // can distinguish a transient error (don't cache) from a genuine not-found (cache).
 async function _reccoGet(url) {
+  if (!_spotifyEnabled) return null; // master kill-switch: no ReccoBeats traffic
   const maxAttempts = 4;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -2729,6 +2740,7 @@ async function _ensureFavPlaylist() {
 // made directly in Spotify show up in the app. create=false skips making the
 // playlist on a cold start where nothing has been favourited yet.
 async function syncFavorites(create = false) {
+  if (!_spotifyEnabled) return _favoriteIds; // master kill-switch
   try {
     const id = create ? await _ensureFavPlaylist() : await _findFavPlaylist();
     if (!id) return _favoriteIds;
@@ -2954,6 +2966,7 @@ function _lastfmKey() {
 // not-found / tagless artist (so we cache the miss), or null on a transient error
 // (so we retry later). Last.fm returns HTTP 200 even for errors, with `error` set.
 async function _lastfmArtistTags(name) {
+  if (!_spotifyEnabled) return null; // master kill-switch: no Last.fm traffic
   const key = _lastfmKey();
   if (!key) return null;
   const url = `${LASTFM_API}?method=artist.gettoptags&artist=${encodeURIComponent(name)}` +
@@ -3002,6 +3015,7 @@ function _allLocalArtistNames() {
 }
 
 async function backfillArtistGenres() {
+  if (!_spotifyEnabled) return; // master kill-switch
   _genreBackfillTimer = null;
   try {
     if (!_lastfmKey()) {
@@ -3560,8 +3574,10 @@ async function getAuthStatus() {
   }
 
   // Second fast path: if the poll loop is running, the token is valid — return
-  // connected immediately rather than risking a rate-limited live API call.
-  if (_polling) {
+  // connected immediately rather than risking a rate-limited live API call. Also
+  // when features are disabled: we must NOT make a live call, and a stored token
+  // means the account is still connected (just dormant).
+  if (_polling || !_spotifyEnabled) {
     return { connected: true, configured: true, needsReauth, missingScopes };
   }
 
@@ -5723,6 +5739,7 @@ async function _warmPoolFeatures(maxFetch) {
 // Runs on a timer; only acts when the API is genuinely idle so it never competes with
 // playback polls or an in-flight window build.
 async function warmDiscovery() {
+  if (!_spotifyEnabled) return; // master kill-switch
   try {
     if (!isAuthed() || _spotifyRateLimited()) return;
     if (Date.now() - _lastApiTs < DISCOVERY_IDLE_QUIET_MS) return; // API busy → stay out of the way
@@ -7195,6 +7212,7 @@ function startPolling() {
   // yield to the live player poll.
   if (!_discoveryWarmTimer) {
     setTimeout(() => {
+      if (!_polling || !_spotifyEnabled || _discoveryWarmTimer) return; // torn down (or disabled) before the delay elapsed
       warmDiscovery().catch(() => {});
       _discoveryWarmTimer = setInterval(() => warmDiscovery().catch(() => {}), DISCOVERY_WARM_INTERVAL);
     }, 60 * 1000);
@@ -7227,6 +7245,10 @@ function stopPolling() {
     clearTimeout(_genreBackfillTimer);
     _genreBackfillTimer = null;
   }
+  if (_discoveryWarmTimer) {
+    clearInterval(_discoveryWarmTimer);
+    _discoveryWarmTimer = null;
+  }
   // Close any active session so time isn't lost on graceful shutdown
   closeActiveSession();
   // Flush any pending features writes so nothing fetched right before shutdown is lost
@@ -7235,6 +7257,33 @@ function stopPolling() {
   // Flush the taste profile too
   if (_tasteSaveTimer) { clearTimeout(_tasteSaveTimer); _tasteSaveTimer = null; }
   if (_tasteDirty) saveTasteProfile();
+}
+
+// Master kill-switch. enabled=false → tear EVERYTHING down (active session, polling,
+// every background job) so the app makes zero outbound calls to Spotify/ReccoBeats/
+// Last.fm. enabled=true → resume polling + jobs if authed. Persisted across restarts.
+function setSpotifyFeaturesEnabled(enabled) {
+  enabled = !!enabled;
+  const changed = enabled !== _spotifyEnabled;
+  _spotifyEnabled = enabled;
+  saveUserPrefs();
+
+  if (!enabled) {
+    try { _sqStop('features-disabled'); } catch { }
+    stopPolling();                 // clears poll + all background timers (incl. discovery)
+    _lastState = null;
+    _lastTrackId = null;
+    if (_io) {
+      _io.emit('spotify:state', null);
+      _io.emit('spotify:features_enabled', { enabled: false });
+    }
+    console.log(`[Spotify] Features DISABLED${changed ? '' : ' (already off)'} — all Spotify/ReccoBeats/Last.fm activity halted`);
+  } else {
+    console.log(`[Spotify] Features ENABLED${changed ? '' : ' (already on)'}`);
+    if (isAuthed()) startPolling();
+    if (_io) _io.emit('spotify:features_enabled', { enabled: true });
+  }
+  return _spotifyEnabled;
 }
 
 // ---------------------------------------------------------------------------
@@ -7288,9 +7337,12 @@ function init(io) {
     if (_healthTimer.unref) _healthTimer.unref();
   }
 
-  // Start polling if already authed
-  if (isAuthed()) {
+  // Start polling if already authed AND the master switch is on. When disabled the
+  // app boots fully inert — no polling, no background jobs, no outbound calls.
+  if (_spotifyEnabled && isAuthed()) {
     startPolling();
+  } else if (!_spotifyEnabled) {
+    console.log('[Spotify] Features are DISABLED (user pref) — no Spotify/ReccoBeats/Last.fm activity');
   }
 
   io.on('connection', async (socket) => {
@@ -7310,6 +7362,9 @@ function init(io) {
 
     // Send the Smart Queue toggle state so the Playback panel renders correctly
     socket.emit('spotify:smart_queue', { enabled: _smartQueueEnabled });
+
+    // Send the master features switch so Settings renders the toggle correctly
+    socket.emit('spotify:features_enabled', { enabled: _spotifyEnabled });
 
     // ----- spotify:cmd -----
     socket.on('spotify:cmd', async ({ action, ...args } = {}) => {
@@ -8283,6 +8338,16 @@ function init(io) {
         _sqStop('toggle-off');
       }
       _io.emit('spotify:smart_queue', { enabled: _smartQueueEnabled });
+    });
+
+    // ----- spotify:get_features_enabled -----
+    socket.on('spotify:get_features_enabled', () => {
+      socket.emit('spotify:features_enabled', { enabled: _spotifyEnabled });
+    });
+
+    // ----- spotify:set_features_enabled -----  (master kill-switch in Settings)
+    socket.on('spotify:set_features_enabled', ({ enabled } = {}) => {
+      setSpotifyFeaturesEnabled(!!enabled); // tears down / resumes everything + broadcasts
     });
   });
 }

@@ -10,7 +10,7 @@ import {
   LEGACY_GAP,
 } from './controls.js';
 import { vmMacro, requestSoundboardDevices, socket } from './socket.js';
-import { saveSpotifyConfig, disconnectSpotify, saveLastfmKey, getLastfmStatus } from './spotify-client.js';
+import { saveSpotifyConfig, disconnectSpotify, saveLastfmKey, getLastfmStatus, setSpotifyFeaturesEnabled, getSpotifyFeaturesEnabled } from './spotify-client.js';
 
 // Convert the size-picker's colSpan/rowSpan choice into a pixel size,
 // clamped up to the type's minimum footprint.
@@ -197,6 +197,23 @@ export function initEditor(state, callbacks) {
     if (inp) inp.value = '';
   });
 
+  // Master Spotify kill-switch — off ⇒ server stops ALL Spotify/ReccoBeats/Last.fm
+  // traffic. Dim + disable the rest of the Spotify settings when off.
+  const spotifyEnabledEl = document.getElementById('s-spotify-enabled');
+  const _reflectSpotifyEnabled = (enabled) => {
+    if (spotifyEnabledEl) spotifyEnabledEl.checked = !!enabled;
+    const controls = document.getElementById('s-spotify-controls');
+    if (controls) {
+      controls.style.opacity = enabled ? '' : '0.45';
+      controls.style.pointerEvents = enabled ? '' : 'none';
+    }
+  };
+  spotifyEnabledEl?.addEventListener('change', () => {
+    setSpotifyFeaturesEnabled(spotifyEnabledEl.checked);
+    _reflectSpotifyEnabled(spotifyEnabledEl.checked);
+  });
+  socket.on('spotify:features_enabled', ({ enabled } = {}) => _reflectSpotifyEnabled(enabled));
+
   document.getElementById('settings-close').addEventListener('click', closeSettings);
   document.getElementById('settings-cancel').addEventListener('click', closeSettings);
   document.getElementById('settings-apply').addEventListener('click', applySettings);
@@ -354,6 +371,8 @@ export function openSettings() {
   renderDefaultDeviceDropdown();
   renderPagesList();
   updateSpotifySettingsStatus(_state.spotifyAuthStatus || null);
+  // Reflect the master features switch (server is the source of truth).
+  getSpotifyFeaturesEnabled();
   // Reflect whether a Last.fm key is already saved (don't echo the secret back).
   getLastfmStatus().then(({ hasKey }) => {
     const st = document.getElementById('s-lastfm-status');

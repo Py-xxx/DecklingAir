@@ -560,6 +560,16 @@
         </section>
         <section class="settings-section">
           <h3>Spotify</h3>
+          <div class="form-row">
+            <div class="form-group fg-grow">
+              <label class="settings-toggle">
+                <input type="checkbox" id="s-spotify-enabled" checked>
+                <span>Enable Spotify features</span>
+              </label>
+              <span class="form-hint">Master switch. When off, the app makes <strong>no calls at all</strong> to Spotify, ReccoBeats or Last.fm — playback polling, the smart queue, discovery and genre lookups all stop until you turn it back on.</span>
+            </div>
+          </div>
+          <div id="s-spotify-controls">
           <div id="s-spotify-status" class="s-spotify-status">
             <span class="s-spotify-status-dot"></span>
             <span id="s-spotify-status-text">Not connected</span>
@@ -595,6 +605,7 @@
             <button class="btn-primary btn-sm" id="s-lastfm-save">Save Last.fm Key</button>
             <span id="s-lastfm-status" class="form-hint" style="align-self:center"></span>
           </div>
+          </div><!-- /#s-spotify-controls -->
         </section>
         <section class="settings-section">
           <h3>Mixer</h3>
