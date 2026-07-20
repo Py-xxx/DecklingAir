@@ -18,6 +18,7 @@ The grid is fully editable: you drag, drop, resize and configure cards, organise
   - [Desktop shortcuts](#desktop-shortcuts)
 - [The Spotify dashboard](#the-spotify-dashboard)
   - [Player, Search, Playlists, Queue](#player-search-playlists-queue)
+  - [Favorites](#favorites)
   - [The Smart Queue engine](#the-smart-queue-engine)
   - [The Insights card](#the-insights-card)
   - [Mixes — the genre × mood map](#mixes--the-genre--mood-map)
@@ -27,6 +28,7 @@ The grid is fully editable: you drag, drop, resize and configure cards, organise
   - [Now Playing intelligence](#now-playing-intelligence)
   - [Tuning — the dials](#tuning--the-dials)
   - [Data — the diagnostics tab](#data--the-diagnostics-tab)
+  - [The master Spotify switch](#the-master-spotify-switch)
 - [How it works under the hood](#how-it-works-under-the-hood)
 - [Configuration & data files](#configuration--data-files)
 - [Troubleshooting](#troubleshooting)
@@ -59,54 +61,117 @@ The grid is fully editable: you drag, drop, resize and configure cards, organise
 
 ## Setup
 
+Do these roughly in order: **(1)** get the server running on the Pi, **(2)** connect Spotify, **(3)** add a Last.fm key so genres work, **(4)** — only if you also want the VoiceMeeter half — set up the Windows/Mac bridge.
+
 ### 1. Raspberry Pi (the server)
 
+**Prerequisites:** a Raspberry Pi (3B+ or newer) running Raspberry Pi OS, on the same network as the devices you'll control it from, with internet access.
+
 ```bash
-# Install Node.js 20+
+# 1a. SSH into the Pi (or use a terminal directly on it)
+ssh pi@<pi-ip>
+
+# 1b. Install Node.js 20+ (skip if `node -v` already shows 20+)
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt-get install -y nodejs
+node -v            # confirm v20.x or newer
 
-# Clone & install
+# 1c. Clone the repo & install dependencies
 git clone https://github.com/py-xxx/DecklingAir.git
 cd DecklingAir/server
 npm install
 
-# Run it
-npm start          # → http://<Pi-IP>:3002
+# 1d. First run — sanity check before wiring up auto-start
+npm start          # → "listening on :3002"; Ctrl+C once you've confirmed it starts
 ```
 
-Auto-start on boot with **PM2**:
+Find the Pi's IP with `hostname -I`, then open `http://<Pi-IP>:3002` from any device on the same network. You should see the (mostly empty) control grid. On an iPad/iPhone, use Safari's **Share → Add to Home Screen** so it opens full-screen like a native app.
+
+> **Ports:** web UI **3002**, VoiceMeeter bridge **3003**. Override with the `PORT` / `BRIDGE_PORT` env vars if either is already in use, e.g. `PORT=8080 npm start`.
+
+**Keep it running — auto-start on boot with PM2:**
 
 ```bash
 sudo npm install -g pm2
 pm2 start index.js --name "vm-control"
-pm2 save
-pm2 startup        # run the command it prints
-pm2 logs vm-control
+pm2 save            # persist the process list
+pm2 startup         # prints a sudo command — copy/paste and run it once
 ```
 
-Find the Pi's IP with `hostname -I`. Open `http://<Pi-IP>:3002` on any device (on iPad, *Add to Home Screen* for an app-like experience).
+That last step registers PM2 itself as a boot service, so a power-cycle or reboot brings the app back up automatically. Useful PM2 commands going forward:
 
-> Ports: web UI **3002**, bridge **3003** (override with `PORT` / `BRIDGE_PORT`).
+```bash
+pm2 logs vm-control       # live logs — check here first for ANY problem
+pm2 restart vm-control    # after a `git pull` to pick up code changes
+pm2 status                 # confirm it's "online"
+```
+
+**Updating later:** `cd DecklingAir/server && git pull && npm install && pm2 restart vm-control`.
 
 ### 2. Connect Spotify
 
-1. Create an app at [developer.spotify.com](https://developer.spotify.com) and set the Redirect URI to `http://<Pi-IP>:3002/api/spotify/callback`.
-2. In the panel: **Settings → Spotify**, paste your **Client ID** and **Client Secret**, click **Connect Spotify**, and authorise.
+Spotify requires you to register your own (free) "app" to get API credentials — this is a one-time developer-dashboard step, not something you publish.
+
+1. Go to [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard) and log in with your normal Spotify account.
+2. **Create app** → give it any name/description (e.g. "DecklingAir").
+3. For **Redirect URI**, enter exactly:
+   ```
+   http://<Pi-IP>:3002/api/spotify/callback
+   ```
+   Replace `<Pi-IP>` with the Pi's real LAN IP (from `hostname -I`) — not `localhost`, since you're authorising from whatever device's browser you're using, not the Pi itself. This must match **character-for-character** or the OAuth callback will fail.
+4. Check the box for the **Web API**, agree to the terms, and **Save**.
+5. Open the new app → **Settings** → copy the **Client ID**, then click **View client secret** and copy that too.
+6. In the DecklingAir panel: **Settings (top-right gear) → Spotify section**, paste the **Client ID** and **Client Secret**, click **Connect Spotify**. You'll be redirected to Spotify's login/consent screen — approve it, and you're bounced back to the panel as connected.
+
+If the redirect fails or you see a scope/permission error later (likes, search or playlist actions not working), see [Troubleshooting](#troubleshooting) — it's almost always a Redirect URI mismatch or a token that predates a newer required scope.
 
 ### 3. Add a Last.fm key (for genres)
 
-1. Get a free key at [last.fm/api/account/create](https://www.last.fm/api/account/create) (you only need the **API key**, not the shared secret).
-2. **Settings → Spotify → Last.fm API Key → Save.** The genre backfill starts immediately — watch `pm2 logs` for the `[Genre]` lines.
+Spotify no longer exposes artist genres to ordinary apps, so genre data comes from Last.fm instead — a separate, free, unrelated service.
 
-### 4. (Optional) Windows bridge for VoiceMeeter
+1. Go to [last.fm/api/account/create](https://www.last.fm/api/account/create), fill in the short form (any "application name" works), and submit.
+2. You'll get two values — an **API key** and a **shared secret**. **You only need the API key**; DecklingAir never needs the shared secret.
+3. In the panel: **Settings → Spotify → Last.fm API Key** field → paste the key → **Save**.
 
-Only needed for the VoiceMeeter half.
+The genre backfill kicks off immediately in the background. Watch it progress with `pm2 logs vm-control` — you'll see lines like:
 
-1. Install Python 3.9+ and VoiceMeeter Potato (have VoiceMeeter running first).
-2. Edit `bridge/config.json` → set `pi_host` to your Pi's IP and `bridge_port` to `3003`.
-3. `pip install -r bridge/requirements.txt`, then `python bridge.py` (a tray icon appears).
-4. Auto-start it via the Startup folder, Task Scheduler, or build a standalone exe with `bridge/build.bat`. (Use `macos_bridge.py` to drive a Mac instead.)
+```
+[Genre] backfilled 50 artists (467/812 = 57% covered)
+```
+
+It runs in small throttled passes so it never floods Last.fm, and re-scans periodically to pick up newly-played artists — leave it running and it reaches 100% on its own over time.
+
+### 4. (Optional) Windows or Mac bridge for VoiceMeeter
+
+Skip this entirely if you only want the Spotify dashboard. This step connects the panel to **VoiceMeeter Potato** on a separate Windows PC (or a Mac, via the included alternate script).
+
+**Windows:**
+
+1. Make sure **VoiceMeeter Potato** is installed and already running on the PC before starting the bridge.
+2. Install **Python 3.9+** on that PC if it isn't already.
+3. Copy (or clone) the `bridge/` folder from this repo onto the PC.
+4. Edit `bridge/config.json`:
+   ```json
+   {
+     "pi_host": "<Pi-IP>",
+     "bridge_port": 3003
+   }
+   ```
+   Use the same Pi IP from step 1, and leave the port at 3003 unless you overrode `BRIDGE_PORT` on the server.
+5. Install dependencies and run it:
+   ```bat
+   pip install -r bridge\requirements.txt
+   python bridge.py
+   ```
+   A small tray icon appears — that means it connected to the Pi. The panel's VoiceMeeter cards should immediately start reflecting live fader/mute state.
+6. **Auto-start it on login** so you don't have to launch it manually every time — either:
+   - Drop a shortcut to `bridge.py` (or the built exe below) in the Windows **Startup** folder (`shell:startup`), or
+   - Register it in **Task Scheduler** to run at logon, or
+   - Build a standalone `.exe` with `bridge\build.bat` so it doesn't need a visible Python environment, then autostart that instead.
+
+**Mac:** run `macos_bridge.py` the same way (Python 3.9+, same `config.json`, same `pip install -r bridge/requirements.txt`) — it talks to the Mac's system audio instead of VoiceMeeter.
+
+**Verifying it worked:** in the panel, any VoiceMeeter card (Fader, Strip Panel, Toggle…) should show live values within a couple of seconds and respond instantly when you drag/click it. If cards show "Offline," see [Troubleshooting](#troubleshooting).
 
 ---
 
@@ -154,6 +219,17 @@ A guiding principle runs through the whole thing: **local-first and API-frugal.*
 - **Playlists** — browse and play your playlists, with a "Recent" sort.
 - **Queue ("Up Next")** — the real upcoming queue, annotated with *why* each pick is there. When the engine rebuilds the queue (e.g. you pick a mix), a **loading overlay** covers it until the new queue is built and playing.
 
+### Favorites
+
+A bookmark icon on the Player marks a track as a **Favorite** — a hand-curated, track-level "this is genuinely one of my best songs" signal, distinct from Spotify's Like and from the engine's learned taste scores.
+
+Favorites are mirrored to a real Spotify playlist named **DecklingAir Favorites** (created automatically the first time you favourite something), so you can view and edit the set from **either** the app or Spotify directly — add, remove, or reorder in whichever is convenient, and the two stay in sync.
+
+Favorites feed the engine as a **high-trust, low-frequency** signal, deliberately *not* a repeat-more lever:
+
+- **Seeding** — starting a mix or "Now Playing" prefers a favourited track over a merely loved-artist track, when it's a close match to the target vibe.
+- **Selection** — favourites get a small nudge in everyday queue picking, just enough to surface an under-heard favourite. That nudge is kept **below** the repeat-tolerance penalty (see the Smart Queue section below), so a favourite that's already played this session backs off like any other track — you get more of the songs you love, without the queue looping the same handful of favourites all night.
+
 ### The Smart Queue engine
 
 Spotify's Web API won't autoplay a bare track — start a single song via the API and "Up Next" stays empty. So the engine sources its own continuation:
@@ -165,7 +241,7 @@ Spotify's Web API won't autoplay a bare track — start a single song via the AP
 
 **Flow ordering** sequences picks harmonically — Camelot key compatibility, BPM and energy smoothness — and is **genre-aware**: a soft genre-similarity term (using your artists' Last.fm tags, so *metalcore↔hardcore* reads as close while *metal↔bedroom-pop* reads as far) nudges transitions toward genre coherence and away from the jarring "same key, opposite genre" jump. The whole window also avoids repeating an artist back-to-back and won't replay a song until many others have passed.
 
-**Fit-to-the-song.** When you search a track and play it, the queue is pulled toward *that* song — its energy/valence neighbourhood and (weighted most strongly) its **genre** — so Up Next actually matches what you played, not just the seed artist. How tightly it sticks is governed by the Variety slider.
+**Fit-to-the-song.** When you search a track and play it, the queue doesn't just softly lean toward it — it's **centered** on it. Spotify's own recommendation endpoint is gone (it silently falls back to your generic top tracks and ignores the seed), so DecklingAir builds a mood-map-style target directly from the played song's energy, valence and genre and routes the whole window — both the discovery spine and your own woven picks — through the same on-target engine that powers Mixes. The result: Up Next actually matches what you played, not just the seed artist or your usual favourites. How wide that target's net is cast is governed by the Variety slider.
 
 Toggle the whole engine on/off from the Queue card's **Auto** pill; when off, playback falls back to Spotify's own anchors.
 
@@ -251,6 +327,10 @@ A read-only window into everything the engine knows about you and how it's using
 - **Smart queue state** — on/off, source, active selection, pool size, window size, and the current genre-aware-transition weight.
 - **Tuning** — your current dial values, explained.
 
+### The master Spotify switch
+
+**Settings → Spotify → Enable Spotify features** is a top-level kill-switch for the entire Spotify half of the app. Turn it off and the server makes **zero** outbound calls to Spotify, ReccoBeats, or Last.fm — playback polling, the Smart Queue, background discovery, feature-warming and genre backfill all stop immediately, and nothing restarts on its own until you flip it back on. The rest of the Spotify settings dim while it's off. This is the switch to reach for if you want to run DecklingAir as a pure VoiceMeeter remote for a while, or if Spotify's API is misbehaving and you want to stop hammering it.
+
 ---
 
 ## How it works under the hood
@@ -273,10 +353,10 @@ Everything the engine persists lives under `server/data/` (git-ignored):
 | `spotify-config.json` | Spotify Client ID/Secret, Last.fm key, timezone override. |
 | `spotify-tokens.json` | Spotify OAuth tokens. |
 | history / sessions | Your play history and past listening sessions. |
-| taste profile | Learned artist scores, ratings, disliked tracks, transitions, **artist→genre tags**, slot biases. |
+| taste profile | Learned artist scores, ratings, disliked tracks, transitions, **artist→genre tags**, slot biases, **favourite track IDs + the linked Favorites playlist ID**. |
 | feature cache | Cached audio features (ReccoBeats). |
 | feeling log | Your check-in labels + the snapshots behind them. |
-| user prefs | Tuning, Smart-Queue toggle, check-in auto. |
+| user prefs | Tuning, Smart-Queue toggle, check-in auto, **master Spotify-features switch**. |
 
 A **timezone override** (Settings, or the Tuning tab) corrects hour-of-day/weekday for the heatmap, vibes and predictions — and repairs past history when changed.
 
@@ -293,6 +373,10 @@ A **timezone override** (Settings, or the Tuning tab) corrects hour-of-day/weekd
 **"Audio features unavailable"** — ReccoBeats was momentarily unreachable; it retries and caches. Harmless and transient.
 
 **Queue stops after one song / feels generic** — confirm the **Auto** pill on the Queue card is on (Smart Queue enabled).
+
+**"Add to playlist" / Favorites fails with a 403** — this is Spotify's own API migration, not a config problem. Spotify periodically moves endpoints for apps in "Development Mode" (most recently `/playlists/{id}/tracks` → `/playlists/{id}/items`); DecklingAir tracks these but a very old checkout may predate a fix. `git pull`, `npm install`, `pm2 restart vm-control`, and try again.
+
+**Nothing Spotify-related works / no Spotify network activity at all** — check **Settings → Spotify → Enable Spotify features** isn't switched off. That toggle intentionally halts all Spotify/ReccoBeats/Last.fm traffic until you turn it back on.
 
 **VoiceMeeter shows "Offline"** — make sure VoiceMeeter is open *before* the bridge, the bridge's `config.json` points at the right Pi IP/port, and the bridge tray icon is present. Check both the Pi (`pm2 logs`) and the bridge console.
 
